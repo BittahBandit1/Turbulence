@@ -23,207 +23,188 @@ index fcbbd7b..9c4fa9d 100644
  #else
      std::this_thread::yield();
  #endif
+diff --git a/Source/Core/Core/Core.cpp b/Source/Core/Core/Core.cpp
+index e58579e..a72c271 100644
+--- a/Source/Core/Core/Core.cpp
++++ b/Source/Core/Core/Core.cpp
+@@ -903,10 +903,9 @@ void DoFrameStep(Core::System& system)
+ 
+ void UpdateInputGate(bool require_focus, bool require_full_focus)
+ {
+-  // If the user accepts background input, controls should pass even if an on screen interface is on
+-  const bool focus_passes =
+-      !require_focus ||
+-      ((Host_RendererHasFocus() || Host_TASInputHasFocus()) && !Host_UIBlocksControllerState());
++  // Background input bypasses window focus, never an interface consuming controls.
++  const bool focus_passes = !Host_UIBlocksControllerState() &&
++      (!require_focus || Host_RendererHasFocus() || Host_TASInputHasFocus());
+   // Ignore full focus if we don't require basic focus
+   const bool full_focus_passes =
+       !require_focus || !require_full_focus || (focus_passes && Host_RendererHasFullFocus());
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+index e3581cc..683d766 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+@@ -328,6 +328,7 @@ void StaticRecompCore::LoadModule()
+   }
+   m_active_rel_sections.clear();
+   m_rel_mapping_generation = 0;
++  m_rel_scan_dirty = true;
+   m_failed_chunks = 0;
+   m_lookup_ram_size = 0;
+   m_lookup_exram_size = 0;
+@@ -356,6 +357,7 @@ void StaticRecompCore::ClearCache()
+   if (!m_module)
+     return;
+   std::fill(m_chunk_state.begin(), m_chunk_state.end(), u8{CHUNK_UNVERIFIED});
++  m_rel_scan_dirty = true;
+   m_failed_chunks = 0;
+   ++m_reverify_events;
+ }
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
+index d084fea..99c56b8 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
+@@ -194,6 +194,12 @@ private:
+   std::vector<int> m_chunk_rel_sections;
+   std::vector<u64> m_effective_chunk_hashes;
+   u64 m_rel_mapping_generation = 0;
++  // Turbulence: RefreshRelSections scans all of guest RAM for REL headers.
++  // ChunkIndexOf reaches it for every address no chunk covers (every JIT
++  // block exit), so it may only rescan after code memory could have changed:
++  // an icache invalidation (OSLink ends with one) or a state load.
++  bool m_rel_scan_dirty = true;
++  std::vector<u32> m_rel_last_candidate;  // header offset per REL module
+   u32 m_failed_chunks = 0;    // chunks currently failing verification (real SMC)
+   u64 m_verifications = 0;    // chunk hash checks performed
+   u64 m_reverify_events = 0;  // invalidations that reset a chunk to Unverified
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
+index 491c57e..f5fad12 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
+@@ -22,6 +22,9 @@ void StaticRecompCore::RefreshRelSections()
+ {
+   if (!m_module || m_module->num_rel_modules == 0 || !m_guest.ram || m_guest.ram_size < 0x40)
+     return;
++  if (!m_rel_scan_dirty)
++    return;
++  m_rel_scan_dirty = false;
+ 
+   std::vector<ActiveRelSection> discovered;
+   for (u32 module_index = 0; module_index < m_module->num_rel_modules; ++module_index)
+@@ -31,15 +34,14 @@ void StaticRecompCore::RefreshRelSections()
+                           static_cast<u64>(module.section_count) * 8;
+     if (table_end > m_guest.ram_size)
+       continue;
+-    for (u32 candidate = 0; static_cast<u64>(candidate) + table_end <= m_guest.ram_size;
+-         candidate += 4)
+-    {
++    // Turbulence: try where this module was found last time before scanning.
++    const auto try_candidate = [&](u32 candidate) -> bool {
+       const u8* header = m_guest.ram + candidate;
+       if (ReadGuestBE32(header) != module.module_id ||
+           ReadGuestBE32(header + 0x0c) != module.section_count ||
+           ReadGuestBE32(header + 0x10) != module.section_info_offset ||
+           ReadGuestBE32(header + 0x1c) != module.version)
+-        continue;
++        return false;
+ 
+       std::vector<ActiveRelSection> candidate_sections;
+       bool valid = true;
+@@ -70,6 +72,22 @@ void StaticRecompCore::RefreshRelSections()
+       if (valid)
+       {
+         discovered.insert(discovered.end(), candidate_sections.begin(), candidate_sections.end());
++        return true;
++      }
++      return false;
++    };
++    if (m_rel_last_candidate.size() < m_module->num_rel_modules)
++      m_rel_last_candidate.resize(m_module->num_rel_modules, 0xFFFFFFFFu);
++    u32& last = m_rel_last_candidate[module_index];
++    if (last != 0xFFFFFFFFu && static_cast<u64>(last) + table_end <= m_guest.ram_size &&
++        try_candidate(last))
++      continue;
++    for (u32 candidate = 0; static_cast<u64>(candidate) + table_end <= m_guest.ram_size;
++         candidate += 4)
++    {
++      if (try_candidate(candidate))
++      {
++        last = candidate;
+         break;
+       }
+     }
+@@ -339,6 +357,7 @@ void StaticRecompCore::OnICacheInvalidate(u32 address, u32 length)
+ 
+   if (!m_module_active || length == 0)
+     return;
++  m_rel_scan_dirty = true;
+   u32 linked_address = address;
+   ResolveNativeAddress(address, &linked_address, nullptr);
+   address = linked_address;
 diff --git a/Source/Core/DolphinNoGUI/PlatformMacos.mm b/Source/Core/DolphinNoGUI/PlatformMacos.mm
-index e942282..68fe87d 100644
+index e942282..bd5e802 100644
 --- a/Source/Core/DolphinNoGUI/PlatformMacos.mm
 +++ b/Source/Core/DolphinNoGUI/PlatformMacos.mm
-@@ -162,6 +162,82 @@
- }
- @end
- 
-+bool g_turbulence_macos_key_down[128] = {};
-+
-+namespace
-+{
-+void ClearMacOSKeyStates()
-+{
-+  std::memset(g_turbulence_macos_key_down, 0, sizeof(g_turbulence_macos_key_down));
-+}
-+
-+bool AnyMacOSKeyDown()
-+{
-+  for (bool down : g_turbulence_macos_key_down)
-+  {
-+    if (down)
-+      return true;
-+  }
-+  return false;
-+}
-+
-+bool IsSpotlightOverlayActive()
-+{
-+  static auto s_last_check = std::chrono::steady_clock::now() - std::chrono::seconds(1);
-+  static bool s_cached_active = false;
-+
-+  const auto now = std::chrono::steady_clock::now();
-+  if (now - s_last_check < std::chrono::milliseconds(50))
-+    return s_cached_active;
-+  s_last_check = now;
-+
-+  bool active = false;
-+  CFArrayRef window_list = CGWindowListCopyWindowInfo(
-+      kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID);
-+  if (window_list)
-+  {
-+    const CFIndex count = CFArrayGetCount(window_list);
-+    for (CFIndex i = 0; i < count; ++i)
-+    {
-+      auto dict = static_cast<CFDictionaryRef>(CFArrayGetValueAtIndex(window_list, i));
-+      if (!dict)
-+        continue;
-+      auto owner = static_cast<CFStringRef>(CFDictionaryGetValue(dict, kCGWindowOwnerName));
-+      if (!owner)
-+        continue;
-+      if (CFStringCompare(owner, CFSTR("Spotlight"), 0) == kCFCompareEqualTo)
-+      {
-+        int layer = 0;
-+        if (auto layer_num = static_cast<CFNumberRef>(CFDictionaryGetValue(dict, kCGWindowLayer)))
-+          CFNumberGetValue(layer_num, kCFNumberIntType, &layer);
-+        // Spotlight's menubar icon lives in layer 25 with tiny height (~24px);
-+        // the Spotlight search bar / results window has height >= 40px.
-+        auto bounds_dict =
-+            static_cast<CFDictionaryRef>(CFDictionaryGetValue(dict, kCGWindowBounds));
-+        CGRect bounds = CGRectZero;
-+        if (bounds_dict)
-+          CGRectMakeWithDictionaryRepresentation(bounds_dict, &bounds);
-+        if (bounds.size.height >= 40.0 && bounds.size.width >= 200.0)
-+        {
-+          active = true;
-+          break;
-+        }
-+      }
-+    }
-+    CFRelease(window_list);
-+  }
-+  s_cached_active = active;
-+  return active;
-+}
-+}  // namespace
-+
-+bool Turbulence_IsMacOSKeyDown(unsigned short keycode)
-+{
-+  if (keycode >= 128)
-+    return false;
-+  return g_turbulence_macos_key_down[keycode];
-+}
-+
- namespace
- {
- class PlatformMacOS : public Platform
-@@ -197,6 +273,7 @@ private:
- 
- PlatformMacOS::~PlatformMacOS()
- {
-+  ClearMacOSKeyStates();
-   [m_window close];
- }
- 
-@@ -285,8 +362,8 @@ void PlatformMacOS::MainLoop()
-     UpdateRunningFlag();
-     Core::HostDispatchJobs(Core::System::GetInstance());
-     ProcessEvents();
--    UpdateWindowPosition();
+@@ -256,9 +256,19 @@ bool PlatformMacOS::Init()
+     [m_window toggleFullScreen:m_window];
    }
-+  UpdateWindowPosition();
- }
  
- WindowSystemInfo PlatformMacOS::GetWindowSystemInfo() const
-@@ -305,18 +382,82 @@ void PlatformMacOS::ProcessEvents()
- {
-   @autoreleasepool
-   {
--    NSDate* expiration = [NSDate dateWithTimeIntervalSinceNow:1];
-+    const bool window_active =
-+        [NSApp isActive] && ([m_window isKeyWindow] || [m_window isMainWindow]);
-+
-+    if (!window_active || (AnyMacOSKeyDown() && IsSpotlightOverlayActive()))
-+      ClearMacOSKeyStates();
-+
-     NSEvent* event = [NSApp nextEventMatchingMask:NSEventMaskAny
--                                        untilDate:expiration
-+                                        untilDate:nil
+-  [m_window makeKeyAndOrderFront:NSApp];
+-  [m_window makeMainWindow];
+-  [NSApp activateIgnoringOtherApps:YES];
++  // Turbulence: TURBULENCE_NO_ACTIVATE (set by the unattended test runner) shows the
++  // window without taking keyboard focus, so whatever the user is typing in
++  // another app never reaches the game. Automation input still works.
++  if (::getenv("TURBULENCE_NO_ACTIVATE"))
++  {
++    [m_window orderFrontRegardless];
++  }
++  else
++  {
++    [m_window makeKeyAndOrderFront:NSApp];
++    [m_window makeMainWindow];
++    [NSApp activateIgnoringOtherApps:YES];
++  }
+   [m_window setTitle:@"Dolphin-emu-nogui"];
+ 
+   SetupMenu();
+@@ -311,12 +321,33 @@ void PlatformMacOS::ProcessEvents()
                                             inMode:NSDefaultRunLoopMode
                                            dequeue:YES];
-+    while (event != nil)
-+    {
-+      const NSEventType type = [event type];
-+      if (type == NSEventTypeKeyDown || type == NSEventTypeKeyUp)
-+      {
-+        const NSEventModifierFlags mods = [event modifierFlags];
-+        if ((mods & NSEventModifierFlagCommand) != 0)
-+        {
-+          ClearMacOSKeyStates();
-+          [NSApp sendEvent:event];
-+        }
-+        else if (window_active && (type == NSEventTypeKeyUp || !IsSpotlightOverlayActive()))
-+        {
-+          const unsigned short kc = [event keyCode];
-+          if (kc < 128)
-+            g_turbulence_macos_key_down[kc] = (type == NSEventTypeKeyDown);
-+        }
-+        else
-+        {
-+          ClearMacOSKeyStates();
-+        }
-+      }
-+      else if (type == NSEventTypeFlagsChanged)
-+      {
-+        if (window_active && !IsSpotlightOverlayActive())
-+        {
-+          const unsigned short kc = [event keyCode];
-+          const NSEventModifierFlags mods = [event modifierFlags];
-+          if (kc == kVK_Shift || kc == kVK_RightShift)
-+            g_turbulence_macos_key_down[kc] = (mods & NSEventModifierFlagShift) != 0;
-+          else if (kc == kVK_Control || kc == kVK_RightControl)
-+            g_turbulence_macos_key_down[kc] = (mods & NSEventModifierFlagControl) != 0;
-+          else if (kc == kVK_Option || kc == kVK_RightOption)
-+            g_turbulence_macos_key_down[kc] = (mods & NSEventModifierFlagOption) != 0;
-+          else if (kc == kVK_Command || kc == kVK_RightCommand)
-+          {
-+            const bool cmd_down = (mods & NSEventModifierFlagCommand) != 0;
-+            if (cmd_down)
-+              ClearMacOSKeyStates();
-+            if (kc < 128)
-+              g_turbulence_macos_key_down[kc] = cmd_down;
-+          }
-+          else if (kc == kVK_CapsLock)
-+            g_turbulence_macos_key_down[kc] = (mods & NSEventModifierFlagCapsLock) != 0;
-+        }
-+        else
-+        {
-+          ClearMacOSKeyStates();
-+        }
-+        [NSApp sendEvent:event];
-+      }
-+      else
-+      {
-+        [NSApp sendEvent:event];
-+      }
  
 -    [NSApp sendEvent:event];
-+      event = [NSApp nextEventMatchingMask:NSEventMaskAny
-+                                 untilDate:nil
-+                                    inMode:NSDefaultRunLoopMode
-+                                   dequeue:YES];
++    // Game input reads the keyboard state directly. Plain key events have no
++    // responder in the render view, so AppKit would beep on every key press;
++    // only forward keys that carry Command, for menu shortcuts such as Cmd-Q.
++    const bool plain_key = event &&
++                           (event.type == NSEventTypeKeyDown || event.type == NSEventTypeKeyUp) &&
++                           !(event.modifierFlags & NSEventModifierFlagCommand);
++    // Cmd+Return (or Cmd+keypad Enter) toggles fullscreen, as in most Mac games.
++    const bool fullscreen_key = event && event.type == NSEventTypeKeyDown &&
++                                (event.modifierFlags & NSEventModifierFlagCommand) &&
++                                (event.keyCode == 36 || event.keyCode == 76);
++    if (fullscreen_key)
++    {
++      if (!event.isARepeat)
++        [m_window toggleFullScreen:nil];
++    }
++    else if (!plain_key)
++    {
++      [NSApp sendEvent:event];
 +    }
  
      // Need to update if m_window becomes fullscreen
--    m_window_fullscreen = [m_window styleMask] & NSWindowStyleMaskFullScreen;
-+    m_window_fullscreen = ([m_window styleMask] & NSWindowStyleMaskFullScreen) != 0;
+     m_window_fullscreen = [m_window styleMask] & NSWindowStyleMaskFullScreen;
  
 -    if ([m_window isMainWindow])
-+    if (window_active)
++    // A window stays "main" while another app's panel (Spotlight, Raycast,
++    // notification banners) takes the keyboard, and Quartz reads global key
++    // state. Only treat the game as focused while this app is active too.
++    if ([NSApp isActive] && [m_window isMainWindow])
      {
        m_window_focus = true;
        if (Config::Get(Config::MAIN_SHOW_CURSOR) == Config::ShowCursor::Never &&
-@@ -328,6 +469,7 @@ void PlatformMacOS::ProcessEvents()
-     else
-     {
-       m_window_focus = false;
-+      ClearMacOSKeyStates();
-       if (Config::Get(Config::MAIN_SHOW_CURSOR) == Config::ShowCursor::Never)
-         [NSCursor hide];
-     }
 diff --git a/Source/Core/InputCommon/ControlReference/ExpressionParser.cpp b/Source/Core/InputCommon/ControlReference/ExpressionParser.cpp
 index ee2e78d..4858516 100644
 --- a/Source/Core/InputCommon/ControlReference/ExpressionParser.cpp
@@ -290,27 +271,6 @@ index a10edd1..351ea8e 100644
  
    return nullptr;
  }
-diff --git a/Source/Core/InputCommon/ControllerInterface/Quartz/QuartzKeyboardAndMouse.mm b/Source/Core/InputCommon/ControllerInterface/Quartz/QuartzKeyboardAndMouse.mm
-index 5f0022c..a5616a3 100644
---- a/Source/Core/InputCommon/ControllerInterface/Quartz/QuartzKeyboardAndMouse.mm
-+++ b/Source/Core/InputCommon/ControllerInterface/Quartz/QuartzKeyboardAndMouse.mm
-@@ -189,9 +189,15 @@ KeyboardAndMouse::Key::Key(CGKeyCode keycode) : m_keycode(keycode), m_name(Keyco
- {
- }
- 
-+}  // namespace ciface::Quartz
-+
-+extern bool Turbulence_IsMacOSKeyDown(unsigned short keycode);
-+
-+namespace ciface::Quartz
-+{
- ControlState KeyboardAndMouse::Key::GetState() const
- {
--  return CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, m_keycode) != 0;
-+  return Turbulence_IsMacOSKeyDown(m_keycode) ? 1.0 : 0.0;
- }
- 
- std::string KeyboardAndMouse::Key::GetName() const
 diff --git a/Source/Core/InputCommon/ControllerInterface/SDL/SDLGamepad.cpp b/Source/Core/InputCommon/ControllerInterface/SDL/SDLGamepad.cpp
 index 0945759..a401ae7 100644
 --- a/Source/Core/InputCommon/ControllerInterface/SDL/SDLGamepad.cpp
@@ -356,17 +316,18 @@ index 0945759..a401ae7 100644
  
      // Rumble
 diff --git a/Source/Core/VideoBackends/Metal/MTLGfx.mm b/Source/Core/VideoBackends/Metal/MTLGfx.mm
-index 4b744fe..4d13b66 100644
+index 4b744fe..d3b984b 100644
 --- a/Source/Core/VideoBackends/Metal/MTLGfx.mm
 +++ b/Source/Core/VideoBackends/Metal/MTLGfx.mm
-@@ -16,12 +16,43 @@
+@@ -16,12 +16,44 @@
  #include "VideoCommon/Present.h"
  #include "VideoCommon/VideoBackendBase.h"
  
 +#include <cstdlib>
  #include <fstream>
  
-+extern bool g_turbulence_metal_hud_enabled;
++// Turbulence: Metal performance HUD, toggled by the options menu.
++bool g_turbulence_metal_hud_enabled = true;
 +
 +namespace
 +{
@@ -403,7 +364,7 @@ index 4b744fe..4d13b66 100644
  
    SetupSurface();
    g_state_tracker->FlushEncoders();
-@@ -465,6 +496,7 @@ void Metal::Gfx::PresentBackbuffer()
+@@ -465,6 +497,7 @@ void Metal::Gfx::PresentBackbuffer()
  {
    @autoreleasepool
    {
@@ -411,7 +372,7 @@ index 4b744fe..4d13b66 100644
      g_state_tracker->EndRenderPass();
      if (m_drawable)
      {
-@@ -475,10 +507,18 @@ void Metal::Gfx::PresentBackbuffer()
+@@ -475,10 +508,18 @@ void Metal::Gfx::PresentBackbuffer()
        // It also seems to improve frame pacing, so enable it by default with vsync
        if (g_ActiveConfig.iUsePresentDrawable == TriState::On ||
            (g_ActiveConfig.iUsePresentDrawable == TriState::Auto && g_ActiveConfig.bVSyncActive))
@@ -466,441 +427,22 @@ index ff8480e..31f4dd8 100644
  #endif
  }
 diff --git a/Source/Core/VideoCommon/OnScreenUI.cpp b/Source/Core/VideoCommon/OnScreenUI.cpp
-index 451109b..418144e 100644
+index 451109b..cd89b2c 100644
 --- a/Source/Core/VideoCommon/OnScreenUI.cpp
 +++ b/Source/Core/VideoCommon/OnScreenUI.cpp
-@@ -413,6 +413,426 @@ void OnScreenUI::DrawChallengesAndLeaderboards()
- #endif  // USE_RETRO_ACHIEVEMENTS
- }
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
  
-+}  // namespace VideoCommon
-+
-+#include "Core/Host.h"
-+#include "InputCommon/ControllerInterface/ControllerInterface.h"
-+#include "VideoCommon/VertexShaderManager.h"
-+
-+extern bool g_turbulence_hud_stretched;
-+extern bool g_turbulence_metal_hud_enabled;
-+extern bool g_turbulence_menu_open;
-+extern bool g_turbulence_drawing_efb_copy;
-+bool g_turbulence_hud_stretched = false;
-+bool g_turbulence_metal_hud_enabled = true;
-+bool g_turbulence_menu_open = false;
-+bool g_turbulence_drawing_efb_copy = false;
-+
-+namespace VideoCommon
-+{
-+namespace
-+{
-+bool PollAnyDeviceInput(std::string_view input_name, double threshold = 0.5)
-+{
-+  if (!Host_RendererHasFocus() || !g_controller_interface.IsInit())
-+    return false;
-+  for (const auto& dev : g_controller_interface.GetAllDevices())
-+  {
-+    if (!dev)
-+      continue;
-+    if (auto* inp = dev->FindInput(input_name))
-+    {
-+      if (inp->GetState() > threshold)
-+        return true;
-+    }
-+  }
-+  return false;
-+}
-+
-+void DrawTurbulenceOptionsMenu(float scale)
-+{
-+  static bool s_prev_toggle = false;
-+  static bool s_prev_up = false;
-+  static bool s_prev_down = false;
-+  static bool s_prev_left = false;
-+  static bool s_prev_right = false;
-+  static bool s_prev_confirm = false;
-+  static bool s_prev_cancel = false;
-+  static int s_selected_row = 0;
-+  static bool s_confirm_exit_open = false;
-+  static int s_confirm_exit_choice = 0;  // 0 = No (Left), 1 = Yes (Right)
-+
-+  const bool has_focus = Host_RendererHasFocus();
-+
-+  // Poll R1 (Shoulder R) on any controller, or Tab / F1 on keyboard (only when focused)
-+  const bool toggle_down =
-+      has_focus && (PollAnyDeviceInput("Shoulder R") || PollAnyDeviceInput("Tab") ||
-+                    PollAnyDeviceInput("F1") || ImGui::IsKeyDown(ImGuiKey_Tab));
-+  if (toggle_down && !s_prev_toggle)
-+  {
-+    g_turbulence_menu_open = !g_turbulence_menu_open;
-+    if (!g_turbulence_menu_open)
-+      s_confirm_exit_open = false;
-+  }
-+  s_prev_toggle = toggle_down;
-+
-+  const ImVec2 display_size = ImGui::GetIO().DisplaySize;
-+  if (display_size.x <= 0.0f || display_size.y <= 0.0f)
-+    return;
-+
-+  // Subtle top-left badge when closed so user can verify R1 menu is active
-+  if (!g_turbulence_menu_open)
-+  {
-+    ImGui::SetNextWindowPos(ImVec2(14.0f * scale, 14.0f * scale), ImGuiCond_Always);
-+    ImGui::SetNextWindowBgAlpha(0.45f);
-+    if (ImGui::Begin("##TurbulenceBadge", nullptr,
-+                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoInputs |
-+                         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
-+                         ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoNav |
-+                         ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoFocusOnAppearing))
-+    {
-+      ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 0.95f), "[R1 / Tab] Turbulence Options");
-+    }
-+    ImGui::End();
-+    return;
-+  }
-+
-+  // Poll controller navigation when menu is open and window is focused
-+  const bool up_down =
-+      has_focus && (PollAnyDeviceInput("Pad N") || PollAnyDeviceInput("Left Y+", 0.55) ||
-+                    PollAnyDeviceInput("Up Arrow") || ImGui::IsKeyDown(ImGuiKey_UpArrow));
-+  const bool down_down =
-+      has_focus && (PollAnyDeviceInput("Pad S") || PollAnyDeviceInput("Left Y-", 0.55) ||
-+                    PollAnyDeviceInput("Down Arrow") || ImGui::IsKeyDown(ImGuiKey_DownArrow));
-+  const bool left_down =
-+      has_focus && (PollAnyDeviceInput("Pad W") || PollAnyDeviceInput("Left X-", 0.55) ||
-+                    PollAnyDeviceInput("Left Arrow") || ImGui::IsKeyDown(ImGuiKey_LeftArrow));
-+  const bool right_down =
-+      has_focus && (PollAnyDeviceInput("Pad E") || PollAnyDeviceInput("Left X+", 0.55) ||
-+                    PollAnyDeviceInput("Right Arrow") || ImGui::IsKeyDown(ImGuiKey_RightArrow));
-+  const bool confirm_down =
-+      has_focus && (PollAnyDeviceInput("Button S") || PollAnyDeviceInput("Return") ||
-+                    ImGui::IsKeyDown(ImGuiKey_Enter));
-+  const bool cancel_down =
-+      has_focus && (PollAnyDeviceInput("Button E") || PollAnyDeviceInput("Escape") ||
-+                    ImGui::IsKeyDown(ImGuiKey_Escape));
-+
-+  const bool nav_up = up_down && !s_prev_up;
-+  const bool nav_down = down_down && !s_prev_down;
-+  const bool nav_left = left_down && !s_prev_left;
-+  const bool nav_right = right_down && !s_prev_right;
-+  const bool nav_confirm = confirm_down && !s_prev_confirm;
-+  const bool nav_cancel = cancel_down && !s_prev_cancel;
-+
-+  s_prev_up = up_down;
-+  s_prev_down = down_down;
-+  s_prev_left = left_down;
-+  s_prev_right = right_down;
-+  s_prev_confirm = confirm_down;
-+  s_prev_cancel = cancel_down;
-+
-+  auto TriggerExitGame = []() {
-+    Host_Message(HostMessageID::WMUserStop);
-+    std::exit(0);
-+  };
-+
-+  if (s_confirm_exit_open)
-+  {
-+    if (nav_cancel)
-+    {
-+      s_confirm_exit_open = false;
-+    }
-+    else
-+    {
-+      if (nav_left)
-+        s_confirm_exit_choice = 0;  // No (Left)
-+      if (nav_right)
-+        s_confirm_exit_choice = 1;  // Yes (Right)
-+      if (nav_confirm)
-+      {
-+        if (s_confirm_exit_choice == 1)
-+          TriggerExitGame();
-+        else
-+          s_confirm_exit_open = false;
-+      }
-+    }
-+  }
-+  else
-+  {
-+    if (nav_cancel)
-+    {
-+      g_turbulence_menu_open = false;
-+      return;
-+    }
-+
-+    constexpr int kNumRows = 5;
-+    if (nav_up)
-+      s_selected_row = (s_selected_row + kNumRows - 1) % kNumRows;
-+    if (nav_down)
-+      s_selected_row = (s_selected_row + 1) % kNumRows;
-+  }
-+
-+  // Resolution Scale options
-+  struct ResOption
-+  {
-+    int scale;
-+    const char* label;
-+  };
-+  static constexpr ResOption kResOptions[] = {
-+      {1, "1x Native (640x528)"},   {2, "2x 720p (1280x1056)"},
-+      {3, "3x 1080p (1920x1584)"},  {4, "4x 1440p (2560x2112)"},
-+      {5, "5x (3200x2640)"},        {6, "6x 4K (3840x3168)"},
-+  };
-+  constexpr int kNumRes = static_cast<int>(std::size(kResOptions));
-+  const int cur_scale = Config::Get(Config::GFX_EFB_SCALE);
-+  int res_idx = 1;
-+  for (int i = 0; i < kNumRes; ++i)
-+  {
-+    if (kResOptions[i].scale == cur_scale)
-+    {
-+      res_idx = i;
-+      break;
-+    }
-+  }
-+
-+  // Aspect Ratio options
-+  struct AspectOption
-+  {
-+    AspectMode mode;
-+    const char* label;
-+  };
-+  static constexpr AspectOption kAspectOptions[] = {
-+      {AspectMode::ForceWide, "16:9 (Widescreen)"},
-+      {AspectMode::ForceStandard, "4:3 (Original)"},
-+      {AspectMode::Auto, "Auto"},
-+      {AspectMode::Stretch, "Stretch to Window"},
-+  };
-+  constexpr int kNumAspect = static_cast<int>(std::size(kAspectOptions));
-+  const AspectMode cur_aspect = Config::Get(Config::GFX_ASPECT_RATIO);
-+  int aspect_idx = 0;
-+  for (int i = 0; i < kNumAspect; ++i)
-+  {
-+    if (kAspectOptions[i].mode == cur_aspect)
-+    {
-+      aspect_idx = i;
-+      break;
-+    }
-+  }
-+
-+  auto ApplyResIdx = [&](int idx) {
-+    idx = (idx + kNumRes) % kNumRes;
-+    Config::SetBaseOrCurrent(Config::GFX_EFB_SCALE, kResOptions[idx].scale);
-+  };
-+
-+  auto ApplyAspectIdx = [&](int idx) {
-+    idx = (idx + kNumAspect) % kNumAspect;
-+    const AspectMode mode = kAspectOptions[idx].mode;
-+    Config::SetBaseOrCurrent(Config::GFX_ASPECT_RATIO, mode);
-+    Config::SetBaseOrCurrent(Config::GFX_WIDESCREEN_HACK, mode != AspectMode::ForceStandard);
-+    Core::System::GetInstance().GetVertexShaderManager().dirty = true;
-+  };
-+
-+  if (!s_confirm_exit_open)
-+  {
-+    // Apply gamepad left/right/confirm changes
-+    const int delta = nav_right ? 1 : (nav_left ? -1 : (nav_confirm ? 1 : 0));
-+    if (delta != 0)
-+    {
-+      if (s_selected_row == 0)
-+        ApplyResIdx(res_idx + delta);
-+      else if (s_selected_row == 1)
-+        ApplyAspectIdx(aspect_idx + delta);
-+      else if (s_selected_row == 2)
-+      {
-+        g_turbulence_hud_stretched = !g_turbulence_hud_stretched;
-+        Core::System::GetInstance().GetVertexShaderManager().dirty = true;
-+      }
-+      else if (s_selected_row == 3)
-+      {
-+        g_turbulence_metal_hud_enabled = !g_turbulence_metal_hud_enabled;
-+      }
-+      else if (s_selected_row == 4 && nav_confirm)
-+      {
-+        s_confirm_exit_open = true;
-+        s_confirm_exit_choice = 0;  // Default to No (Left)
-+      }
-+    }
-+  }
-+
-+  ImGui::SetNextWindowPos(ImVec2(display_size.x * 0.5f, display_size.y * 0.5f), ImGuiCond_Always,
-+                          ImVec2(0.5f, 0.5f));
-+  ImGui::SetNextWindowSize(ImVec2(520.0f * scale, 0.0f), ImGuiCond_Always);
-+  ImGui::SetNextWindowBgAlpha(0.92f);
-+
-+  ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.06f, 0.09f, 0.16f, 0.95f));
-+  ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.20f, 0.65f, 1.0f, 0.85f));
-+  ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f);
-+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20.0f * scale, 16.0f * scale));
-+  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.0f * scale, 12.0f * scale));
-+
-+  if (ImGui::Begin("Turbulence Options (Sonic Riders Recomp)", &g_turbulence_menu_open,
-+                   ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize |
-+                       ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize))
-+  {
-+    if (s_confirm_exit_open)
-+    {
-+      ImGui::Spacing();
-+      ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.25f, 1.0f), "Are you sure?");
-+      ImGui::TextColored(ImVec4(0.75f, 0.85f, 0.95f, 1.0f),
-+                         "Select with Left / Right and press A / Cross to confirm:");
-+      ImGui::Separator();
-+      ImGui::Spacing();
-+
-+      // Left option: No (index 0)
-+      const bool no_selected = (s_confirm_exit_choice == 0);
-+      if (no_selected)
-+      {
-+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.55f, 0.90f, 1.0f));
-+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.28f, 0.65f, 1.0f, 1.0f));
-+      }
-+      if (ImGui::Button(no_selected ? "> No <" : "  No  ", ImVec2(210.0f * scale, 38.0f * scale)))
-+      {
-+        s_confirm_exit_choice = 0;
-+        s_confirm_exit_open = false;
-+      }
-+      if (no_selected)
-+        ImGui::PopStyleColor(2);
-+
-+      ImGui::SameLine(0.0f, 36.0f * scale);
-+
-+      // Right option: Yes (index 1)
-+      const bool yes_selected = (s_confirm_exit_choice == 1);
-+      if (yes_selected)
-+      {
-+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.22f, 0.22f, 1.0f));
-+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.95f, 0.30f, 0.30f, 1.0f));
-+      }
-+      if (ImGui::Button(yes_selected ? "> Yes <" : "  Yes  ", ImVec2(210.0f * scale, 38.0f * scale)))
-+      {
-+        s_confirm_exit_choice = 1;
-+        TriggerExitGame();
-+      }
-+      if (yes_selected)
-+        ImGui::PopStyleColor(2);
-+
-+      ImGui::Spacing();
-+    }
-+    else
-+    {
-+      ImGui::TextColored(ImVec4(0.45f, 0.85f, 1.0f, 1.0f),
-+                         "Use D-Pad / Left Stick or Mouse  |  [R1 / B / Circle] Close");
-+      ImGui::Separator();
-+
-+      auto DrawRowPrefix = [&](int row, const char* label) {
-+        if (s_selected_row == row)
-+          ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.20f, 1.0f), "> %-22s", label);
-+        else
-+          ImGui::Text("  %-22s", label);
-+        ImGui::SameLine(230.0f * scale);
-+      };
-+
-+      // Row 0: Resolution Scale
-+      DrawRowPrefix(0, "Resolution Scale:");
-+      if (ImGui::Button("<##res"))
-+      {
-+        s_selected_row = 0;
-+        ApplyResIdx(res_idx - 1);
-+      }
-+      ImGui::SameLine();
-+      ImGui::TextColored(s_selected_row == 0 ? ImVec4(1.0f, 0.9f, 0.3f, 1.0f) :
-+                                               ImVec4(0.9f, 0.95f, 1.0f, 1.0f),
-+                         "%-22s", kResOptions[res_idx].label);
-+      ImGui::SameLine();
-+      if (ImGui::Button(">##res"))
-+      {
-+        s_selected_row = 0;
-+        ApplyResIdx(res_idx + 1);
-+      }
-+
-+      // Row 1: Aspect Ratio
-+      DrawRowPrefix(1, "Aspect Ratio:");
-+      if (ImGui::Button("<##asp"))
-+      {
-+        s_selected_row = 1;
-+        ApplyAspectIdx(aspect_idx - 1);
-+      }
-+      ImGui::SameLine();
-+      ImGui::TextColored(s_selected_row == 1 ? ImVec4(1.0f, 0.9f, 0.3f, 1.0f) :
-+                                               ImVec4(0.9f, 0.95f, 1.0f, 1.0f),
-+                         "%-22s", kAspectOptions[aspect_idx].label);
-+      ImGui::SameLine();
-+      if (ImGui::Button(">##asp"))
-+      {
-+        s_selected_row = 1;
-+        ApplyAspectIdx(aspect_idx + 1);
-+      }
-+
-+      // Row 2: HUD Aspect Mode
-+      DrawRowPrefix(2, "HUD Layout:");
-+      if (ImGui::Button("<##hud"))
-+      {
-+        s_selected_row = 2;
-+        g_turbulence_hud_stretched = !g_turbulence_hud_stretched;
-+        Core::System::GetInstance().GetVertexShaderManager().dirty = true;
-+      }
-+      ImGui::SameLine();
-+      ImGui::TextColored(s_selected_row == 2 ? ImVec4(1.0f, 0.9f, 0.3f, 1.0f) :
-+                                               ImVec4(0.9f, 0.95f, 1.0f, 1.0f),
-+                         "%-22s",
-+                         g_turbulence_hud_stretched ? "Stretched (16:9)" : "Centered (4:3)");
-+      ImGui::SameLine();
-+      if (ImGui::Button(">##hud"))
-+      {
-+        s_selected_row = 2;
-+        g_turbulence_hud_stretched = !g_turbulence_hud_stretched;
-+        Core::System::GetInstance().GetVertexShaderManager().dirty = true;
-+      }
-+
-+      // Row 3: Metal Performance HUD
-+      DrawRowPrefix(3, "Metal HUD:");
-+      if (ImGui::Button("<##mhud"))
-+      {
-+        s_selected_row = 3;
-+        g_turbulence_metal_hud_enabled = !g_turbulence_metal_hud_enabled;
-+      }
-+      ImGui::SameLine();
-+      ImGui::TextColored(g_turbulence_metal_hud_enabled ? ImVec4(0.35f, 1.0f, 0.55f, 1.0f) :
-+                                                          ImVec4(0.85f, 0.45f, 0.45f, 1.0f),
-+                         "%-22s", g_turbulence_metal_hud_enabled ? "Enabled (On)" : "Disabled (Off)");
-+      ImGui::SameLine();
-+      if (ImGui::Button(">##mhud"))
-+      {
-+        s_selected_row = 3;
-+        g_turbulence_metal_hud_enabled = !g_turbulence_metal_hud_enabled;
-+      }
-+
-+      ImGui::Separator();
-+
-+      // Row 4: Exit Game
-+      DrawRowPrefix(4, "Exit Game:");
-+      if (s_selected_row == 4)
-+      {
-+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.75f, 0.18f, 0.18f, 1.0f));
-+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.90f, 0.25f, 0.25f, 1.0f));
-+      }
-+      if (ImGui::Button(s_selected_row == 4 ? "> Exit Game <" : "  Exit Game  ",
-+                        ImVec2(230.0f * scale, 30.0f * scale)))
-+      {
-+        s_selected_row = 4;
-+        s_confirm_exit_open = true;
-+        s_confirm_exit_choice = 0;  // Default to No (Left)
-+      }
-+      if (s_selected_row == 4)
-+        ImGui::PopStyleColor(2);
-+    }
-+  }
-+  ImGui::End();
-+
-+  ImGui::PopStyleVar(3);
-+  ImGui::PopStyleColor(2);
-+}
-+}  // namespace
-+
- void OnScreenUI::Finalize()
- {
-   auto lock = GetImGuiLock();
-@@ -422,6 +842,7 @@ void OnScreenUI::Finalize()
+ #include "VideoCommon/OnScreenUI.h"
++#include "VideoCommon/VideoEvents.h"
+ 
+ #include "Common/CommonPaths.h"
+ #include "Common/EnumMap.h"
+@@ -422,6 +423,7 @@ void OnScreenUI::Finalize()
    DrawDebugText();
    OSD::DrawMessages();
    DrawChallengesAndLeaderboards();
-+  DrawTurbulenceOptionsMenu(m_backbuffer_scale);
++  GetVideoEvents().imgui_draw_event.Trigger();
    ImGui::Render();
  
    // Check for font changes
@@ -1078,10 +620,22 @@ index 2bc6d58..d636384 100644
    if (!bpmem.genMode.zfreeze)
    {
 diff --git a/Source/Core/VideoCommon/VertexShaderManager.cpp b/Source/Core/VideoCommon/VertexShaderManager.cpp
-index 6d69803..43469f8 100644
+index 6d69803..98033ac 100644
 --- a/Source/Core/VideoCommon/VertexShaderManager.cpp
 +++ b/Source/Core/VideoCommon/VertexShaderManager.cpp
-@@ -76,15 +76,23 @@ Common::Matrix44 VertexShaderManager::LoadProjectionMatrix()
+@@ -38,6 +38,11 @@ void VertexShaderManager::Init()
+   dirty = true;
+ }
+ 
++// Turbulence: HUD layout (set by the options menu) and whether the current
++// draw samples an EFB copy / full-screen pass (set by VertexManagerBase).
++bool g_turbulence_hud_stretched = false;
++bool g_turbulence_drawing_efb_copy = false;
++
+ Common::Matrix44 VertexShaderManager::LoadProjectionMatrix()
+ {
+   const auto& rawProjection = xfmem.projection.rawProjection;
+@@ -76,15 +81,23 @@ Common::Matrix44 VertexShaderManager::LoadProjectionMatrix()
  
    case ProjectionType::Orthographic:
    {
@@ -1109,7 +663,7 @@ index 6d69803..43469f8 100644
  
      m_projection_matrix[8] = 0.0f;
      m_projection_matrix[9] = 0.0f;
-@@ -126,6 +134,7 @@ void VertexShaderManager::SetProjectionMatrix(XFStateManager& xf_state_manager)
+@@ -126,6 +139,7 @@ void VertexShaderManager::SetProjectionMatrix(XFStateManager& xf_state_manager)
      xf_state_manager.ResetProjection();
      auto corrected_matrix = LoadProjectionMatrix();
      memcpy(constants.projection.data(), corrected_matrix.data.data(), 4 * sizeof(float4));
@@ -1117,7 +671,7 @@ index 6d69803..43469f8 100644
    }
  }
  
-@@ -411,8 +420,10 @@ void VertexShaderManager::SetConstants(std::span<const std::string> textures,
+@@ -411,8 +425,10 @@ void VertexShaderManager::SetConstants(std::span<const std::string> textures,
      }
    }
  
@@ -1130,6 +684,20 @@ index 6d69803..43469f8 100644
    {
      xf_state_manager.ResetProjection();
      m_projection_graphics_mod_change = !projection_actions.empty();
+diff --git a/Source/Core/VideoCommon/VideoEvents.h b/Source/Core/VideoCommon/VideoEvents.h
+index fe30aa2..e3da818 100644
+--- a/Source/Core/VideoCommon/VideoEvents.h
++++ b/Source/Core/VideoCommon/VideoEvents.h
+@@ -66,6 +66,9 @@ struct PresentInfo
+ 
+ struct VideoEvents
+ {
++  // Render-thread overlay hook, with the ImGui context and lock held.
++  Common::HookableEvent<> imgui_draw_event;
++
+   // Called when certain video config setting are changed
+   Common::HookableEvent<u32> config_changed_event;
+ 
 diff --git a/module-template/CMakeLists.txt b/module-template/CMakeLists.txt
 index dac92e8..75e21f5 100644
 --- a/module-template/CMakeLists.txt

@@ -1,22 +1,52 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c0548a0..beba90c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -281,6 +281,12 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+         target_compile_definitions(moderngekko PRIVATE _M_GENERIC=1)
+     endif()
+     target_link_libraries(moderngekko PRIVATE core uicommon)
++    if(TURBULENCE_OPTIONS_SOURCE_DIR)
++        target_sources(moderngekko PRIVATE "${TURBULENCE_OPTIONS_SOURCE_DIR}/turbulence_options.cpp")
++        target_include_directories(moderngekko PRIVATE "${TURBULENCE_OPTIONS_SOURCE_DIR}")
++        target_link_libraries(moderngekko PRIVATE imgui)
++        target_compile_definitions(moderngekko PRIVATE TURBULENCE_OPTIONS_MENU=1)
++    endif()
+     if(TARGET PkgConfig::X11)
+         target_sources(moderngekko PRIVATE
+             vendor/dolphin/Source/Core/DolphinNoGUI/PlatformX11.cpp)
 diff --git a/src/runtime/dolphin_runtime.cpp b/src/runtime/dolphin_runtime.cpp
-index f9b5405..1e0741c 100644
+index f9b5405..9ebc792 100644
 --- a/src/runtime/dolphin_runtime.cpp
 +++ b/src/runtime/dolphin_runtime.cpp
-@@ -110,10 +110,12 @@ PowerPC::CPUCore SelectCPUCore() {
+@@ -1,4 +1,7 @@
+ #include "moderngekko/runtime.hpp"
++#ifdef TURBULENCE_OPTIONS_MENU
++#include "turbulence_options.hpp"
++#endif
+ 
+ #include "AudioCommon/AudioCommon.h"
+ #include "Common/Config/Config.h"
+@@ -110,10 +113,17 @@ PowerPC::CPUCore SelectCPUCore() {
  }
  } // namespace
  
-+extern bool g_turbulence_menu_open;
 +
  std::vector<std::string> Host_GetPreferredLocales() { return {}; }
  void Host_PPCSymbolsChanged() {}
  void Host_PPCBreakpointsChanged() {}
 -bool Host_UIBlocksControllerState() { return false; }
-+bool Host_UIBlocksControllerState() { return g_turbulence_menu_open; }
++bool Host_UIBlocksControllerState() {
++#ifdef TURBULENCE_OPTIONS_MENU
++  return turbulence::OptionsMenuBlocksInput();
++#else
++  return false;
++#endif
++}
  void Host_Message(HostMessageID id) {
    if (id == HostMessageID::WMUserStop && s_platform)
      s_platform->Stop();
-@@ -134,7 +136,7 @@ void Host_JitCacheInvalidation() {}
+@@ -134,7 +144,7 @@ void Host_JitCacheInvalidation() {}
  void Host_JitProfileDataWiped() {}
  void Host_RequestRenderWindowSize(int, int) {}
  bool Host_RendererHasFocus() {
@@ -25,15 +55,24 @@ index f9b5405..1e0741c 100644
  }
  bool Host_RendererHasFullFocus() { return Host_RendererHasFocus(); }
  bool Host_RendererIsFullscreen() {
-@@ -665,6 +667,16 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -665,6 +675,25 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
    if (impl->config.graphics.internal_resolution_scale)
      Config::SetBase(Config::GFX_EFB_SCALE,
                      *impl->config.graphics.internal_resolution_scale);
 +  else
 +    Config::SetBase(Config::GFX_EFB_SCALE, 2);
-+  Config::SetBase(Config::GFX_ASPECT_RATIO, AspectMode::ForceWide);
-+  Config::SetBase(Config::GFX_WIDESCREEN_HACK, true);
-+  Config::SetBaseOrCurrent(Config::GFX_VSYNC, true);
++  // Turbulence: first-run defaults only. Once the options menu has saved a
++  // choice to GFX.ini, that choice wins.
++  if (Config::GetActiveLayerForConfig(Config::GFX_ASPECT_RATIO) == Config::LayerType::Default)
++  {
++    Config::SetBase(Config::GFX_ASPECT_RATIO, AspectMode::ForceWide);
++    Config::SetBase(Config::GFX_WIDESCREEN_HACK, true);
++  }
++  if (Config::GetActiveLayerForConfig(Config::GFX_VSYNC) == Config::LayerType::Default)
++    Config::SetBase(Config::GFX_VSYNC, true);
++#ifdef TURBULENCE_OPTIONS_MENU
++  turbulence::PrepareOptions(impl->config.user_directory);
++#endif
 +  Config::SetBaseOrCurrent(Config::GFX_MTL_USE_PRESENT_DRAWABLE, TriState::On);
 +  Config::SetBaseOrCurrent(Config::MAIN_PRECISION_FRAME_TIMING, true);
 +  Config::SetBaseOrCurrent(Config::MAIN_RUSH_FRAME_PRESENTATION, false);
@@ -42,7 +81,7 @@ index f9b5405..1e0741c 100644
    Config::SetBase(Config::GFX_SHADER_CACHE, true);
    Config::SetBase(Config::GFX_SHADER_COMPILATION_MODE,
                    ShaderCompilationMode::AsynchronousUberShaders);
-@@ -688,8 +700,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -688,8 +717,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
    Config::SetBase(Config::MAIN_AUDIO_BACKEND, impl->config.audio.backend);
    if (impl->config.audio.mute)
      Config::SetBase(Config::MAIN_AUDIO_VOLUME, 0);
@@ -52,6 +91,21 @@ index f9b5405..1e0741c 100644
  
    auto &jit = Core::System::GetInstance().GetJitInterface();
    StaticRecompModuleSource recomp_source;
+@@ -790,6 +818,14 @@ RuntimeRunResult Runtime::Run() {
+                          "Dolphin could not boot sys/main.dol"}};
+   }
+   m_impl->booted = true;
++#ifdef TURBULENCE_OPTIONS_MENU
++  std::unique_ptr<turbulence::OptionsMenu> options_menu;
++  if (!m_impl->config.headless)
++    options_menu = std::make_unique<turbulence::OptionsMenu>(
++        m_impl->config.user_directory,
++        // "Exit The Game": same clean shutdown request as the automation stop.
++        [this] { RequestStop(); });
++#endif
+   m_impl->present_hook =
+       GetVideoEvents().after_present_event.Register([this](const PresentInfo &info) {
+         m_impl->automation_state.frame_count.store(info.frame_count,
 diff --git a/tools/frontend_config.cpp b/tools/frontend_config.cpp
 index 03740d4..0724326 100644
 --- a/tools/frontend_config.cpp
