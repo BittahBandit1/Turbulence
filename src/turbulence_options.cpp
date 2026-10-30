@@ -28,24 +28,25 @@ namespace turbulence {
 namespace {
 std::atomic<bool> s_blocks_input{false};
 
-// Sonic Riders palette: the deep night-blue of the menus, Riders cyan for
-// frames and highlights, and the gold of the logo / Air gauge for focus.
+// Sonic Riders palette, sampled from the title screen: the deep indigo of the
+// Sonic silhouette for panels, the sky blue behind the logo for frames and
+// highlights, the logo's gold for focus, and the orange-red of its "R".
 struct Palette {
-  ImVec4 window{0.020f, 0.045f, 0.110f, 0.97f};
-  ImVec4 border{0.000f, 0.780f, 1.000f, 0.85f};
-  ImVec4 title{1.000f, 0.780f, 0.000f, 1.00f};
-  ImVec4 accent{0.000f, 0.780f, 1.000f, 1.00f};
-  ImVec4 text{0.930f, 0.970f, 1.000f, 1.00f};
-  ImVec4 text_dim{0.560f, 0.680f, 0.820f, 1.00f};
-  ImVec4 button{0.070f, 0.160f, 0.330f, 1.00f};
-  ImVec4 button_hover{0.000f, 0.480f, 0.720f, 1.00f};
-  ImVec4 button_active{0.000f, 0.620f, 0.880f, 1.00f};
-  ImVec4 row_selected{0.000f, 0.560f, 0.860f, 0.55f};
-  ImVec4 row_hover{0.000f, 0.560f, 0.860f, 0.30f};
-  ImVec4 focus{1.000f, 0.780f, 0.000f, 1.00f};
-  ImVec4 focus_text{0.040f, 0.050f, 0.100f, 1.00f};
-  ImVec4 danger{0.860f, 0.120f, 0.220f, 1.00f};
-  ImVec4 separator{0.000f, 0.780f, 1.000f, 0.35f};
+  ImVec4 window{0.090f, 0.086f, 0.290f, 0.96f};       // indigo #17164A
+  ImVec4 border{0.180f, 0.560f, 0.960f, 0.90f};       // sky blue #2E8FF5
+  ImVec4 title{1.000f, 0.820f, 0.080f, 1.00f};        // logo gold #FFD114
+  ImVec4 accent{0.360f, 0.720f, 1.000f, 1.00f};       // light sky #5CB8FF
+  ImVec4 text{0.960f, 0.970f, 1.000f, 1.00f};
+  ImVec4 text_dim{0.620f, 0.680f, 0.880f, 1.00f};
+  ImVec4 button{0.160f, 0.170f, 0.470f, 1.00f};
+  ImVec4 button_hover{0.150f, 0.440f, 0.860f, 1.00f};
+  ImVec4 button_active{0.180f, 0.560f, 0.960f, 1.00f};
+  ImVec4 row_selected{0.180f, 0.560f, 0.960f, 0.45f};
+  ImVec4 row_hover{0.180f, 0.560f, 0.960f, 0.25f};
+  ImVec4 focus{1.000f, 0.820f, 0.080f, 1.00f};        // logo gold
+  ImVec4 focus_text{0.090f, 0.086f, 0.290f, 1.00f};   // indigo on gold
+  ImVec4 danger{0.910f, 0.290f, 0.100f, 1.00f};       // the "R" #E84A1A
+  ImVec4 separator{0.180f, 0.560f, 0.960f, 0.40f};
 };
 const Palette kPalette;
 
@@ -240,7 +241,12 @@ struct OptionsMenu::Impl {
     s_menu_binding = LoadMenuButtonBinding(directory);
     binding = s_menu_binding;
     draw_hook = GetVideoEvents().imgui_draw_event.Register([this] { Draw(); });
+    // Unattended tests (scripts/turbulence_agent.sh) can't press the real menu
+    // button: automation input drives the emulated GameCube pad.
+    if (const char* open_now = std::getenv("TURBULENCE_OPTIONS_OPEN"); open_now && *open_now == '1')
+      open_on_first_draw = true;
   }
+  bool open_on_first_draw = false;
   ~Impl() { draw_hook.reset(); s_blocks_input = false; }
   Row CurrentRow() const { return Rows()[selected]; }
   void ReadSettings() {
@@ -459,6 +465,7 @@ struct OptionsMenu::Impl {
     for (int i=0;i<Count;++i) pressed[i] = down[i] && !previous[i];
     previous = down;
     if (exiting) { s_blocks_input = true; return; }
+    if (open_on_first_draw) { open_on_first_draw = false; open = true; ReadSettings(); }
     if (capturing) UpdateCapture();
     else if (pressed[Toggle]) {
       if (open) Close();
