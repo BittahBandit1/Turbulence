@@ -1,0 +1,197 @@
+diff --git a/src/runtime/dolphin_runtime.cpp b/src/runtime/dolphin_runtime.cpp
+index f9b5405..1e0741c 100644
+--- a/src/runtime/dolphin_runtime.cpp
++++ b/src/runtime/dolphin_runtime.cpp
+@@ -110,10 +110,12 @@ PowerPC::CPUCore SelectCPUCore() {
+ }
+ } // namespace
+ 
++extern bool g_turbulence_menu_open;
++
+ std::vector<std::string> Host_GetPreferredLocales() { return {}; }
+ void Host_PPCSymbolsChanged() {}
+ void Host_PPCBreakpointsChanged() {}
+-bool Host_UIBlocksControllerState() { return false; }
++bool Host_UIBlocksControllerState() { return g_turbulence_menu_open; }
+ void Host_Message(HostMessageID id) {
+   if (id == HostMessageID::WMUserStop && s_platform)
+     s_platform->Stop();
+@@ -134,7 +136,7 @@ void Host_JitCacheInvalidation() {}
+ void Host_JitProfileDataWiped() {}
+ void Host_RequestRenderWindowSize(int, int) {}
+ bool Host_RendererHasFocus() {
+-  return !s_platform || s_platform->IsWindowFocused();
++  return s_platform && s_platform->IsWindowFocused();
+ }
+ bool Host_RendererHasFullFocus() { return Host_RendererHasFocus(); }
+ bool Host_RendererIsFullscreen() {
+@@ -665,6 +667,16 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+   if (impl->config.graphics.internal_resolution_scale)
+     Config::SetBase(Config::GFX_EFB_SCALE,
+                     *impl->config.graphics.internal_resolution_scale);
++  else
++    Config::SetBase(Config::GFX_EFB_SCALE, 2);
++  Config::SetBase(Config::GFX_ASPECT_RATIO, AspectMode::ForceWide);
++  Config::SetBase(Config::GFX_WIDESCREEN_HACK, true);
++  Config::SetBaseOrCurrent(Config::GFX_VSYNC, true);
++  Config::SetBaseOrCurrent(Config::GFX_MTL_USE_PRESENT_DRAWABLE, TriState::On);
++  Config::SetBaseOrCurrent(Config::MAIN_PRECISION_FRAME_TIMING, true);
++  Config::SetBaseOrCurrent(Config::MAIN_RUSH_FRAME_PRESENTATION, false);
++  Config::SetBaseOrCurrent(Config::MAIN_SMOOTH_EARLY_PRESENTATION, true);
++  Config::SetBaseOrCurrent(Config::MAIN_CORRECT_TIME_DRIFT, true);
+   Config::SetBase(Config::GFX_SHADER_CACHE, true);
+   Config::SetBase(Config::GFX_SHADER_COMPILATION_MODE,
+                   ShaderCompilationMode::AsynchronousUberShaders);
+@@ -688,8 +700,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+   Config::SetBase(Config::MAIN_AUDIO_BACKEND, impl->config.audio.backend);
+   if (impl->config.audio.mute)
+     Config::SetBase(Config::MAIN_AUDIO_VOLUME, 0);
+-  Config::SetBase(Config::MAIN_INPUT_BACKGROUND_INPUT,
+-                  impl->config.input.background_input);
++  Config::SetBaseOrCurrent(Config::MAIN_INPUT_BACKGROUND_INPUT, false);
+ 
+   auto &jit = Core::System::GetInstance().GetJitInterface();
+   StaticRecompModuleSource recomp_source;
+diff --git a/tools/frontend_config.cpp b/tools/frontend_config.cpp
+index 03740d4..0724326 100644
+--- a/tools/frontend_config.cpp
++++ b/tools/frontend_config.cpp
+@@ -36,6 +36,8 @@ bool ValidNetplayAddress(std::string_view value) {
+ 
+ std::string NormalizeGraphicsBackend(std::string value) {
+   const std::string lower = Lower(Trim(std::move(value)));
++  if (lower == "metal")
++    return "Metal";
+   if (lower == "vulkan")
+     return "Vulkan";
+   if (lower == "opengl" || lower == "ogl")
+@@ -85,6 +87,9 @@ const std::vector<ResolutionOption> &SupportedResolutions() {
+ 
+ const std::vector<GraphicsBackendOption> &SupportedGraphicsBackends() {
+   static const std::vector<GraphicsBackendOption> backends = {
++#if defined(__APPLE__)
++      {"Metal", "Metal"},
++#endif
+       {"Vulkan", "Vulkan"},
+       {"OpenGL", "OGL"},
+   };
+@@ -124,7 +129,7 @@ ConfigResult LoadConfig(const fs::path &user_directory,
+     else if (key == "backend" || key == "graphics_backend") {
+       config.graphics_backend = NormalizeGraphicsBackend(raw_value);
+       if (config.graphics_backend.empty())
+-        return {.error = "graphics backend must be Vulkan or OpenGL"};
++        return {.error = "graphics backend must be Metal, Vulkan, or OpenGL"};
+     }
+     else if (key == "controller")
+       config.controller = raw_value;
+diff --git a/tools/frontend_config.hpp b/tools/frontend_config.hpp
+index 3b18d05..71ef24e 100644
+--- a/tools/frontend_config.hpp
++++ b/tools/frontend_config.hpp
+@@ -21,7 +21,11 @@ struct GraphicsBackendOption {
+ struct ConfigResult {
+   int dolphin_scale = 0;
+   std::string resolution;
++#if defined(__APPLE__)
++  std::string graphics_backend = "Metal";
++#else
+   std::string graphics_backend = "Vulkan";
++#endif
+   std::string controller;
+   std::vector<std::string> controllers;
+   bool show_fps_in_title = true;
+diff --git a/tools/moderngekko_port.cpp b/tools/moderngekko_port.cpp
+index af1c2a5..c59f2b6 100644
+--- a/tools/moderngekko_port.cpp
++++ b/tools/moderngekko_port.cpp
+@@ -670,6 +670,29 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
+       pgo_compile_flags += " -Werror=profile-instr-out-of-date";
+   }
+ 
++  // Turbulence: recompile the game's _Main.rel too when its layout is pinned.
++  // DolRecomp bakes the REL's relocated addresses into the generated code, so
++  // they must be the addresses the game itself links the REL to at run time:
++  // TURBULENCE_REL_BASE is the address OSLink loads the file at, and
++  // TURBULENCE_REL_BSS where the game puts its .bss. Without them the REL keeps
++  // running in the fallback JIT, exactly as before.
++  const auto env_text = [](const char* name) {
++    const char* value = std::getenv(name);
++    return value ? std::string(value) : std::string();
++  };
++  const std::string rel_base = env_text("TURBULENCE_REL_BASE");
++  const std::string rel_bss = env_text("TURBULENCE_REL_BSS");
++  const bool recompile_rel = !game.main_rel.empty() && !rel_base.empty() &&
++                             env_text("TURBULENCE_REL_DISABLE").empty();
++  if (recompile_rel && options.backend != "c")
++  {
++    std::cerr << "TURBULENCE_REL_BASE currently needs the C backend\n";
++    return std::nullopt;
++  }
++  const std::string rel_identity = recompile_rel
++      ? "|rel=" + game.rel_sha256 + "@" + rel_base + "/bss=" + rel_bss + "|rel-glue=2"
++      : std::string();
++
+   const std::string identity = std::string(RECOMPCORE_REVISION) + "|dolrecomp=" +
+       std::string(DOLRECOMP_REVISION) + "|module-abi=" +
+       std::to_string(MODERNGEKKO_MODULE_ABI_VERSION) + "|cpu-abi=" +
+@@ -677,7 +700,7 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
+       std::string(architecture) + "|" + flags + "|backend=" + options.backend +
+       "|patches=" + patches.fingerprint + "|dolrecomp_binary=" +
+       *dolrecomp_hash + "|" + moderngekko::pgo::PgoCacheIdentity(options.pgo) +
+-      DolRecompCodegenIdentity();
++      DolRecompCodegenIdentity() + rel_identity;
+   std::ostringstream key_tail;
+   key_tail << std::hex << std::setfill('0') << std::setw(16) << Fnv1a(identity);
+   const std::string cache_key = game.dol_sha256 + "-" + key_tail.str();
+@@ -711,6 +734,9 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
+              << "flags=" << flags << '\n'
+              << "backend=" << options.backend << '\n'
+              << "patches=" << patches.fingerprint << '\n';
++    if (recompile_rel)
++      manifest << "rel_sha256=" << game.rel_sha256 << '\n'
++               << "rel_base=" << rel_base << '\n' << "rel_bss=" << rel_bss << '\n';
+     if (options.pgo.mode != moderngekko::pgo::PgoMode::Off)
+       manifest << moderngekko::pgo::FormatPgoManifest(options.pgo, options.pgo_facts);
+     manifest.close();
+@@ -794,6 +820,32 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
+   else
+     std::ofstream{normalized_smc};
+ 
++  fs::path rel_generated;
++  if (recompile_rel)
++  {
++    ScopedEnvironment rel_environment;
++    if (!rel_bss.empty())
++      rel_environment.Set("DOLRECOMP_REL_BSS", rel_bss);
++    const fs::path rel_parent = generated_parent / "rel";
++    const std::string generate_rel = Quote(dolrecomp) + " -j" +
++        std::to_string(std::max(1u, std::thread::hardware_concurrency())) +
++        " --backend=c --cpu gekko --gamecube --rel-base " + rel_base + " " +
++        Quote(game.main_rel) + " " + Quote(rel_parent);
++    std::cout << "recompiling " << game.main_rel << " at " << rel_base
++              << (rel_bss.empty() ? std::string() : " (bss " + rel_bss + ")") << '\n';
++    if (!RunCommand(generate_rel))
++      return std::nullopt;
++    rel_generated = rel_parent / "generated";
++    if (!fs::is_regular_file(rel_generated / "generated.h") ||
++        !fs::is_regular_file(rel_generated / "rel_image.bin"))
++    {
++      std::cerr << "DolRecomp did not produce the REL output in " << rel_generated << '\n';
++      return std::nullopt;
++    }
++    if (!fs::is_regular_file(rel_generated / "generated_smc.txt"))
++      std::ofstream{rel_generated / "generated_smc.txt"};
++  }
++
+   const unsigned compile_jobs = std::max(1u, std::thread::hardware_concurrency());
+   std::string configure = "cmake -E env CMAKE_NINJA_FORCE_RESPONSE_FILE=1 cmake -S " +
+       Quote(source_root / "vendor/dolphin/module-template") +
+@@ -806,6 +858,8 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
+            : " -DRECOMPCORE_MODULE_OPT_LEVEL=" + options.opt_level) +
+       " -DCHASSIS_ABI_DIR=" +
+       Quote(source_root / "vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp");
++  if (!rel_generated.empty())
++    configure += " -DREL_GENERATED_DIR=" + Quote(rel_generated);
+   if (!pgo_compile_flags.empty())
+     configure += " -DCMAKE_C_FLAGS=" + QuoteText(pgo_compile_flags) +
+                  " -DCMAKE_SHARED_LINKER_FLAGS=" + QuoteText(pgo_compile_flags);

@@ -1,0 +1,1482 @@
+diff --git a/Source/Core/Common/Timer.cpp b/Source/Core/Common/Timer.cpp
+index fcbbd7b..9c4fa9d 100644
+--- a/Source/Core/Common/Timer.cpp
++++ b/Source/Core/Common/Timer.cpp
+@@ -177,6 +177,11 @@ void PrecisionTimer::SleepUntil(Clock::time_point target)
+     SetWaitableTimerEx(m_timer_handle, &due_time, 0, NULL, NULL, NULL, 0);
+     WaitForSingleObject(m_timer_handle, INFINITE);
+   }
++#elif defined(__APPLE__)
++  constexpr auto MACOS_SPIN_TIME = std::chrono::microseconds{1500};
++  const auto now = Clock::now();
++  if (target > now + MACOS_SPIN_TIME)
++    std::this_thread::sleep_until(target - MACOS_SPIN_TIME);
+ #else
+   // Sleeping on Linux generally isn't as terrible as it is on Windows.
+   std::this_thread::sleep_until(target - SPIN_TIME);
+@@ -187,6 +192,8 @@ void PrecisionTimer::SleepUntil(Clock::time_point target)
+   {
+ #if defined(_WIN32)
+     YieldProcessor();
++#elif defined(__aarch64__)
++    __builtin_arm_yield();
+ #else
+     std::this_thread::yield();
+ #endif
+diff --git a/Source/Core/DolphinNoGUI/PlatformMacos.mm b/Source/Core/DolphinNoGUI/PlatformMacos.mm
+index e942282..68fe87d 100644
+--- a/Source/Core/DolphinNoGUI/PlatformMacos.mm
++++ b/Source/Core/DolphinNoGUI/PlatformMacos.mm
+@@ -162,6 +162,82 @@
+ }
+ @end
+ 
++bool g_turbulence_macos_key_down[128] = {};
++
++namespace
++{
++void ClearMacOSKeyStates()
++{
++  std::memset(g_turbulence_macos_key_down, 0, sizeof(g_turbulence_macos_key_down));
++}
++
++bool AnyMacOSKeyDown()
++{
++  for (bool down : g_turbulence_macos_key_down)
++  {
++    if (down)
++      return true;
++  }
++  return false;
++}
++
++bool IsSpotlightOverlayActive()
++{
++  static auto s_last_check = std::chrono::steady_clock::now() - std::chrono::seconds(1);
++  static bool s_cached_active = false;
++
++  const auto now = std::chrono::steady_clock::now();
++  if (now - s_last_check < std::chrono::milliseconds(50))
++    return s_cached_active;
++  s_last_check = now;
++
++  bool active = false;
++  CFArrayRef window_list = CGWindowListCopyWindowInfo(
++      kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID);
++  if (window_list)
++  {
++    const CFIndex count = CFArrayGetCount(window_list);
++    for (CFIndex i = 0; i < count; ++i)
++    {
++      auto dict = static_cast<CFDictionaryRef>(CFArrayGetValueAtIndex(window_list, i));
++      if (!dict)
++        continue;
++      auto owner = static_cast<CFStringRef>(CFDictionaryGetValue(dict, kCGWindowOwnerName));
++      if (!owner)
++        continue;
++      if (CFStringCompare(owner, CFSTR("Spotlight"), 0) == kCFCompareEqualTo)
++      {
++        int layer = 0;
++        if (auto layer_num = static_cast<CFNumberRef>(CFDictionaryGetValue(dict, kCGWindowLayer)))
++          CFNumberGetValue(layer_num, kCFNumberIntType, &layer);
++        // Spotlight's menubar icon lives in layer 25 with tiny height (~24px);
++        // the Spotlight search bar / results window has height >= 40px.
++        auto bounds_dict =
++            static_cast<CFDictionaryRef>(CFDictionaryGetValue(dict, kCGWindowBounds));
++        CGRect bounds = CGRectZero;
++        if (bounds_dict)
++          CGRectMakeWithDictionaryRepresentation(bounds_dict, &bounds);
++        if (bounds.size.height >= 40.0 && bounds.size.width >= 200.0)
++        {
++          active = true;
++          break;
++        }
++      }
++    }
++    CFRelease(window_list);
++  }
++  s_cached_active = active;
++  return active;
++}
++}  // namespace
++
++bool Turbulence_IsMacOSKeyDown(unsigned short keycode)
++{
++  if (keycode >= 128)
++    return false;
++  return g_turbulence_macos_key_down[keycode];
++}
++
+ namespace
+ {
+ class PlatformMacOS : public Platform
+@@ -197,6 +273,7 @@ private:
+ 
+ PlatformMacOS::~PlatformMacOS()
+ {
++  ClearMacOSKeyStates();
+   [m_window close];
+ }
+ 
+@@ -285,8 +362,8 @@ void PlatformMacOS::MainLoop()
+     UpdateRunningFlag();
+     Core::HostDispatchJobs(Core::System::GetInstance());
+     ProcessEvents();
+-    UpdateWindowPosition();
+   }
++  UpdateWindowPosition();
+ }
+ 
+ WindowSystemInfo PlatformMacOS::GetWindowSystemInfo() const
+@@ -305,18 +382,82 @@ void PlatformMacOS::ProcessEvents()
+ {
+   @autoreleasepool
+   {
+-    NSDate* expiration = [NSDate dateWithTimeIntervalSinceNow:1];
++    const bool window_active =
++        [NSApp isActive] && ([m_window isKeyWindow] || [m_window isMainWindow]);
++
++    if (!window_active || (AnyMacOSKeyDown() && IsSpotlightOverlayActive()))
++      ClearMacOSKeyStates();
++
+     NSEvent* event = [NSApp nextEventMatchingMask:NSEventMaskAny
+-                                        untilDate:expiration
++                                        untilDate:nil
+                                            inMode:NSDefaultRunLoopMode
+                                           dequeue:YES];
++    while (event != nil)
++    {
++      const NSEventType type = [event type];
++      if (type == NSEventTypeKeyDown || type == NSEventTypeKeyUp)
++      {
++        const NSEventModifierFlags mods = [event modifierFlags];
++        if ((mods & NSEventModifierFlagCommand) != 0)
++        {
++          ClearMacOSKeyStates();
++          [NSApp sendEvent:event];
++        }
++        else if (window_active && (type == NSEventTypeKeyUp || !IsSpotlightOverlayActive()))
++        {
++          const unsigned short kc = [event keyCode];
++          if (kc < 128)
++            g_turbulence_macos_key_down[kc] = (type == NSEventTypeKeyDown);
++        }
++        else
++        {
++          ClearMacOSKeyStates();
++        }
++      }
++      else if (type == NSEventTypeFlagsChanged)
++      {
++        if (window_active && !IsSpotlightOverlayActive())
++        {
++          const unsigned short kc = [event keyCode];
++          const NSEventModifierFlags mods = [event modifierFlags];
++          if (kc == kVK_Shift || kc == kVK_RightShift)
++            g_turbulence_macos_key_down[kc] = (mods & NSEventModifierFlagShift) != 0;
++          else if (kc == kVK_Control || kc == kVK_RightControl)
++            g_turbulence_macos_key_down[kc] = (mods & NSEventModifierFlagControl) != 0;
++          else if (kc == kVK_Option || kc == kVK_RightOption)
++            g_turbulence_macos_key_down[kc] = (mods & NSEventModifierFlagOption) != 0;
++          else if (kc == kVK_Command || kc == kVK_RightCommand)
++          {
++            const bool cmd_down = (mods & NSEventModifierFlagCommand) != 0;
++            if (cmd_down)
++              ClearMacOSKeyStates();
++            if (kc < 128)
++              g_turbulence_macos_key_down[kc] = cmd_down;
++          }
++          else if (kc == kVK_CapsLock)
++            g_turbulence_macos_key_down[kc] = (mods & NSEventModifierFlagCapsLock) != 0;
++        }
++        else
++        {
++          ClearMacOSKeyStates();
++        }
++        [NSApp sendEvent:event];
++      }
++      else
++      {
++        [NSApp sendEvent:event];
++      }
+ 
+-    [NSApp sendEvent:event];
++      event = [NSApp nextEventMatchingMask:NSEventMaskAny
++                                 untilDate:nil
++                                    inMode:NSDefaultRunLoopMode
++                                   dequeue:YES];
++    }
+ 
+     // Need to update if m_window becomes fullscreen
+-    m_window_fullscreen = [m_window styleMask] & NSWindowStyleMaskFullScreen;
++    m_window_fullscreen = ([m_window styleMask] & NSWindowStyleMaskFullScreen) != 0;
+ 
+-    if ([m_window isMainWindow])
++    if (window_active)
+     {
+       m_window_focus = true;
+       if (Config::Get(Config::MAIN_SHOW_CURSOR) == Config::ShowCursor::Never &&
+@@ -328,6 +469,7 @@ void PlatformMacOS::ProcessEvents()
+     else
+     {
+       m_window_focus = false;
++      ClearMacOSKeyStates();
+       if (Config::Get(Config::MAIN_SHOW_CURSOR) == Config::ShowCursor::Never)
+         [NSCursor hide];
+     }
+diff --git a/Source/Core/InputCommon/ControlReference/ExpressionParser.cpp b/Source/Core/InputCommon/ControlReference/ExpressionParser.cpp
+index ee2e78d..4858516 100644
+--- a/Source/Core/InputCommon/ControlReference/ExpressionParser.cpp
++++ b/Source/Core/InputCommon/ControlReference/ExpressionParser.cpp
+@@ -680,19 +680,13 @@ std::shared_ptr<Device> ControlEnvironment::FindDevice(const ControlQualifier& q
+ Device::Input* ControlEnvironment::FindInput(const ControlQualifier& qualifier) const
+ {
+   const std::shared_ptr<Device> device = FindDevice(qualifier);
+-  if (!device)
+-    return nullptr;
+-
+-  return device->FindInput(qualifier.control_name);
++  return container.FindInput(qualifier.control_name, device.get());
+ }
+ 
+ Device::Output* ControlEnvironment::FindOutput(const ControlQualifier& qualifier) const
+ {
+   const std::shared_ptr<Device> device = FindDevice(qualifier);
+-  if (!device)
+-    return nullptr;
+-
+-  return device->FindOutput(qualifier.control_name);
++  return device ? container.FindOutput(qualifier.control_name, device.get()) : nullptr;
+ }
+ 
+ std::shared_ptr<ControlState> ControlEnvironment::GetVariablePtr(const std::string& name)
+diff --git a/Source/Core/InputCommon/ControllerInterface/CoreDevice.cpp b/Source/Core/InputCommon/ControllerInterface/CoreDevice.cpp
+index a10edd1..351ea8e 100644
+--- a/Source/Core/InputCommon/ControllerInterface/CoreDevice.cpp
++++ b/Source/Core/InputCommon/ControllerInterface/CoreDevice.cpp
+@@ -232,10 +232,11 @@ void DeviceQualifier::FromDevice(const Device* const dev)
+ 
+ bool DeviceQualifier::operator==(const Device* const dev) const
+ {
+-  if (dev->GetId() == cid)
+-    if (dev->GetName() == name)
+-      if (dev->GetSource() == source)
+-        return true;
++  if (dev->GetId() == cid && dev->GetSource() == source)
++  {
++    if (dev->GetName() == name || name.empty() || name == "*" || name == "Any")
++      return true;
++  }
+ 
+   return false;
+ }
+@@ -253,6 +254,19 @@ std::shared_ptr<Device> DeviceContainer::FindDevice(const DeviceQualifier& devq)
+     if (devq == d.get())
+       return d;
+   }
++  if (devq.source == "SDL")
++  {
++    for (const auto& d : m_devices)
++    {
++      if (d->GetSource() == "SDL" && d->GetId() == devq.cid)
++        return d;
++    }
++    for (const auto& d : m_devices)
++    {
++      if (d->GetSource() == "SDL")
++        return d;
++    }
++  }
+ 
+   return nullptr;
+ }
+diff --git a/Source/Core/InputCommon/ControllerInterface/Quartz/QuartzKeyboardAndMouse.mm b/Source/Core/InputCommon/ControllerInterface/Quartz/QuartzKeyboardAndMouse.mm
+index 5f0022c..a5616a3 100644
+--- a/Source/Core/InputCommon/ControllerInterface/Quartz/QuartzKeyboardAndMouse.mm
++++ b/Source/Core/InputCommon/ControllerInterface/Quartz/QuartzKeyboardAndMouse.mm
+@@ -189,9 +189,15 @@ KeyboardAndMouse::Key::Key(CGKeyCode keycode) : m_keycode(keycode), m_name(Keyco
+ {
+ }
+ 
++}  // namespace ciface::Quartz
++
++extern bool Turbulence_IsMacOSKeyDown(unsigned short keycode);
++
++namespace ciface::Quartz
++{
+ ControlState KeyboardAndMouse::Key::GetState() const
+ {
+-  return CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, m_keycode) != 0;
++  return Turbulence_IsMacOSKeyDown(m_keycode) ? 1.0 : 0.0;
+ }
+ 
+ std::string KeyboardAndMouse::Key::GetName() const
+diff --git a/Source/Core/InputCommon/ControllerInterface/SDL/SDLGamepad.cpp b/Source/Core/InputCommon/ControllerInterface/SDL/SDLGamepad.cpp
+index 0945759..a401ae7 100644
+--- a/Source/Core/InputCommon/ControllerInterface/SDL/SDLGamepad.cpp
++++ b/Source/Core/InputCommon/ControllerInterface/SDL/SDLGamepad.cpp
+@@ -57,6 +57,7 @@ Gamepad::Gamepad(SDL_Gamepad* const gamepad, SDL_Joystick* const joystick)
+     auto** bindings = SDL_GetGamepadBindings(gamepad, &binding_count);
+     Common::ScopeGuard free_bindings([&] { SDL_free(bindings); });
+ 
++    std::unordered_set<int> added_gamepad_axes;
+     for (auto* const binding : std::span(bindings, binding_count))
+     {
+       register_mapping(*binding);
+@@ -69,6 +70,8 @@ Gamepad::Gamepad(SDL_Gamepad* const gamepad, SDL_Joystick* const joystick)
+       case SDL_GAMEPAD_BINDTYPE_AXIS:
+       {
+         const auto axis = binding->output.axis.axis;
++        if (!added_gamepad_axes.insert(static_cast<int>(axis)).second)
++          break;
+         if (IsTriggerAxis(axis))
+         {
+           AddInput(new Axis(m_gamepad, 32767, axis));
+@@ -86,6 +89,22 @@ Gamepad::Gamepad(SDL_Gamepad* const gamepad, SDL_Joystick* const joystick)
+       }
+     }
+ 
++    for (int axis_idx = 0; axis_idx < 6; ++axis_idx)
++    {
++      if (added_gamepad_axes.contains(axis_idx))
++        continue;
++      const auto axis = static_cast<SDL_GamepadAxis>(axis_idx);
++      if (IsTriggerAxis(axis_idx))
++      {
++        AddInput(new Axis(m_gamepad, 32767, axis));
++      }
++      else
++      {
++        AddInput(new Axis(m_gamepad, -32768, axis));
++        AddInput(new Axis(m_gamepad, 32767, axis));
++      }
++    }
++
+     const auto properties = SDL_GetGamepadProperties(m_gamepad);
+ 
+     // Rumble
+diff --git a/Source/Core/VideoBackends/Metal/MTLGfx.mm b/Source/Core/VideoBackends/Metal/MTLGfx.mm
+index 4b744fe..4d13b66 100644
+--- a/Source/Core/VideoBackends/Metal/MTLGfx.mm
++++ b/Source/Core/VideoBackends/Metal/MTLGfx.mm
+@@ -16,12 +16,43 @@
+ #include "VideoCommon/Present.h"
+ #include "VideoCommon/VideoBackendBase.h"
+ 
++#include <cstdlib>
+ #include <fstream>
+ 
++extern bool g_turbulence_metal_hud_enabled;
++
++namespace
++{
++void SyncMetalHUDState(CAMetalLayer* layer, bool force = false)
++{
++#if TARGET_OS_OSX
++  static int s_last_state = -1;
++  const int desired = g_turbulence_metal_hud_enabled ? 1 : 0;
++  if (!force && s_last_state == desired)
++    return;
++  s_last_state = desired;
++  setenv("MTL_HUD_ENABLED", desired ? "1" : "0", 1);
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability"
++  if (layer && [layer respondsToSelector:@selector(setDeveloperHUDProperties:)])
++  {
++    if (desired)
++      [layer setDeveloperHUDProperties:@{@"mode": @"default"}];
++    else
++      [layer setDeveloperHUDProperties:nil];
++  }
++#pragma clang diagnostic pop
++#endif
++}
++}  // namespace
++
+ Metal::Gfx::Gfx(MRCOwned<CAMetalLayer*> layer) : m_layer(std::move(layer))
+ {
+   UpdateActiveConfig();
+   [m_layer setDisplaySyncEnabled:g_ActiveConfig.bVSyncActive];
++  if ([m_layer respondsToSelector:@selector(setMaximumDrawableCount:)])
++    [m_layer setMaximumDrawableCount:3];
++  SyncMetalHUDState(m_layer, true);
+ 
+   SetupSurface();
+   g_state_tracker->FlushEncoders();
+@@ -465,6 +496,7 @@ void Metal::Gfx::PresentBackbuffer()
+ {
+   @autoreleasepool
+   {
++    SyncMetalHUDState(m_layer, false);
+     g_state_tracker->EndRenderPass();
+     if (m_drawable)
+     {
+@@ -475,10 +507,18 @@ void Metal::Gfx::PresentBackbuffer()
+       // It also seems to improve frame pacing, so enable it by default with vsync
+       if (g_ActiveConfig.iUsePresentDrawable == TriState::On ||
+           (g_ActiveConfig.iUsePresentDrawable == TriState::Auto && g_ActiveConfig.bVSyncActive))
+-        [g_state_tracker->GetRenderCmdBuf() presentDrawable:m_drawable];
++      {
++        id<MTLCommandBuffer> cmd_buf = g_state_tracker->GetRenderCmdBuf();
++        if ([cmd_buf respondsToSelector:@selector(presentDrawable:afterMinimumDuration:)])
++          [cmd_buf presentDrawable:m_drawable afterMinimumDuration:0.014];
++        else
++          [cmd_buf presentDrawable:m_drawable];
++      }
+       else
++      {
+         [g_state_tracker->GetRenderCmdBuf()
+             addScheduledHandler:[drawable = std::move(m_drawable)](id) { [drawable present]; }];
++      }
+       m_backbuffer->UpdateBackbufferTexture(nullptr);
+       m_drawable = nullptr;
+     }
+diff --git a/Source/Core/VideoBackends/Metal/MTLMain.mm b/Source/Core/VideoBackends/Metal/MTLMain.mm
+index ff8480e..31f4dd8 100644
+--- a/Source/Core/VideoBackends/Metal/MTLMain.mm
++++ b/Source/Core/VideoBackends/Metal/MTLMain.mm
+@@ -29,6 +29,10 @@
+ #include "VideoCommon/VideoCommon.h"
+ #include "VideoCommon/VideoConfig.h"
+ 
++#include <cstdlib>
++
++extern bool g_turbulence_metal_hud_enabled;
++
+ std::string Metal::VideoBackend::GetConfigName() const
+ {
+   return CONFIG_NAME;
+@@ -181,6 +185,18 @@ void Metal::VideoBackend::PrepareWindow(WindowSystemInfo& wsi)
+   [view setWantsLayer:YES];
+   [view setLayer:layer];
+ 
++  setenv("MTL_HUD_ENABLED", g_turbulence_metal_hud_enabled ? "1" : "0", 1);
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability"
++  if ([layer respondsToSelector:@selector(setDeveloperHUDProperties:)])
++  {
++    if (g_turbulence_metal_hud_enabled)
++      [layer setDeveloperHUDProperties:@{@"mode": @"default"}];
++    else
++      [layer setDeveloperHUDProperties:nil];
++  }
++#pragma clang diagnostic pop
++
+   wsi.render_surface = layer;
+ #endif
+ }
+diff --git a/Source/Core/VideoCommon/OnScreenUI.cpp b/Source/Core/VideoCommon/OnScreenUI.cpp
+index 451109b..418144e 100644
+--- a/Source/Core/VideoCommon/OnScreenUI.cpp
++++ b/Source/Core/VideoCommon/OnScreenUI.cpp
+@@ -413,6 +413,426 @@ void OnScreenUI::DrawChallengesAndLeaderboards()
+ #endif  // USE_RETRO_ACHIEVEMENTS
+ }
+ 
++}  // namespace VideoCommon
++
++#include "Core/Host.h"
++#include "InputCommon/ControllerInterface/ControllerInterface.h"
++#include "VideoCommon/VertexShaderManager.h"
++
++extern bool g_turbulence_hud_stretched;
++extern bool g_turbulence_metal_hud_enabled;
++extern bool g_turbulence_menu_open;
++extern bool g_turbulence_drawing_efb_copy;
++bool g_turbulence_hud_stretched = false;
++bool g_turbulence_metal_hud_enabled = true;
++bool g_turbulence_menu_open = false;
++bool g_turbulence_drawing_efb_copy = false;
++
++namespace VideoCommon
++{
++namespace
++{
++bool PollAnyDeviceInput(std::string_view input_name, double threshold = 0.5)
++{
++  if (!Host_RendererHasFocus() || !g_controller_interface.IsInit())
++    return false;
++  for (const auto& dev : g_controller_interface.GetAllDevices())
++  {
++    if (!dev)
++      continue;
++    if (auto* inp = dev->FindInput(input_name))
++    {
++      if (inp->GetState() > threshold)
++        return true;
++    }
++  }
++  return false;
++}
++
++void DrawTurbulenceOptionsMenu(float scale)
++{
++  static bool s_prev_toggle = false;
++  static bool s_prev_up = false;
++  static bool s_prev_down = false;
++  static bool s_prev_left = false;
++  static bool s_prev_right = false;
++  static bool s_prev_confirm = false;
++  static bool s_prev_cancel = false;
++  static int s_selected_row = 0;
++  static bool s_confirm_exit_open = false;
++  static int s_confirm_exit_choice = 0;  // 0 = No (Left), 1 = Yes (Right)
++
++  const bool has_focus = Host_RendererHasFocus();
++
++  // Poll R1 (Shoulder R) on any controller, or Tab / F1 on keyboard (only when focused)
++  const bool toggle_down =
++      has_focus && (PollAnyDeviceInput("Shoulder R") || PollAnyDeviceInput("Tab") ||
++                    PollAnyDeviceInput("F1") || ImGui::IsKeyDown(ImGuiKey_Tab));
++  if (toggle_down && !s_prev_toggle)
++  {
++    g_turbulence_menu_open = !g_turbulence_menu_open;
++    if (!g_turbulence_menu_open)
++      s_confirm_exit_open = false;
++  }
++  s_prev_toggle = toggle_down;
++
++  const ImVec2 display_size = ImGui::GetIO().DisplaySize;
++  if (display_size.x <= 0.0f || display_size.y <= 0.0f)
++    return;
++
++  // Subtle top-left badge when closed so user can verify R1 menu is active
++  if (!g_turbulence_menu_open)
++  {
++    ImGui::SetNextWindowPos(ImVec2(14.0f * scale, 14.0f * scale), ImGuiCond_Always);
++    ImGui::SetNextWindowBgAlpha(0.45f);
++    if (ImGui::Begin("##TurbulenceBadge", nullptr,
++                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoInputs |
++                         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
++                         ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoNav |
++                         ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoFocusOnAppearing))
++    {
++      ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 0.95f), "[R1 / Tab] Turbulence Options");
++    }
++    ImGui::End();
++    return;
++  }
++
++  // Poll controller navigation when menu is open and window is focused
++  const bool up_down =
++      has_focus && (PollAnyDeviceInput("Pad N") || PollAnyDeviceInput("Left Y+", 0.55) ||
++                    PollAnyDeviceInput("Up Arrow") || ImGui::IsKeyDown(ImGuiKey_UpArrow));
++  const bool down_down =
++      has_focus && (PollAnyDeviceInput("Pad S") || PollAnyDeviceInput("Left Y-", 0.55) ||
++                    PollAnyDeviceInput("Down Arrow") || ImGui::IsKeyDown(ImGuiKey_DownArrow));
++  const bool left_down =
++      has_focus && (PollAnyDeviceInput("Pad W") || PollAnyDeviceInput("Left X-", 0.55) ||
++                    PollAnyDeviceInput("Left Arrow") || ImGui::IsKeyDown(ImGuiKey_LeftArrow));
++  const bool right_down =
++      has_focus && (PollAnyDeviceInput("Pad E") || PollAnyDeviceInput("Left X+", 0.55) ||
++                    PollAnyDeviceInput("Right Arrow") || ImGui::IsKeyDown(ImGuiKey_RightArrow));
++  const bool confirm_down =
++      has_focus && (PollAnyDeviceInput("Button S") || PollAnyDeviceInput("Return") ||
++                    ImGui::IsKeyDown(ImGuiKey_Enter));
++  const bool cancel_down =
++      has_focus && (PollAnyDeviceInput("Button E") || PollAnyDeviceInput("Escape") ||
++                    ImGui::IsKeyDown(ImGuiKey_Escape));
++
++  const bool nav_up = up_down && !s_prev_up;
++  const bool nav_down = down_down && !s_prev_down;
++  const bool nav_left = left_down && !s_prev_left;
++  const bool nav_right = right_down && !s_prev_right;
++  const bool nav_confirm = confirm_down && !s_prev_confirm;
++  const bool nav_cancel = cancel_down && !s_prev_cancel;
++
++  s_prev_up = up_down;
++  s_prev_down = down_down;
++  s_prev_left = left_down;
++  s_prev_right = right_down;
++  s_prev_confirm = confirm_down;
++  s_prev_cancel = cancel_down;
++
++  auto TriggerExitGame = []() {
++    Host_Message(HostMessageID::WMUserStop);
++    std::exit(0);
++  };
++
++  if (s_confirm_exit_open)
++  {
++    if (nav_cancel)
++    {
++      s_confirm_exit_open = false;
++    }
++    else
++    {
++      if (nav_left)
++        s_confirm_exit_choice = 0;  // No (Left)
++      if (nav_right)
++        s_confirm_exit_choice = 1;  // Yes (Right)
++      if (nav_confirm)
++      {
++        if (s_confirm_exit_choice == 1)
++          TriggerExitGame();
++        else
++          s_confirm_exit_open = false;
++      }
++    }
++  }
++  else
++  {
++    if (nav_cancel)
++    {
++      g_turbulence_menu_open = false;
++      return;
++    }
++
++    constexpr int kNumRows = 5;
++    if (nav_up)
++      s_selected_row = (s_selected_row + kNumRows - 1) % kNumRows;
++    if (nav_down)
++      s_selected_row = (s_selected_row + 1) % kNumRows;
++  }
++
++  // Resolution Scale options
++  struct ResOption
++  {
++    int scale;
++    const char* label;
++  };
++  static constexpr ResOption kResOptions[] = {
++      {1, "1x Native (640x528)"},   {2, "2x 720p (1280x1056)"},
++      {3, "3x 1080p (1920x1584)"},  {4, "4x 1440p (2560x2112)"},
++      {5, "5x (3200x2640)"},        {6, "6x 4K (3840x3168)"},
++  };
++  constexpr int kNumRes = static_cast<int>(std::size(kResOptions));
++  const int cur_scale = Config::Get(Config::GFX_EFB_SCALE);
++  int res_idx = 1;
++  for (int i = 0; i < kNumRes; ++i)
++  {
++    if (kResOptions[i].scale == cur_scale)
++    {
++      res_idx = i;
++      break;
++    }
++  }
++
++  // Aspect Ratio options
++  struct AspectOption
++  {
++    AspectMode mode;
++    const char* label;
++  };
++  static constexpr AspectOption kAspectOptions[] = {
++      {AspectMode::ForceWide, "16:9 (Widescreen)"},
++      {AspectMode::ForceStandard, "4:3 (Original)"},
++      {AspectMode::Auto, "Auto"},
++      {AspectMode::Stretch, "Stretch to Window"},
++  };
++  constexpr int kNumAspect = static_cast<int>(std::size(kAspectOptions));
++  const AspectMode cur_aspect = Config::Get(Config::GFX_ASPECT_RATIO);
++  int aspect_idx = 0;
++  for (int i = 0; i < kNumAspect; ++i)
++  {
++    if (kAspectOptions[i].mode == cur_aspect)
++    {
++      aspect_idx = i;
++      break;
++    }
++  }
++
++  auto ApplyResIdx = [&](int idx) {
++    idx = (idx + kNumRes) % kNumRes;
++    Config::SetBaseOrCurrent(Config::GFX_EFB_SCALE, kResOptions[idx].scale);
++  };
++
++  auto ApplyAspectIdx = [&](int idx) {
++    idx = (idx + kNumAspect) % kNumAspect;
++    const AspectMode mode = kAspectOptions[idx].mode;
++    Config::SetBaseOrCurrent(Config::GFX_ASPECT_RATIO, mode);
++    Config::SetBaseOrCurrent(Config::GFX_WIDESCREEN_HACK, mode != AspectMode::ForceStandard);
++    Core::System::GetInstance().GetVertexShaderManager().dirty = true;
++  };
++
++  if (!s_confirm_exit_open)
++  {
++    // Apply gamepad left/right/confirm changes
++    const int delta = nav_right ? 1 : (nav_left ? -1 : (nav_confirm ? 1 : 0));
++    if (delta != 0)
++    {
++      if (s_selected_row == 0)
++        ApplyResIdx(res_idx + delta);
++      else if (s_selected_row == 1)
++        ApplyAspectIdx(aspect_idx + delta);
++      else if (s_selected_row == 2)
++      {
++        g_turbulence_hud_stretched = !g_turbulence_hud_stretched;
++        Core::System::GetInstance().GetVertexShaderManager().dirty = true;
++      }
++      else if (s_selected_row == 3)
++      {
++        g_turbulence_metal_hud_enabled = !g_turbulence_metal_hud_enabled;
++      }
++      else if (s_selected_row == 4 && nav_confirm)
++      {
++        s_confirm_exit_open = true;
++        s_confirm_exit_choice = 0;  // Default to No (Left)
++      }
++    }
++  }
++
++  ImGui::SetNextWindowPos(ImVec2(display_size.x * 0.5f, display_size.y * 0.5f), ImGuiCond_Always,
++                          ImVec2(0.5f, 0.5f));
++  ImGui::SetNextWindowSize(ImVec2(520.0f * scale, 0.0f), ImGuiCond_Always);
++  ImGui::SetNextWindowBgAlpha(0.92f);
++
++  ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.06f, 0.09f, 0.16f, 0.95f));
++  ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.20f, 0.65f, 1.0f, 0.85f));
++  ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f);
++  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20.0f * scale, 16.0f * scale));
++  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.0f * scale, 12.0f * scale));
++
++  if (ImGui::Begin("Turbulence Options (Sonic Riders Recomp)", &g_turbulence_menu_open,
++                   ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize |
++                       ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize))
++  {
++    if (s_confirm_exit_open)
++    {
++      ImGui::Spacing();
++      ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.25f, 1.0f), "Are you sure?");
++      ImGui::TextColored(ImVec4(0.75f, 0.85f, 0.95f, 1.0f),
++                         "Select with Left / Right and press A / Cross to confirm:");
++      ImGui::Separator();
++      ImGui::Spacing();
++
++      // Left option: No (index 0)
++      const bool no_selected = (s_confirm_exit_choice == 0);
++      if (no_selected)
++      {
++        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.55f, 0.90f, 1.0f));
++        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.28f, 0.65f, 1.0f, 1.0f));
++      }
++      if (ImGui::Button(no_selected ? "> No <" : "  No  ", ImVec2(210.0f * scale, 38.0f * scale)))
++      {
++        s_confirm_exit_choice = 0;
++        s_confirm_exit_open = false;
++      }
++      if (no_selected)
++        ImGui::PopStyleColor(2);
++
++      ImGui::SameLine(0.0f, 36.0f * scale);
++
++      // Right option: Yes (index 1)
++      const bool yes_selected = (s_confirm_exit_choice == 1);
++      if (yes_selected)
++      {
++        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.22f, 0.22f, 1.0f));
++        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.95f, 0.30f, 0.30f, 1.0f));
++      }
++      if (ImGui::Button(yes_selected ? "> Yes <" : "  Yes  ", ImVec2(210.0f * scale, 38.0f * scale)))
++      {
++        s_confirm_exit_choice = 1;
++        TriggerExitGame();
++      }
++      if (yes_selected)
++        ImGui::PopStyleColor(2);
++
++      ImGui::Spacing();
++    }
++    else
++    {
++      ImGui::TextColored(ImVec4(0.45f, 0.85f, 1.0f, 1.0f),
++                         "Use D-Pad / Left Stick or Mouse  |  [R1 / B / Circle] Close");
++      ImGui::Separator();
++
++      auto DrawRowPrefix = [&](int row, const char* label) {
++        if (s_selected_row == row)
++          ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.20f, 1.0f), "> %-22s", label);
++        else
++          ImGui::Text("  %-22s", label);
++        ImGui::SameLine(230.0f * scale);
++      };
++
++      // Row 0: Resolution Scale
++      DrawRowPrefix(0, "Resolution Scale:");
++      if (ImGui::Button("<##res"))
++      {
++        s_selected_row = 0;
++        ApplyResIdx(res_idx - 1);
++      }
++      ImGui::SameLine();
++      ImGui::TextColored(s_selected_row == 0 ? ImVec4(1.0f, 0.9f, 0.3f, 1.0f) :
++                                               ImVec4(0.9f, 0.95f, 1.0f, 1.0f),
++                         "%-22s", kResOptions[res_idx].label);
++      ImGui::SameLine();
++      if (ImGui::Button(">##res"))
++      {
++        s_selected_row = 0;
++        ApplyResIdx(res_idx + 1);
++      }
++
++      // Row 1: Aspect Ratio
++      DrawRowPrefix(1, "Aspect Ratio:");
++      if (ImGui::Button("<##asp"))
++      {
++        s_selected_row = 1;
++        ApplyAspectIdx(aspect_idx - 1);
++      }
++      ImGui::SameLine();
++      ImGui::TextColored(s_selected_row == 1 ? ImVec4(1.0f, 0.9f, 0.3f, 1.0f) :
++                                               ImVec4(0.9f, 0.95f, 1.0f, 1.0f),
++                         "%-22s", kAspectOptions[aspect_idx].label);
++      ImGui::SameLine();
++      if (ImGui::Button(">##asp"))
++      {
++        s_selected_row = 1;
++        ApplyAspectIdx(aspect_idx + 1);
++      }
++
++      // Row 2: HUD Aspect Mode
++      DrawRowPrefix(2, "HUD Layout:");
++      if (ImGui::Button("<##hud"))
++      {
++        s_selected_row = 2;
++        g_turbulence_hud_stretched = !g_turbulence_hud_stretched;
++        Core::System::GetInstance().GetVertexShaderManager().dirty = true;
++      }
++      ImGui::SameLine();
++      ImGui::TextColored(s_selected_row == 2 ? ImVec4(1.0f, 0.9f, 0.3f, 1.0f) :
++                                               ImVec4(0.9f, 0.95f, 1.0f, 1.0f),
++                         "%-22s",
++                         g_turbulence_hud_stretched ? "Stretched (16:9)" : "Centered (4:3)");
++      ImGui::SameLine();
++      if (ImGui::Button(">##hud"))
++      {
++        s_selected_row = 2;
++        g_turbulence_hud_stretched = !g_turbulence_hud_stretched;
++        Core::System::GetInstance().GetVertexShaderManager().dirty = true;
++      }
++
++      // Row 3: Metal Performance HUD
++      DrawRowPrefix(3, "Metal HUD:");
++      if (ImGui::Button("<##mhud"))
++      {
++        s_selected_row = 3;
++        g_turbulence_metal_hud_enabled = !g_turbulence_metal_hud_enabled;
++      }
++      ImGui::SameLine();
++      ImGui::TextColored(g_turbulence_metal_hud_enabled ? ImVec4(0.35f, 1.0f, 0.55f, 1.0f) :
++                                                          ImVec4(0.85f, 0.45f, 0.45f, 1.0f),
++                         "%-22s", g_turbulence_metal_hud_enabled ? "Enabled (On)" : "Disabled (Off)");
++      ImGui::SameLine();
++      if (ImGui::Button(">##mhud"))
++      {
++        s_selected_row = 3;
++        g_turbulence_metal_hud_enabled = !g_turbulence_metal_hud_enabled;
++      }
++
++      ImGui::Separator();
++
++      // Row 4: Exit Game
++      DrawRowPrefix(4, "Exit Game:");
++      if (s_selected_row == 4)
++      {
++        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.75f, 0.18f, 0.18f, 1.0f));
++        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.90f, 0.25f, 0.25f, 1.0f));
++      }
++      if (ImGui::Button(s_selected_row == 4 ? "> Exit Game <" : "  Exit Game  ",
++                        ImVec2(230.0f * scale, 30.0f * scale)))
++      {
++        s_selected_row = 4;
++        s_confirm_exit_open = true;
++        s_confirm_exit_choice = 0;  // Default to No (Left)
++      }
++      if (s_selected_row == 4)
++        ImGui::PopStyleColor(2);
++    }
++  }
++  ImGui::End();
++
++  ImGui::PopStyleVar(3);
++  ImGui::PopStyleColor(2);
++}
++}  // namespace
++
+ void OnScreenUI::Finalize()
+ {
+   auto lock = GetImGuiLock();
+@@ -422,6 +842,7 @@ void OnScreenUI::Finalize()
+   DrawDebugText();
+   OSD::DrawMessages();
+   DrawChallengesAndLeaderboards();
++  DrawTurbulenceOptionsMenu(m_backbuffer_scale);
+   ImGui::Render();
+ 
+   // Check for font changes
+diff --git a/Source/Core/VideoCommon/Present.cpp b/Source/Core/VideoCommon/Present.cpp
+index 7c62730..6115d51 100644
+--- a/Source/Core/VideoCommon/Present.cpp
++++ b/Source/Core/VideoCommon/Present.cpp
+@@ -954,6 +954,10 @@ void Presenter::Present(PresentInfo* present_info)
+   {
+     std::lock_guard<std::mutex> guard(m_swap_mutex);
+ 
++    // Commit the GPU render command buffer FIRST so the GPU executes the frame's render passes
++    // in parallel while we pace the CPU/presenter thread to intended_present_time.
++    g_gfx->PresentBackbuffer();
++
+     if (present_info != nullptr)
+     {
+       const auto present_time = GetUpdatedPresentationTime(present_info->intended_present_time);
+@@ -964,8 +968,6 @@ void Presenter::Present(PresentInfo* present_info)
+       present_info->actual_present_time = Clock::now();
+       present_info->present_time_accuracy = PresentInfo::PresentTimeAccuracy::PresentInProgress;
+     }
+-
+-    g_gfx->PresentBackbuffer();
+   }
+ 
+   if (m_xfb_entry)
+diff --git a/Source/Core/VideoCommon/TextureCacheBase.cpp b/Source/Core/VideoCommon/TextureCacheBase.cpp
+index c5d6096..fb13dd0 100644
+--- a/Source/Core/VideoCommon/TextureCacheBase.cpp
++++ b/Source/Core/VideoCommon/TextureCacheBase.cpp
+@@ -1262,14 +1262,15 @@ TCacheEntry* TextureCacheBase::LoadImpl(u32 stage, bool force_reload)
+     //
+     // Spyro: A Hero's Tail is known for (deliberately?) using such overwritten textures
+     // in it's bloom effect, which breaks without giving it the invalidated texture.
+-    if (TMEM::IsCached(stage))
++    if (TMEM::IsCached(stage) && !entry->may_have_overlapping_textures)
+     {
+       return entry;
+     }
+ 
+     // Otherwise, hash the backing memory and check it's unchanged.
+     // FIXME: this doesn't correctly handle textures from tmem.
+-    if (!entry->invalidated && entry->base_hash == entry->CalculateHash())
++    if (!entry->invalidated && !entry->may_have_overlapping_textures &&
++        entry->base_hash == entry->CalculateHash())
+     {
+       return entry;
+     }
+@@ -1463,11 +1464,14 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
+     else
+     {
+       // For normal textures, all texture parameters need to match
+-      if (!entry->IsEfbCopy() && entry->hash == full_hash && entry->format == full_format &&
++      if (!entry->IsEfbCopy() &&
++          (entry->hash == full_hash || entry->may_have_overlapping_textures) &&
++          entry->format == full_format &&
+           entry->native_levels >= texture_info.GetLevelCount() &&
+           entry->native_width == texture_info.GetRawWidth() &&
+           entry->native_height == texture_info.GetRawHeight())
+       {
++        entry->SetHashes(base_hash, full_hash);
+         entry = DoPartialTextureUpdates(iter->second, texture_info.GetTlutAddress(),
+                                         texture_info.GetTlutFormat());
+         if (entry)
+@@ -2126,12 +2130,20 @@ bool TextureCacheBase::CopyFilterCanOverflow(const std::array<u32, 3>& coefficie
+   return coefficients[0] + coefficients[1] + coefficients[2] >= 128;
+ }
+ 
++static std::unordered_set<u32> s_turbulence_efb_copy_addrs;
++
++bool TurbulenceIsEFBCopyAddress(u32 addr)
++{
++  return s_turbulence_efb_copy_addrs.contains(addr);
++}
++
+ void TextureCacheBase::CopyRenderTargetToTexture(
+     u32 dstAddr, EFBCopyFormat dstFormat, u32 width, u32 height, u32 dstStride, bool is_depth_copy,
+     const MathUtil::Rectangle<int>& srcRect, bool isIntensity, bool scaleByHalf, float y_scale,
+     float gamma, bool clamp_top, bool clamp_bottom,
+     const CopyFilterCoefficients::Values& filter_coefficients)
+ {
++  s_turbulence_efb_copy_addrs.insert(dstAddr);
+   // Emulation methods:
+   //
+   // - EFB to RAM:
+@@ -2209,8 +2221,8 @@ void TextureCacheBase::CopyRenderTargetToTexture(
+   {
+     tex_w /= 2;
+     tex_h /= 2;
+-    scaled_tex_w /= 2;
+-    scaled_tex_h /= 2;
++    scaled_tex_w = tex_w;
++    scaled_tex_h = tex_h;
+   }
+ 
+   if (!is_xfb_copy && !g_ActiveConfig.bCopyEFBScaled)
+diff --git a/Source/Core/VideoCommon/VertexManagerBase.cpp b/Source/Core/VideoCommon/VertexManagerBase.cpp
+index 2bc6d58..d636384 100644
+--- a/Source/Core/VideoCommon/VertexManagerBase.cpp
++++ b/Source/Core/VideoCommon/VertexManagerBase.cpp
+@@ -562,6 +562,24 @@ void VertexManagerBase::Flush()
+   std::vector<std::string> texture_names;
+   Common::SmallVector<u32, 8> texture_units;
+   std::array<SamplerState, 8> samplers;
++  extern bool g_turbulence_drawing_efb_copy;
++  extern bool TurbulenceIsEFBCopyAddress(u32 addr);
++  bool drawing_efb_copy = false;
++  auto is_efb_or_postproc_tex = [](const TCacheEntry* cache_entry) {
++    if (!cache_entry)
++      return false;
++    if (cache_entry->IsCopy() || !cache_entry->references.empty() ||
++        TurbulenceIsEFBCopyAddress(cache_entry->addr))
++    {
++      return true;
++    }
++    if (cache_entry->native_width == 512 && cache_entry->native_height == 256 &&
++        cache_entry->format.texfmt == TextureFormat::RGB565)
++    {
++      return true;
++    }
++    return false;
++  };
+   if (!m_cull_all)
+   {
+     if (!g_ActiveConfig.bGraphicMods)
+@@ -571,6 +589,8 @@ void VertexManagerBase::Flush()
+         const auto cache_entry = g_texture_cache->Load(i);
+         if (!cache_entry)
+           continue;
++        if (is_efb_or_postproc_tex(cache_entry))
++          drawing_efb_copy = true;
+         const float custom_tex_scale = cache_entry->GetWidth() / float(cache_entry->native_width);
+         samplers[i] = TextureCacheBase::GetSamplerState(
+             i, custom_tex_scale, cache_entry->is_custom_tex, cache_entry->has_arbitrary_mips);
+@@ -583,6 +603,8 @@ void VertexManagerBase::Flush()
+         const auto cache_entry = g_texture_cache->Load(i);
+         if (cache_entry)
+         {
++          if (is_efb_or_postproc_tex(cache_entry))
++            drawing_efb_copy = true;
+           if (!Common::Contains(texture_names, cache_entry->texture_info_name))
+           {
+             texture_names.push_back(cache_entry->texture_info_name);
+@@ -595,7 +617,31 @@ void VertexManagerBase::Flush()
+         }
+       }
+     }
++    if (!drawing_efb_copy && xfmem.projection.type == ProjectionType::Orthographic)
++    {
++      const float x0 = VertexLoaderManager::position_cache[0][0];
++      const float x1 = VertexLoaderManager::position_cache[1][0];
++      const float x2 = VertexLoaderManager::position_cache[2][0];
++      float min_x = std::min({x0, x1, x2});
++      const float max_x = std::max({x0, x1, x2});
++      if (const auto* vtx_fmt = VertexLoaderManager::GetCurrentVertexFormat())
++      {
++        const auto& vtx_decl = vtx_fmt->GetVertexDeclaration();
++        if (vtx_decl.position.enable && vtx_decl.position.type == ComponentFormat::Float &&
++            m_cur_buffer_pointer > m_base_buffer_pointer)
++        {
++          const float first_x = *reinterpret_cast<const float*>(m_base_buffer_pointer + vtx_decl.position.offset);
++          min_x = std::min(min_x, first_x);
++        }
++      }
++      if (xfmem.numTexGen.numTexGens == 0 && bpmem.genMode.numtexgens == 0 &&
++          min_x <= 1.0f && max_x >= 600.0f)
++      {
++        drawing_efb_copy = true;
++      }
++    }
+   }
++  g_turbulence_drawing_efb_copy = drawing_efb_copy;
+   vertex_shader_manager.SetConstants(texture_names, xf_state_manager);
+   if (!bpmem.genMode.zfreeze)
+   {
+diff --git a/Source/Core/VideoCommon/VertexShaderManager.cpp b/Source/Core/VideoCommon/VertexShaderManager.cpp
+index 6d69803..43469f8 100644
+--- a/Source/Core/VideoCommon/VertexShaderManager.cpp
++++ b/Source/Core/VideoCommon/VertexShaderManager.cpp
+@@ -76,15 +76,23 @@ Common::Matrix44 VertexShaderManager::LoadProjectionMatrix()
+ 
+   case ProjectionType::Orthographic:
+   {
+-    m_projection_matrix[0] = rawProjection[0];
++    extern bool g_turbulence_hud_stretched;
++    extern bool g_turbulence_drawing_efb_copy;
++    const bool is_strip_or_efb_pass =
++        g_turbulence_drawing_efb_copy || std::fabs(xfmem.viewport.wd) < 300.0f ||
++        (bpmem.scissorBR.x > bpmem.scissorTL.x && (bpmem.scissorBR.x - bpmem.scissorTL.x) <= 256);
++    const bool stretch_ortho = g_turbulence_hud_stretched || is_strip_or_efb_pass;
++    const float hud_scale_w = stretch_ortho ? 1.0f : g_ActiveConfig.fAspectRatioHackW;
++    const float hud_scale_h = stretch_ortho ? 1.0f : g_ActiveConfig.fAspectRatioHackH;
++    m_projection_matrix[0] = rawProjection[0] * hud_scale_w;
+     m_projection_matrix[1] = 0.0f;
+     m_projection_matrix[2] = 0.0f;
+-    m_projection_matrix[3] = rawProjection[1];
++    m_projection_matrix[3] = rawProjection[1] * hud_scale_w;
+ 
+     m_projection_matrix[4] = 0.0f;
+-    m_projection_matrix[5] = rawProjection[2];
++    m_projection_matrix[5] = rawProjection[2] * hud_scale_h;
+     m_projection_matrix[6] = 0.0f;
+-    m_projection_matrix[7] = rawProjection[3];
++    m_projection_matrix[7] = rawProjection[3] * hud_scale_h;
+ 
+     m_projection_matrix[8] = 0.0f;
+     m_projection_matrix[9] = 0.0f;
+@@ -126,6 +134,7 @@ void VertexShaderManager::SetProjectionMatrix(XFStateManager& xf_state_manager)
+     xf_state_manager.ResetProjection();
+     auto corrected_matrix = LoadProjectionMatrix();
+     memcpy(constants.projection.data(), corrected_matrix.data.data(), 4 * sizeof(float4));
++    dirty = true;
+   }
+ }
+ 
+@@ -411,8 +420,10 @@ void VertexShaderManager::SetConstants(std::span<const std::string> textures,
+     }
+   }
+ 
+-  if (xf_state_manager.DidProjectionChange() || g_freelook_camera.GetController()->IsDirty() ||
+-      !projection_actions.empty() || m_projection_graphics_mod_change)
++  if (xf_state_manager.DidProjectionChange() ||
++      xfmem.projection.type == ProjectionType::Orthographic ||
++      g_freelook_camera.GetController()->IsDirty() || !projection_actions.empty() ||
++      m_projection_graphics_mod_change)
+   {
+     xf_state_manager.ResetProjection();
+     m_projection_graphics_mod_change = !projection_actions.empty();
+diff --git a/module-template/CMakeLists.txt b/module-template/CMakeLists.txt
+index dac92e8..75e21f5 100644
+--- a/module-template/CMakeLists.txt
++++ b/module-template/CMakeLists.txt
+@@ -39,15 +39,30 @@ set(MODULE_NAME "g${GAME_ID}_recomp")
+ 
+ find_package(Python3 REQUIRED COMPONENTS Interpreter)
+ 
++# Turbulence: optional recompiled REL (DolRecomp output for _Main.rel).
++set(REL_GENERATED_DIR "" CACHE PATH "DolRecomp output for the game's REL (generated.h, generated_smc.txt, rel_image.bin, chunks/)")
++set(REL_TABLE_ARGS)
++set(REL_TABLE_DEPENDS)
++if(REL_GENERATED_DIR)
++  foreach(REQUIRED_REL_FILE generated.h generated_smc.txt rel_image.bin)
++    if(NOT EXISTS "${REL_GENERATED_DIR}/${REQUIRED_REL_FILE}")
++      message(FATAL_ERROR "REL output is incomplete: ${REL_GENERATED_DIR}/${REQUIRED_REL_FILE} is missing")
++    endif()
++  endforeach()
++  set(REL_TABLE_ARGS "${REL_GENERATED_DIR}/generated.h" "${REL_GENERATED_DIR}/generated_smc.txt"
++                     "${REL_GENERATED_DIR}/rel_image.bin")
++  set(REL_TABLE_DEPENDS ${REL_TABLE_ARGS})
++endif()
++
+ set(MODULE_TABLES "${CMAKE_CURRENT_BINARY_DIR}/module_tables.inc")
+ add_custom_command(
+   OUTPUT "${MODULE_TABLES}"
+   COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/gen_module_tables.py"
+           "${GENERATED_DIR}/generated.h" "${GENERATED_DIR}/generated_smc.txt"
+-          "${GENERATED_DIR}/main.dol" "${MODULE_TABLES}"
++          "${GENERATED_DIR}/main.dol" "${MODULE_TABLES}" ${REL_TABLE_ARGS}
+   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/gen_module_tables.py"
+           "${GENERATED_DIR}/generated.h" "${GENERATED_DIR}/generated_smc.txt"
+-          "${GENERATED_DIR}/main.dol"
++          "${GENERATED_DIR}/main.dol" ${REL_TABLE_DEPENDS}
+   COMMENT "Generating module_tables.inc")
+ 
+ file(READ "${GENERATED_DIR}/generated.h" GENERATED_HEADER_TEXT)
+@@ -116,6 +131,33 @@ target_include_directories(${MODULE_NAME} PRIVATE
+   "${CHASSIS_ABI_DIR}"
+   "${CMAKE_CURRENT_BINARY_DIR}")
+ 
++# Turbulence: the REL's chunks include their own generated.h, so they build as
++# a separate object library with the REL output first on the include path.
++if(REL_GENERATED_DIR)
++  if(GENERATED_HEADER_TEXT MATCHES "DOLRECOMP_BACKEND_LLVM")
++    message(FATAL_ERROR "REL_GENERATED_DIR currently supports the C backend only")
++  endif()
++  file(GLOB REL_CHUNK_INPUTS CONFIGURE_DEPENDS "${REL_GENERATED_DIR}/chunks/*.c")
++  if(NOT REL_CHUNK_INPUTS)
++    message(FATAL_ERROR "REL output has no generated chunks in ${REL_GENERATED_DIR}/chunks")
++  endif()
++  add_library(${MODULE_NAME}_rel OBJECT
++    "${CMAKE_CURRENT_SOURCE_DIR}/rel_dispatch.c"
++    ${REL_CHUNK_INPUTS})
++  set_target_properties(${MODULE_NAME}_rel PROPERTIES
++    POSITION_INDEPENDENT_CODE ON
++    UNITY_BUILD OFF
++    C_VISIBILITY_PRESET hidden)
++  target_compile_definitions(${MODULE_NAME}_rel PRIVATE
++    DOLRECOMP_CPU_HEADER="core/cpu.h")
++  target_include_directories(${MODULE_NAME}_rel PRIVATE
++    "${REL_GENERATED_DIR}"
++    "${GXRUNTIME_DIR}/include"
++    "${CHASSIS_ABI_DIR}")
++  target_sources(${MODULE_NAME} PRIVATE $<TARGET_OBJECTS:${MODULE_NAME}_rel>)
++  target_compile_definitions(${MODULE_NAME} PRIVATE MODULE_HAVE_REL=1)
++endif()
++
+ if(NOT WIN32)
+   target_link_libraries(${MODULE_NAME} PRIVATE m)
+ endif()
+@@ -172,3 +214,14 @@ elseif(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+   target_compile_options(${MODULE_NAME} PRIVATE
+     -O${RECOMPCORE_MODULE_OPT_LEVEL} -ffp-contract=off -fno-fast-math)
+ endif()
++if(REL_GENERATED_DIR)
++  if(MSVC)
++    target_compile_options(${MODULE_NAME}_rel PRIVATE /O2 /fp:strict)
++  else()
++    target_compile_options(${MODULE_NAME}_rel PRIVATE
++      -O${RECOMPCORE_MODULE_OPT_LEVEL} -ffp-contract=off -fno-fast-math)
++  endif()
++  if(RECOMPCORE_MODULE_IPO_SUPPORTED)
++    set_property(TARGET ${MODULE_NAME}_rel PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
++  endif()
++endif()
+diff --git a/module-template/gen_module_tables.py b/module-template/gen_module_tables.py
+index baeffe2..78eeb2b 100644
+--- a/module-template/gen_module_tables.py
++++ b/module-template/gen_module_tables.py
+@@ -48,13 +48,7 @@ def load_dol_text(dol_path: Path):
+     return read_range
+ 
+ 
+-def main() -> int:
+-    generated_h = Path(sys.argv[1])
+-    smc_txt = Path(sys.argv[2])
+-    dol_path = Path(sys.argv[3])
+-    out_path = Path(sys.argv[4])
+-
+-    header = generated_h.read_text()
++def parse_coverage(header: str):
+     code_ranges = {
+         (int(a, 16), int(b, 16))
+         for a, b in re.findall(
+@@ -68,33 +62,27 @@ def main() -> int:
+     ):
+         start = int(base, 16)
+         code_ranges.add((start, start + int(span, 16)))
+-    if not code_ranges:
+-        print("error: no coverage ranges found in", generated_h, file=sys.stderr)
+-        return 1
+-    code_ranges = sorted(code_ranges)
+-
+-    # Chunk table: one range per generated func_XXXXXXXX translation unit.
+-    # A chunk is the demotion granule for the chassis SMC guard: an icache
+-    # invalidation inside a chunk retires exactly that chunk to the
+-    # interpreter for the session.
+     func_addrs = sorted(
+         int(a, 16)
+         for a in re.findall(r"void func_([0-9A-Fa-f]{8})\(CPUState\* ctx\);", header)
+     )
+-    if not func_addrs:
+-        print("error: no func_ declarations found in", generated_h, file=sys.stderr)
+-        return 1
++    return sorted(code_ranges), func_addrs
++
++
++def chunk_ranges_for(code_ranges, func_addrs):
+     chunk_ranges = []
+     for i, addr in enumerate(func_addrs):
+         containing = next(((a, b) for a, b in code_ranges if a <= addr < b), None)
+         if containing is None:
+-            print(f"error: func_{addr:08X} outside all code ranges", file=sys.stderr)
+-            return 1
++            raise ValueError(f"func_{addr:08X} outside all code ranges")
+         end = containing[1]
+         if i + 1 < len(func_addrs) and containing[0] <= func_addrs[i + 1] < containing[1]:
+             end = func_addrs[i + 1]
+         chunk_ranges.append((addr, end))
++    return chunk_ranges
++
+ 
++def read_smc(smc_txt: Path):
+     smc_ranges = []
+     for line in smc_txt.read_text().splitlines():
+         m = re.match(r"(0x[0-9A-Fa-f]+)-(0x[0-9A-Fa-f]+)", line.strip())
+@@ -102,6 +90,107 @@ def main() -> int:
+             # File ranges are inclusive instruction addresses; ABI ranges are
+             # end-exclusive byte ranges.
+             smc_ranges.append((int(m.group(1), 16), int(m.group(2), 16) + 4))
++    return smc_ranges
++
++
++def load_rel_image(image_path: Path, code_ranges):
++    """Turbulence: REL layout + a reader over the relocated (post-OSLink) image.
++
++    The image is the REL file with every in-place section relocated to the
++    linked base DolRecomp used. The executable section's linked start comes
++    from the REL dispatcher's coverage range; base = start - file offset.
++    """
++    img = image_path.read_bytes()
++
++    def be32(off: int) -> int:
++        return int.from_bytes(img[off : off + 4], "big")
++
++    module_id = be32(0x00)
++    section_count = be32(0x0C)
++    section_info_offset = be32(0x10)
++    version = be32(0x1C)
++    sections = []
++    for i in range(section_count):
++        raw = be32(section_info_offset + i * 8)
++        size = be32(section_info_offset + i * 8 + 4)
++        if raw & 1 and size:
++            sections.append((i, raw & ~1, size))
++    if not sections:
++        raise ValueError("REL has no executable sections")
++    first_index, first_offset, first_size = sections[0]
++    starts = [a for a, b in code_ranges if b - a == first_size]
++    if len(starts) != 1:
++        raise ValueError("can't find the REL executable section in its coverage ranges")
++    base = starts[0] - first_offset
++    linked = [(i, base + off, size) for i, off, size in sections]
++
++    def read_range(start: int, end: int) -> bytes:
++        for _, lstart, size in linked:
++            if lstart <= start and end <= lstart + size:
++                lo = start - base
++                return img[lo : lo + (end - start)]
++        raise ValueError(f"range [0x{start:08X},0x{end:08X}) not inside one REL section")
++
++    layout = dict(module_id=module_id, version=version, section_count=section_count,
++                  section_info_offset=section_info_offset, file_size=len(img),
++                  sections=linked, base=base)
++    return layout, read_range
++
++
++def main() -> int:
++    generated_h = Path(sys.argv[1])
++    smc_txt = Path(sys.argv[2])
++    dol_path = Path(sys.argv[3])
++    out_path = Path(sys.argv[4])
++    # Turbulence: optional recompiled REL (generated.h, generated_smc.txt,
++    # rel_image.bin from the REL's DolRecomp output).
++    rel_args = sys.argv[5:8] if len(sys.argv) >= 8 else None
++
++    code_ranges, func_addrs = parse_coverage(generated_h.read_text())
++    if not code_ranges:
++        print("error: no coverage ranges found in", generated_h, file=sys.stderr)
++        return 1
++    if not func_addrs:
++        print("error: no func_ declarations found in", generated_h, file=sys.stderr)
++        return 1
++    # Chunk table: one range per generated func_XXXXXXXX translation unit.
++    # A chunk is the demotion granule for the chassis SMC guard: an icache
++    # invalidation inside a chunk retires exactly that chunk to the
++    # interpreter for the session.
++    try:
++        chunk_ranges = chunk_ranges_for(code_ranges, func_addrs)
++    except ValueError as e:
++        print("error:", e, file=sys.stderr)
++        return 1
++    smc_ranges = read_smc(smc_txt)
++    read_dol = load_dol_text(dol_path)
++    chunk_hashes = [fnv1a64(read_dol(a, b)) for a, b in chunk_ranges]
++
++    rel_layout = None
++    if rel_args:
++        rel_h, rel_smc, rel_image = (Path(p) for p in rel_args)
++        rel_code, rel_funcs = parse_coverage(rel_h.read_text())
++        if not rel_code or not rel_funcs:
++            print("error: no REL coverage found in", rel_h, file=sys.stderr)
++            return 1
++        try:
++            rel_chunks = chunk_ranges_for(rel_code, rel_funcs)
++            rel_layout, read_rel = load_rel_image(rel_image, rel_code)
++        except ValueError as e:
++            print("error:", e, file=sys.stderr)
++            return 1
++        for a, b in rel_code:
++            for c, d in code_ranges:
++                if a < d and c < b:
++                    print(f"error: REL range 0x{a:08X} overlaps DOL range 0x{c:08X}",
++                          file=sys.stderr)
++                    return 1
++        code_ranges = sorted(code_ranges + rel_code)
++        smc_ranges += read_smc(rel_smc)
++        pairs = sorted(list(zip(chunk_ranges, chunk_hashes)) +
++                       [(r, fnv1a64(read_rel(*r))) for r in rel_chunks])
++        chunk_ranges = [r for r, _ in pairs]
++        chunk_hashes = [h for _, h in pairs]
+     smc_ranges.sort()
+ 
+     with out_path.open("w") as f:
+@@ -126,14 +215,27 @@ def main() -> int:
+         f.write(f"#define MODULE_CHUNK_RANGE_COUNT {len(chunk_ranges)}u\n")
+         # FNV-1a 64 of each chunk's original text, so the chassis can verify
+         # that guest RAM still holds the code this module was compiled from.
+-        read_range = load_dol_text(dol_path)
+         f.write("static const u64 s_chunk_hashes[] = {\n")
+-        for a, b in chunk_ranges:
+-            f.write(f"    0x{fnv1a64(read_range(a, b)):016X}u,\n")
++        for h in chunk_hashes:
++            f.write(f"    0x{h:016X}u,\n")
+         f.write("};\n")
++        if rel_layout:
++            L = rel_layout
++            f.write("static const StaticRecompRelSection s_rel_sections[] = {\n")
++            for index, start, size in L["sections"]:
++                f.write(f"    {{{L['module_id']}u, {index}u, 0x{start:08X}u, 0x{size:08X}u}},\n")
++            f.write("};\n")
++            f.write("static const StaticRecompRelModule s_rel_modules[] = {\n")
++            f.write(f"    {{{L['module_id']}u, {L['version']}u, {L['section_count']}u, "
++                    f"0x{L['section_info_offset']:X}u, 0x{L['file_size']:X}u, s_rel_sections, "
++                    f"{len(L['sections'])}u}},\n")
++            f.write("};\n")
++            f.write("#define MODULE_REL_MODULE_COUNT 1u\n")
+     print(
+         f"module_tables.inc: {len(code_ranges)} code ranges, "
+         f"{len(smc_ranges)} smc ranges, {len(chunk_ranges)} chunk ranges (hashed)"
++        + (f", REL module {rel_layout['module_id']} at 0x{rel_layout['base']:08X}"
++           if rel_layout else "")
+     )
+     return 0
+ 
+diff --git a/module-template/module_export.c b/module-template/module_export.c
+index 04bce0b..756e872 100644
+--- a/module-template/module_export.c
++++ b/module-template/module_export.c
+@@ -62,13 +62,24 @@ static int host_has_x86_64_v3(void)
+ }
+ #endif
+ 
++#if defined(MODULE_HAVE_REL)
++int turbulence_rel_call(CPUState* ctx, u32 address);
++#endif
++
+ static int selected_dispatch(CPUState* ctx, u32 address)
+ {
+ #if defined(DOLRECOMP_MODULE_HAVE_X86_64_V3)
+     if (host_has_x86_64_v3())
+         return dolrecomp_call__x86_64_v3(ctx, address);
+ #endif
++#if defined(MODULE_HAVE_REL)
++    // Turbulence: the DOL's dispatcher first, then the recompiled REL's.
++    if (dolrecomp_call(ctx, address))
++        return 1;
++    return turbulence_rel_call(ctx, address);
++#else
+     return dolrecomp_call(ctx, address);
++#endif
+ }
+ 
+ void dolrecomp_indirect_dispatch(CPUState* ctx, u32 address)
+@@ -104,6 +115,10 @@ static const StaticRecompModuleDesc s_desc = {
+     s_chunk_ranges,
+     MODULE_CHUNK_RANGE_COUNT,
+     s_chunk_hashes,
++#if defined(MODULE_HAVE_REL)
++    s_rel_modules,
++    MODULE_REL_MODULE_COUNT,
++#endif
+ };
+ 
+ #if defined(_WIN32)
+diff --git a/module-template/rel_dispatch.c b/module-template/rel_dispatch.c
+new file mode 100644
+index 0000000..0fb1a8a
+--- /dev/null
++++ b/module-template/rel_dispatch.c
+@@ -0,0 +1,18 @@
++// Turbulence: dispatcher for the recompiled REL (e.g. Sonic Riders' _Main.rel).
++//
++// DolRecomp writes a REL as its own output with its own generated.h, whose
++// static inline dispatcher only knows the REL's chunks. This translation unit
++// is compiled against that header, so the module can try the DOL's dispatcher
++// first and fall through to the REL's.
++
++#include "generated.h"
++
++int turbulence_rel_call(CPUState* ctx, u32 address)
++{
++    return dolrecomp_call(ctx, address);
++}
++
++u32 turbulence_rel_entry_point(void)
++{
++    return DOLRECOMP_ENTRY_POINT;
++}

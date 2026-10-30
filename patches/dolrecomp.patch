@@ -1,0 +1,86 @@
+diff --git a/src/app/main.c b/src/app/main.c
+index e37c893..99cecc1 100644
+--- a/src/app/main.c
++++ b/src/app/main.c
+@@ -196,6 +196,35 @@ int main(int argc, char** argv) {
+             return 1;
+         }
+ 
++        /* Turbulence: write the REL as it looks in RAM after OSLink (file
++           image with every in-place section relocated) next to the output, so
++           the module tables can hash exactly the bytes the runtime verifies. */
++        {
++            char image_path[1200];
++            const char* slash = strrchr(output_path, '/');
++            int dir_len = slash ? (int)(slash - output_path) : 0;
++            snprintf(image_path, sizeof(image_path), "%.*s%srel_image.bin", dir_len,
++                     output_path, dir_len ? "/" : "");
++            u8* image = (u8*)malloc(rel.file_size);
++            FILE* f = image ? fopen(image_path, "wb") : NULL;
++            if (!f) {
++                fprintf(stderr, "error: cannot write %s\n", image_path);
++                free(image);
++                rel_free(&rel);
++                return 1;
++            }
++            memcpy(image, rel.file_data, rel.file_size);
++            for (u32 i = 0; i < rel.section_count; i++) {
++                const RELSection* section = &rel.sections[i];
++                if (section->size && !section->bss && section->owned_data)
++                    memcpy(image + section->offset, section->owned_data, section->size);
++            }
++            fwrite(image, 1, rel.file_size, f);
++            fclose(f);
++            free(image);
++            printf("  relocated image: %s\n", image_path);
++        }
++
+         rel_free(&rel);
+         return 0;
+     }
+diff --git a/src/frontend/container/rel.c b/src/frontend/container/rel.c
+index b894a36..bec944a 100644
+--- a/src/frontend/container/rel.c
++++ b/src/frontend/container/rel.c
+@@ -421,6 +421,22 @@ bool rel_load_image(RELFile* rel, const char* path, u32 base_address) {
+         rel_free(rel);
+         return false;
+     }
++    /* Turbulence: OSLinkFixed places .bss wherever the game allocated it, not
++       after the file. To bake the same addresses the game computes at run
++       time, DOLRECOMP_REL_BSS can pin the .bss address (hex or decimal). */
++    {
++        const char* pinned_bss = getenv("DOLRECOMP_REL_BSS");
++        if (pinned_bss && pinned_bss[0]) {
++            char* end = NULL;
++            unsigned long value = strtoul(pinned_bss, &end, 0);
++            if (!end || *end != '\0' || value == 0 || value > 0xFFFFFFFFul) {
++                fprintf(stderr, "error: invalid DOLRECOMP_REL_BSS '%s'\n", pinned_bss);
++                rel_free(rel);
++                return false;
++            }
++            bss_cursor = (u32)value;
++        }
++    }
+ 
+     u32 executable_count = 0;
+     for (u32 i = 0; i < rel->section_count; i++) {
+@@ -477,11 +493,15 @@ bool rel_load_image(RELFile* rel, const char* path, u32 base_address) {
+             rel_free(rel);
+             return false;
+         }
++        /* Turbulence: an in-place section lives at load address + file
++           offset and OSLink never moves it, so its alignment is whatever the
++           file gives it (Sonic Riders' _Main.rel has .text at +0xBC with a
++           32-byte alignment field). Only warn. */
+         if (section_alignment > 1 && executable &&
+             (section->address % section_alignment) != 0) {
+-            fprintf(stderr, "error: REL executable section %u is not aligned\n", i);
+-            rel_free(rel);
+-            return false;
++            fprintf(stderr, "warning: REL executable section %u is not %u-byte aligned "
++                    "at 0x%08X; keeping it in place\n", i, section_alignment,
++                    section->address);
+         }
+ 
+         section->owned_data = (u8*)malloc(size);
