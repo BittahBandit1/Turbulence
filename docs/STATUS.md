@@ -38,6 +38,7 @@ Measured with the pacing recorder (`TURBULENCE_PACING_DIR`, touch
 | Race: frames on the 16.67 ms cadence | 593/598 (5 at 25 ms) | 598/598, sd 0.001 ms |
 | Race: present vs. schedule (p50) | ~3,560 ms behind | 15 ms |
 | Loading into a race | not measured | 576/591, 14 at 25 ms, no drops or 2-frame hitches |
+| Loading into a race, shader cache saved | | 585/593, 8 at 25 ms, one 50 ms frame ~5 s in; p50 present vs. schedule 2 ms |
 
 Changes: minimum present duration matched to the display (16.17 ms on
 60/120 Hz) instead of a fixed 14 ms; no 3-drawable queue; no
