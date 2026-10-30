@@ -16,7 +16,7 @@ index c0548a0..beba90c 100644
          target_sources(moderngekko PRIVATE
              vendor/dolphin/Source/Core/DolphinNoGUI/PlatformX11.cpp)
 diff --git a/src/runtime/dolphin_runtime.cpp b/src/runtime/dolphin_runtime.cpp
-index f9b5405..9ebc792 100644
+index f9b5405..8749a81 100644
 --- a/src/runtime/dolphin_runtime.cpp
 +++ b/src/runtime/dolphin_runtime.cpp
 @@ -1,4 +1,7 @@
@@ -55,7 +55,7 @@ index f9b5405..9ebc792 100644
  }
  bool Host_RendererHasFullFocus() { return Host_RendererHasFocus(); }
  bool Host_RendererIsFullscreen() {
-@@ -665,6 +675,25 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -665,6 +675,29 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
    if (impl->config.graphics.internal_resolution_scale)
      Config::SetBase(Config::GFX_EFB_SCALE,
                      *impl->config.graphics.internal_resolution_scale);
@@ -63,12 +63,16 @@ index f9b5405..9ebc792 100644
 +    Config::SetBase(Config::GFX_EFB_SCALE, 2);
 +  // Turbulence: first-run defaults only. Once the options menu has saved a
 +  // choice to GFX.ini, that choice wins.
-+  if (Config::GetActiveLayerForConfig(Config::GFX_ASPECT_RATIO) == Config::LayerType::Default)
++  const auto saved = [](const auto& info) {
++    const auto base = Config::GetLayer(Config::LayerType::Base);
++    return base && base->Exists(info.GetLocation());
++  };
++  if (!saved(Config::GFX_ASPECT_RATIO))
 +  {
 +    Config::SetBase(Config::GFX_ASPECT_RATIO, AspectMode::ForceWide);
 +    Config::SetBase(Config::GFX_WIDESCREEN_HACK, true);
 +  }
-+  if (Config::GetActiveLayerForConfig(Config::GFX_VSYNC) == Config::LayerType::Default)
++  if (!saved(Config::GFX_VSYNC))
 +    Config::SetBase(Config::GFX_VSYNC, true);
 +#ifdef TURBULENCE_OPTIONS_MENU
 +  turbulence::PrepareOptions(impl->config.user_directory);
@@ -81,7 +85,7 @@ index f9b5405..9ebc792 100644
    Config::SetBase(Config::GFX_SHADER_CACHE, true);
    Config::SetBase(Config::GFX_SHADER_COMPILATION_MODE,
                    ShaderCompilationMode::AsynchronousUberShaders);
-@@ -688,8 +717,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -688,8 +721,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
    Config::SetBase(Config::MAIN_AUDIO_BACKEND, impl->config.audio.backend);
    if (impl->config.audio.mute)
      Config::SetBase(Config::MAIN_AUDIO_VOLUME, 0);
@@ -91,7 +95,7 @@ index f9b5405..9ebc792 100644
  
    auto &jit = Core::System::GetInstance().GetJitInterface();
    StaticRecompModuleSource recomp_source;
-@@ -790,6 +818,14 @@ RuntimeRunResult Runtime::Run() {
+@@ -790,6 +822,14 @@ RuntimeRunResult Runtime::Run() {
                           "Dolphin could not boot sys/main.dol"}};
    }
    m_impl->booted = true;
