@@ -517,10 +517,10 @@ index 451109b..cd89b2c 100644
  
    // Check for font changes
 diff --git a/Source/Core/VideoCommon/Present.cpp b/Source/Core/VideoCommon/Present.cpp
-index 7c62730..d07109e 100644
+index 7c62730..1021f28 100644
 --- a/Source/Core/VideoCommon/Present.cpp
 +++ b/Source/Core/VideoCommon/Present.cpp
-@@ -906,6 +906,43 @@ void Presenter::Present(PresentInfo* present_info)
+@@ -906,6 +906,63 @@ void Presenter::Present(PresentInfo* present_info)
    if (g_gfx->IsHeadless() || (!m_onscreen_ui && !m_xfb_entry))
      return;
  
@@ -540,15 +540,35 @@ index 7c62730..d07109e 100644
 +    constexpr auto kBacklog = microseconds(20000);   // ~1.2 frames
 +    constexpr auto kCaughtUp = microseconds(8000);
 +    constexpr int kSustainedFrames = 30;
++    // Turbulence: skipping only helps when presentation itself is the
++    // backlog. After a long load the schedule can stay permanently behind
++    // (emulation is locked to real time and never catches up), and endless
++    // skipping froze the picture. Skip at most kMaxSkips frames in a row, then
++    // present normally until presentation has been back on schedule once.
++    constexpr int kMaxSkips = 12;
 +    static int s_late_frames = 0;
 +    static bool s_catching_up = false;
++    static bool s_armed = true;
++    static int s_skip_run = 0;
 +    static u64 s_skipped = 0;
 +    const auto lateness = Clock::now() - present_info->intended_present_time;
 +    s_late_frames = lateness > kBacklog ? s_late_frames + 1 : 0;
-+    if (lateness > kSevere || s_late_frames >= kSustainedFrames)
-+      s_catching_up = true;
-+    else if (lateness < kCaughtUp)
++    if (lateness < kCaughtUp)
++    {
 +      s_catching_up = false;
++      s_armed = true;
++      s_skip_run = 0;
++    }
++    else if (s_armed && (lateness > kSevere || s_late_frames >= kSustainedFrames))
++    {
++      s_catching_up = true;
++    }
++    if (s_catching_up && ++s_skip_run > kMaxSkips)
++    {
++      s_catching_up = false;
++      s_armed = false;
++      s_skip_run = 0;
++    }
 +    if (s_catching_up)
 +    {
 +      if ((s_skipped++ % 60) == 0)
@@ -902,7 +922,7 @@ index 0000000..9c5cdfa
 +bool MayMatch(u32 width, u32 height, u32 gx_format);
 +}  // namespace TurbulencePromptTextures
 diff --git a/Source/Core/VideoCommon/VertexManagerBase.cpp b/Source/Core/VideoCommon/VertexManagerBase.cpp
-index 2bc6d58..8d454bb 100644
+index 2bc6d58..ad52671 100644
 --- a/Source/Core/VideoCommon/VertexManagerBase.cpp
 +++ b/Source/Core/VideoCommon/VertexManagerBase.cpp
 @@ -4,7 +4,12 @@
@@ -1009,7 +1029,7 @@ index 2bc6d58..8d454bb 100644
            if (!Common::Contains(texture_names, cache_entry->texture_info_name))
            {
              texture_names.push_back(cache_entry->texture_info_name);
-@@ -596,6 +657,35 @@ void VertexManagerBase::Flush()
+@@ -596,6 +657,40 @@ void VertexManagerBase::Flush()
        }
      }
    }
@@ -1022,7 +1042,12 @@ index 2bc6d58..8d454bb 100644
 +  //  edge of the wide screen (their inner end stays where centering puts it).
 +  {
 +    TurbulenceDraw2D draw;
-+    if (xfmem.projection.type == ProjectionType::Orthographic && !m_cull_all)
++    // Diagnostic: TURBULENCE_WS_CLASSIFY=0 centers every 2D draw.
++    static const bool classify = [] {
++      const char* c = std::getenv("TURBULENCE_WS_CLASSIFY");
++      return !(c && *c == '0');
++    }();
++    if (classify && xfmem.projection.type == ProjectionType::Orthographic && !m_cull_all)
 +    {
 +      float min_x = 0.0f, max_x = 0.0f;
 +      if (samples_frame_copy || std::fabs(xfmem.viewport.wd) < 300.0f)
