@@ -120,7 +120,7 @@ index d91ec2d..25eaa5e 100644
      m_module_active = m_module && (current_game_id.empty() || current_game_id == m_module->game_id);
  
 diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
-index 491c57e..7d6c886 100644
+index 491c57e..6dc0944 100644
 --- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
 +++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
 @@ -22,6 +22,9 @@ void StaticRecompCore::RefreshRelSections()
@@ -133,7 +133,7 @@ index 491c57e..7d6c886 100644
  
    std::vector<ActiveRelSection> discovered;
    for (u32 module_index = 0; module_index < m_module->num_rel_modules; ++module_index)
-@@ -31,15 +34,14 @@ void StaticRecompCore::RefreshRelSections()
+@@ -31,15 +34,19 @@ void StaticRecompCore::RefreshRelSections()
                            static_cast<u64>(module.section_count) * 8;
      if (table_end > m_guest.ram_size)
        continue;
@@ -143,16 +143,22 @@ index 491c57e..7d6c886 100644
 +    // Turbulence: try where this module was found last time before scanning.
 +    const auto try_candidate = [&](u32 candidate) -> bool {
        const u8* header = m_guest.ram + candidate;
++      // Turbulence: OSLink rewrites sectionInfoOffset into an absolute
++      // pointer (e.g. 0x4C -> 0x803FBD4C), so a linked REL -- the only kind
++      // whose code can run -- never matched the file offset. Accept both.
++      const u32 info_field = ReadGuestBE32(header + 0x10);
        if (ReadGuestBE32(header) != module.module_id ||
            ReadGuestBE32(header + 0x0c) != module.section_count ||
-           ReadGuestBE32(header + 0x10) != module.section_info_offset ||
+-          ReadGuestBE32(header + 0x10) != module.section_info_offset ||
++          (info_field != module.section_info_offset &&
++           info_field != 0x80000000u + candidate + module.section_info_offset) ||
            ReadGuestBE32(header + 0x1c) != module.version)
 -        continue;
 +        return false;
  
        std::vector<ActiveRelSection> candidate_sections;
        bool valid = true;
-@@ -70,6 +72,22 @@ void StaticRecompCore::RefreshRelSections()
+@@ -70,6 +77,22 @@ void StaticRecompCore::RefreshRelSections()
        if (valid)
        {
          discovered.insert(discovered.end(), candidate_sections.begin(), candidate_sections.end());
@@ -175,7 +181,7 @@ index 491c57e..7d6c886 100644
          break;
        }
      }
-@@ -132,8 +150,11 @@ bool StaticRecompCore::ResolveNativeAddress(u32 runtime_address, u32* linked_add
+@@ -132,8 +155,11 @@ bool StaticRecompCore::ResolveNativeAddress(u32 runtime_address, u32* linked_add
        return true;
      }
    }
@@ -189,7 +195,7 @@ index 491c57e..7d6c886 100644
  }
  
  bool StaticRecompCore::ResolveRuntimeAddress(u32 linked_address, u32* runtime_address) const
-@@ -339,6 +360,7 @@ void StaticRecompCore::OnICacheInvalidate(u32 address, u32 length)
+@@ -339,6 +365,7 @@ void StaticRecompCore::OnICacheInvalidate(u32 address, u32 length)
  
    if (!m_module_active || length == 0)
      return;
