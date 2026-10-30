@@ -391,10 +391,18 @@ index 0945759..a401ae7 100644
  
      // Rumble
 diff --git a/Source/Core/VideoBackends/Metal/MTLGfx.mm b/Source/Core/VideoBackends/Metal/MTLGfx.mm
-index 4b744fe..d3b984b 100644
+index 4b744fe..672bd47 100644
 --- a/Source/Core/VideoBackends/Metal/MTLGfx.mm
 +++ b/Source/Core/VideoBackends/Metal/MTLGfx.mm
-@@ -16,12 +16,44 @@
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "VideoBackends/Metal/MTLGfx.h"
++#include "VideoCommon/TurbulencePresentTimes.h"
+ 
+ #include "VideoBackends/Metal/MTLBoundingBox.h"
+ #include "VideoBackends/Metal/MTLObjectCache.h"
+@@ -16,12 +17,44 @@
  #include "VideoCommon/Present.h"
  #include "VideoCommon/VideoBackendBase.h"
  
@@ -439,7 +447,7 @@ index 4b744fe..d3b984b 100644
  
    SetupSurface();
    g_state_tracker->FlushEncoders();
-@@ -465,6 +497,7 @@ void Metal::Gfx::PresentBackbuffer()
+@@ -465,9 +498,15 @@ void Metal::Gfx::PresentBackbuffer()
  {
    @autoreleasepool
    {
@@ -447,7 +455,15 @@ index 4b744fe..d3b984b 100644
      g_state_tracker->EndRenderPass();
      if (m_drawable)
      {
-@@ -475,10 +508,18 @@ void Metal::Gfx::PresentBackbuffer()
++      // Turbulence: record when each frame actually reaches the display
++      // (0 if it was dropped) for the frame pacing recorder.
++      [m_drawable addPresentedHandler:^(id<MTLDrawable> drawable) {
++        TurbulencePresentTimes::Push(drawable.presentedTime);
++      }];
+       // PresentDrawable refuses to allow Dolphin to present faster than the display's refresh rate
+       // when windowed (or fullscreen with vsync enabled, but that's more understandable).
+       // On the other hand, it helps Xcode's GPU captures start and stop on frame boundaries
+@@ -475,10 +514,18 @@ void Metal::Gfx::PresentBackbuffer()
        // It also seems to improve frame pacing, so enable it by default with vsync
        if (g_ActiveConfig.iUsePresentDrawable == TriState::On ||
            (g_ActiveConfig.iUsePresentDrawable == TriState::Auto && g_ActiveConfig.bVSyncActive))
@@ -615,6 +631,44 @@ index c5d6096..fb13dd0 100644
    }
  
    if (!is_xfb_copy && !g_ActiveConfig.bCopyEFBScaled)
+diff --git a/Source/Core/VideoCommon/TurbulencePresentTimes.h b/Source/Core/VideoCommon/TurbulencePresentTimes.h
+new file mode 100644
+index 0000000..9996ff4
+--- /dev/null
++++ b/Source/Core/VideoCommon/TurbulencePresentTimes.h
+@@ -0,0 +1,32 @@
++// Turbulence diagnostic (from ReFare): on-glass present times reported by the
++// video backend (Metal: MTLDrawable.presentedTime, host-clock seconds; 0 when
++// a frame was dropped). Lock-free ring written by the presentation callback,
++// read by the frame pacing recorder.
++#pragma once
++
++#include <array>
++#include <atomic>
++#include <cstdint>
++
++namespace TurbulencePresentTimes
++{
++struct Ring
++{
++  std::array<std::atomic<double>, 512> seconds{};
++  std::atomic<uint64_t> head{0};
++};
++
++inline Ring& Get()
++{
++  static Ring ring;
++  return ring;
++}
++
++inline void Push(double presented_seconds)
++{
++  Ring& ring = Get();
++  const uint64_t index = ring.head.load(std::memory_order_relaxed);
++  ring.seconds[index % ring.seconds.size()].store(presented_seconds, std::memory_order_relaxed);
++  ring.head.store(index + 1, std::memory_order_release);
++}
++}  // namespace TurbulencePresentTimes
 diff --git a/Source/Core/VideoCommon/VertexManagerBase.cpp b/Source/Core/VideoCommon/VertexManagerBase.cpp
 index 2bc6d58..d636384 100644
 --- a/Source/Core/VideoCommon/VertexManagerBase.cpp
