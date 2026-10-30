@@ -902,20 +902,23 @@ index 0000000..9c5cdfa
 +bool MayMatch(u32 width, u32 height, u32 gx_format);
 +}  // namespace TurbulencePromptTextures
 diff --git a/Source/Core/VideoCommon/VertexManagerBase.cpp b/Source/Core/VideoCommon/VertexManagerBase.cpp
-index 2bc6d58..d2c99dc 100644
+index 2bc6d58..0b8688f 100644
 --- a/Source/Core/VideoCommon/VertexManagerBase.cpp
 +++ b/Source/Core/VideoCommon/VertexManagerBase.cpp
-@@ -4,7 +4,9 @@
+@@ -4,7 +4,12 @@
  #include "VideoCommon/VertexManagerBase.h"
  
  #include <array>
 +#include <algorithm>
  #include <cmath>
++#include <cstdio>
++#include <cstdlib>
 +#include <cstring>
++#include <set>
  #include <memory>
  
  #include "Common/ChunkFile.h"
-@@ -36,6 +38,7 @@
+@@ -36,6 +41,7 @@
  #include "VideoCommon/PixelShaderManager.h"
  #include "VideoCommon/Statistics.h"
  #include "VideoCommon/TextureCacheBase.h"
@@ -923,7 +926,7 @@ index 2bc6d58..d2c99dc 100644
  #include "VideoCommon/VertexLoaderManager.h"
  #include "VideoCommon/VertexShaderManager.h"
  #include "VideoCommon/VideoBackendBase.h"
-@@ -432,6 +435,38 @@ BitSet32 VertexManagerBase::UsedTextures() const
+@@ -432,6 +438,51 @@ BitSet32 VertexManagerBase::UsedTextures() const
    return usedtextures;
  }
  
@@ -956,13 +959,26 @@ index 2bc6d58..d2c99dc 100644
 +    min_x = std::min(min_x, x);
 +    max_x = std::max(max_x, x);
 +  }
++  // Diagnostic: TURBULENCE_WS_TRACE=1 logs the extent of 2D draws (once per
++  // distinct extent) to find full-width art that falls just short.
++  static const bool trace = [] {
++    const char* t = std::getenv("TURBULENCE_WS_TRACE");
++    return t && *t == '1';
++  }();
++  if (trace)
++  {
++    static std::set<std::pair<int, int>> seen;
++    const std::pair<int, int> key{int(min_x * 1000), int(max_x * 1000)};
++    if (seen.size() < 4000 && seen.insert(key).second)
++      std::fprintf(stderr, "[ws] 2D extent %.3f .. %.3f (%u vertices)\n", min_x, max_x, count);
++  }
 +  return min_x <= -0.98f && max_x >= 0.98f;
 +}
 +
  void VertexManagerBase::Flush()
  {
    if (m_is_flushed)
-@@ -562,6 +597,12 @@ void VertexManagerBase::Flush()
+@@ -562,6 +613,12 @@ void VertexManagerBase::Flush()
    std::vector<std::string> texture_names;
    Common::SmallVector<u32, 8> texture_units;
    std::array<SamplerState, 8> samplers;
@@ -975,7 +991,7 @@ index 2bc6d58..d2c99dc 100644
    if (!m_cull_all)
    {
      if (!g_ActiveConfig.bGraphicMods)
-@@ -571,6 +612,7 @@ void VertexManagerBase::Flush()
+@@ -571,6 +628,7 @@ void VertexManagerBase::Flush()
          const auto cache_entry = g_texture_cache->Load(i);
          if (!cache_entry)
            continue;
@@ -983,7 +999,7 @@ index 2bc6d58..d2c99dc 100644
          const float custom_tex_scale = cache_entry->GetWidth() / float(cache_entry->native_width);
          samplers[i] = TextureCacheBase::GetSamplerState(
              i, custom_tex_scale, cache_entry->is_custom_tex, cache_entry->has_arbitrary_mips);
-@@ -583,6 +625,7 @@ void VertexManagerBase::Flush()
+@@ -583,6 +641,7 @@ void VertexManagerBase::Flush()
          const auto cache_entry = g_texture_cache->Load(i);
          if (cache_entry)
          {
@@ -991,7 +1007,7 @@ index 2bc6d58..d2c99dc 100644
            if (!Common::Contains(texture_names, cache_entry->texture_info_name))
            {
              texture_names.push_back(cache_entry->texture_info_name);
-@@ -596,6 +639,20 @@ void VertexManagerBase::Flush()
+@@ -596,6 +655,20 @@ void VertexManagerBase::Flush()
        }
      }
    }
