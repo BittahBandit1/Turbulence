@@ -51,6 +51,23 @@ Now as in ReFare: MTL_HUD_ENABLED set before Metal starts, the menu only flips
 the layer's HUD mode. Gemini's version set the variable after Metal had read
 it and replaced the layer's HUD properties, so the HUD never appeared.
 
+## Dynamic button prompts
+Sonic Riders' prompt textures already contain the GameCube, Xbox and PS2
+icons side by side; the GameCube build only draws the GameCube cells.
+`TurbulencePromptTextures` (VideoCommon) patches the chosen style's cells over
+them when a prompt texture loads; `src/turbulence_prompts.cpp` follows the
+last-used controller (DualShock / DualSense: PlayStation, Xbox pads: Xbox,
+anything else: GameCube). Options menu: Button prompts Automatic / GameCube /
+Xbox / PlayStation. Verified on Player Entry (Select / Back bar, Information,
+"Press" slots) with both styles. Covered textures: the 256x128 icon sheet and
+the 512x128 Select / Back bar -- the only prompt art on the title, save,
+main menu, Player Entry and race screens. Story mode, shop and missions not
+yet checked.
+
+## Shader cache
+Dolphin's `Cache/` folder was never created, so the pipeline UID cache never
+saved and every launch compiled shaders during play. Now created at startup.
+
 ## Options menu
 Ported from ReFare (`src/turbulence_options.cpp`), Sonic Riders palette.
 R1 / Tab by default, rebindable. Not yet checked visually: automation
