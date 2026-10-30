@@ -483,6 +483,19 @@ index ff8480e..28bac1a 100644
  
    Util::PopulateBackendInfo(&g_backend_info);
  
+diff --git a/Source/Core/VideoCommon/CMakeLists.txt b/Source/Core/VideoCommon/CMakeLists.txt
+index 69a0968..00b4ecf 100644
+--- a/Source/Core/VideoCommon/CMakeLists.txt
++++ b/Source/Core/VideoCommon/CMakeLists.txt
+@@ -173,6 +173,8 @@ add_library(videocommon
+   Spirv.cpp
+   Spirv.h
+   Statistics.cpp
++  TurbulencePromptTextures.cpp
++  TurbulencePromptTextures.h
+   Statistics.h
+   TextureCacheBase.cpp
+   TextureCacheBase.h
 diff --git a/Source/Core/VideoCommon/OnScreenUI.cpp b/Source/Core/VideoCommon/OnScreenUI.cpp
 index 451109b..cd89b2c 100644
 --- a/Source/Core/VideoCommon/OnScreenUI.cpp
@@ -552,10 +565,18 @@ index 7c62730..d07109e 100644
    {
      // Video Software doesn't support drawing a UI or doing post-processing
 diff --git a/Source/Core/VideoCommon/TextureCacheBase.cpp b/Source/Core/VideoCommon/TextureCacheBase.cpp
-index c5d6096..fb13dd0 100644
+index c5d6096..0e7a536 100644
 --- a/Source/Core/VideoCommon/TextureCacheBase.cpp
 +++ b/Source/Core/VideoCommon/TextureCacheBase.cpp
-@@ -1262,14 +1262,15 @@ TCacheEntry* TextureCacheBase::LoadImpl(u32 stage, bool force_reload)
+@@ -47,6 +47,7 @@
+ #include "VideoCommon/OpcodeDecoding.h"
+ #include "VideoCommon/PixelShaderManager.h"
+ #include "VideoCommon/Present.h"
++#include "VideoCommon/TurbulencePromptTextures.h"
+ #include "VideoCommon/Resources/CustomResourceManager.h"
+ #include "VideoCommon/ShaderCache.h"
+ #include "VideoCommon/Statistics.h"
+@@ -1262,14 +1263,15 @@ TCacheEntry* TextureCacheBase::LoadImpl(u32 stage, bool force_reload)
      //
      // Spyro: A Hero's Tail is known for (deliberately?) using such overwritten textures
      // in it's bloom effect, which breaks without giving it the invalidated texture.
@@ -573,7 +594,30 @@ index c5d6096..fb13dd0 100644
      {
        return entry;
      }
-@@ -1463,11 +1464,14 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
+@@ -1309,6 +1311,22 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
+   if (!texture_info.IsDataValid())
+     return {};
+ 
++  // Turbulence: the button prompt style changed; drop cached prompt textures
++  // so the matching variant is created on this lookup.
++  if (TurbulencePromptTextures::TakeStyleChange())
++  {
++    for (auto iter = m_textures_by_address.begin(); iter != m_textures_by_address.end();)
++    {
++      const RcTcacheEntry& cached = iter->second;
++      if (!cached->IsCopy() &&
++          TurbulencePromptTextures::MayMatch(cached->native_width, cached->native_height,
++                                             static_cast<u32>(cached->format.texfmt)))
++        iter = InvalidateTexture(iter);
++      else
++        ++iter;
++    }
++  }
++
+   // Hash assigned to texcache entry (also used to generate filenames used for texture dumping and
+   // custom texture lookup)
+   u64 base_hash = TEXHASH_INVALID;
+@@ -1463,11 +1481,14 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
      else
      {
        // For normal textures, all texture parameters need to match
@@ -589,7 +633,24 @@ index c5d6096..fb13dd0 100644
          entry = DoPartialTextureUpdates(iter->second, texture_info.GetTlutAddress(),
                                          texture_info.GetTlutFormat());
          if (entry)
-@@ -2126,12 +2130,20 @@ bool TextureCacheBase::CopyFilterCanOverflow(const std::array<u32, 3>& coefficie
+@@ -1583,6 +1604,16 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
+     }
+   }
+ 
++  // Turbulence: Xbox / PlayStation button prompts for the active controller.
++  if (!custom_texture_data)
++  {
++    if (auto prompt = TurbulencePromptTextures::Find(texture_info))
++    {
++      custom_texture_data = std::move(prompt);
++      skip_texture_dump = true;
++    }
++  }
++
+   std::string texture_name = "";
+ 
+   if (g_ActiveConfig.bGraphicMods)
+@@ -2126,12 +2157,20 @@ bool TextureCacheBase::CopyFilterCanOverflow(const std::array<u32, 3>& coefficie
    return coefficients[0] + coefficients[1] + coefficients[2] >= 128;
  }
  
@@ -610,7 +671,7 @@ index c5d6096..fb13dd0 100644
    // Emulation methods:
    //
    // - EFB to RAM:
-@@ -2209,8 +2221,8 @@ void TextureCacheBase::CopyRenderTargetToTexture(
+@@ -2209,8 +2248,8 @@ void TextureCacheBase::CopyRenderTargetToTexture(
    {
      tex_w /= 2;
      tex_h /= 2;
@@ -659,6 +720,208 @@ index 0000000..9996ff4
 +  ring.head.store(index + 1, std::memory_order_release);
 +}
 +}  // namespace TurbulencePresentTimes
+diff --git a/Source/Core/VideoCommon/TurbulencePromptTextures.cpp b/Source/Core/VideoCommon/TurbulencePromptTextures.cpp
+new file mode 100644
+index 0000000..bed4e14
+--- /dev/null
++++ b/Source/Core/VideoCommon/TurbulencePromptTextures.cpp
+@@ -0,0 +1,124 @@
++// Turbulence: switch texture-baked button prompts between console styles.
++
++#include "VideoCommon/TurbulencePromptTextures.h"
++
++#include <atomic>
++#include <cstdio>
++#include <cstring>
++#include <map>
++#include <mutex>
++
++#include <fmt/format.h>
++
++#include "VideoCommon/Assets/CustomTextureData.h"
++#include "VideoCommon/TextureDecoder.h"
++#include "VideoCommon/TextureInfo.h"
++
++namespace TurbulencePromptTextures
++{
++namespace
++{
++std::mutex s_mutex;
++std::vector<Recipe> s_recipes;
++// Patched textures by (texture name incl. palette, style).
++std::map<std::pair<std::string, int>, std::shared_ptr<VideoCommon::CustomTextureData>> s_built;
++std::atomic<int> s_style{GameCube};
++std::atomic<bool> s_changed{false};
++
++bool ParseSize(const std::string& prefix, u32* width, u32* height)
++{
++  // "tex1_<W>x<H>_<hash>"
++  return std::sscanf(prefix.c_str(), "tex1_%ux%u_", width, height) == 2;
++}
++}  // namespace
++
++void Register(Recipe recipe)
++{
++  std::lock_guard lock(s_mutex);
++  s_recipes.push_back(std::move(recipe));
++}
++
++void SetStyle(Style style)
++{
++  if (s_style.exchange(style) != style)
++    s_changed.store(true);
++}
++
++bool TakeStyleChange()
++{
++  return s_changed.load(std::memory_order_relaxed) && s_changed.exchange(false);
++}
++
++bool MayMatch(u32 width, u32 height, u32 gx_format)
++{
++  std::lock_guard lock(s_mutex);
++  for (const Recipe& r : s_recipes)
++  {
++    u32 w = 0, h = 0;
++    if (ParseSize(r.name_prefix, &w, &h) && w == width && h == height && r.gx_format == gx_format)
++      return true;
++  }
++  return false;
++}
++
++std::shared_ptr<VideoCommon::CustomTextureData> Find(const TextureInfo& texture_info)
++{
++  const int style = s_style.load(std::memory_order_relaxed);
++  if (style == GameCube || !texture_info.IsDataValid())
++    return nullptr;
++  const u32 format = static_cast<u32>(texture_info.GetTextureFormat());
++  const u32 width = texture_info.GetRawWidth(), height = texture_info.GetRawHeight();
++  if (!MayMatch(width, height, format))
++    return nullptr;
++
++  const TextureInfo::NameDetails name = texture_info.CalculateTextureName();
++  const std::string prefix = fmt::format("{}_{}", name.base_name, name.texture_name);
++  const std::string full_name = name.GetFullName();
++
++  std::lock_guard lock(s_mutex);
++  const Recipe* recipe = nullptr;
++  for (const Recipe& r : s_recipes)
++  {
++    if (r.name_prefix == prefix && r.gx_format == format)
++      recipe = &r;
++  }
++  if (!recipe)
++    return nullptr;
++  if (auto it = s_built.find({full_name, style}); it != s_built.end())
++    return it->second;
++
++  // Decode the game's own texture (expanded to whole blocks), then copy the
++  // chosen style's cells over the GameCube cells.
++  const u32 ew = texture_info.GetExpandedWidth(), eh = texture_info.GetExpandedHeight();
++  std::vector<u8> decoded(size_t(ew) * eh * 4);
++  TexDecoder_Decode(decoded.data(), texture_info.GetData(), ew, eh,
++                    texture_info.GetTextureFormat(), texture_info.GetTlutAddress(),
++                    texture_info.GetTlutFormat());
++  std::vector<u8> rgba(size_t(width) * height * 4);
++  for (u32 y = 0; y < height; ++y)
++    std::memcpy(&rgba[size_t(y) * width * 4], &decoded[size_t(y) * ew * 4], size_t(width) * 4);
++  for (const CellCopy& c : recipe->cells)
++  {
++    const u32 sx = c.source_x[style], sy = c.source_y[style];
++    if (c.x + c.width > width || c.y + c.height > height || sx + c.width > width ||
++        sy + c.height > height)
++      continue;
++    for (u32 row = 0; row < c.height; ++row)
++      std::memcpy(&rgba[(size_t(c.y + row) * width + c.x) * 4],
++                  &decoded[(size_t(sy + row) * ew + sx) * 4], size_t(c.width) * 4);
++  }
++
++  auto data = std::make_shared<VideoCommon::CustomTextureData>();
++  auto& level = data->m_slices.emplace_back().m_levels.emplace_back();
++  level.width = width;
++  level.height = height;
++  level.row_length = width;
++  level.format = AbstractTextureFormat::RGBA8;
++  level.data = Common::UniqueBuffer<u8>(rgba.size());
++  std::memcpy(level.data.data(), rgba.data(), rgba.size());
++  s_built[{full_name, style}] = data;
++  std::fprintf(stderr, "[turbulence] button prompts: %s -> %s\n", full_name.c_str(),
++               style == Xbox ? "Xbox" : "PlayStation");
++  return data;
++}
++}  // namespace TurbulencePromptTextures
+diff --git a/Source/Core/VideoCommon/TurbulencePromptTextures.h b/Source/Core/VideoCommon/TurbulencePromptTextures.h
+new file mode 100644
+index 0000000..9c5cdfa
+--- /dev/null
++++ b/Source/Core/VideoCommon/TurbulencePromptTextures.h
+@@ -0,0 +1,66 @@
++// Turbulence: switch texture-baked button prompts between console styles
++// (generalised from ReFare's RefarePromptTextures).
++//
++// Sonic Riders' prompt textures already hold the GameCube, Xbox and
++// PlayStation 2 versions of each button icon side by side; the GameCube game
++// only draws the GameCube cells. The frontend registers recipes (which cells
++// to copy over the GameCube ones for each style). While a non-GameCube style
++// is active, a matching texture is decoded, patched and used instead; a style
++// change evicts matching cache entries so it shows on the next frame.
++#pragma once
++
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "Common/CommonTypes.h"
++
++class TextureInfo;
++namespace VideoCommon
++{
++class CustomTextureData;
++}
++
++namespace TurbulencePromptTextures
++{
++enum Style : int
++{
++  GameCube = 0,
++  Xbox = 1,
++  PlayStation = 2,
++  StyleCount = 3,
++};
++
++struct CellCopy
++{
++  // Destination: the GameCube cell. Sources: the same-size cell to copy for
++  // each style (index by Style; the GameCube entry is unused).
++  u32 x, y, width, height;
++  u32 source_x[StyleCount];
++  u32 source_y[StyleCount];
++};
++
++struct Recipe
++{
++  // Matches Dolphin's texture name without the palette hash, e.g.
++  // "tex1_256x128_af289750027e9b53" plus the GX format (9 = C8).
++  std::string name_prefix;
++  u32 gx_format;
++  std::vector<CellCopy> cells;
++};
++
++// Call before rendering starts.
++void Register(Recipe recipe);
++
++// Any thread. Takes effect on the next texture lookup.
++void SetStyle(Style style);
++
++// Video thread (texture cache): the patched texture for the current style.
++std::shared_ptr<VideoCommon::CustomTextureData> Find(const TextureInfo& texture_info);
++
++// Video thread: true once after each style change (evict prompt textures).
++bool TakeStyleChange();
++
++// Whether a texture of this size/format could be a registered prompt.
++bool MayMatch(u32 width, u32 height, u32 gx_format);
++}  // namespace TurbulencePromptTextures
 diff --git a/Source/Core/VideoCommon/VertexManagerBase.cpp b/Source/Core/VideoCommon/VertexManagerBase.cpp
 index 2bc6d58..d636384 100644
 --- a/Source/Core/VideoCommon/VertexManagerBase.cpp

@@ -4,6 +4,7 @@
 // respects window focus like the game does.
 #include "turbulence_options.hpp"
 #include "turbulence_metal.hpp"
+#include "turbulence_prompts.hpp"
 #include "Common/Config/Config.h"
 #include "Common/IniFile.h"
 #include "Core/Config/GraphicsSettings.h"
@@ -79,17 +80,20 @@ constexpr std::array<Aspect, 6> aspects = {{{"Match window / display",AspectMode
  {"4:3 (original)",AspectMode::ForceStandard,4,3},
  {"16:9",AspectMode::CustomStretch,16,9},{"16:10",AspectMode::CustomStretch,16,10},
  {"21:9",AspectMode::CustomStretch,21,9},{"32:9",AspectMode::CustomStretch,32,9}}};
+// Button prompt preference, as saved in Turbulence.ini and shown in the menu.
+constexpr const char* kPromptNames[] = {"auto", "gamecube", "xbox", "playstation"};
+constexpr const char* kPromptLabels[] = {"Automatic", "GameCube", "Xbox", "PlayStation"};
 // Dolphin post-processing shader shipped in Sys/Shaders/FXAA.glsl.
 constexpr const char* kFXAAShader = "FXAA";
 
-enum class Row { Scale, Aspect, HudLayout, FXAA, VSync, MetalHUD, MenuButton, Exit };
+enum class Row { Scale, Aspect, HudLayout, FXAA, VSync, MetalHUD, Prompts, MenuButton, Exit };
 const std::vector<Row>& Rows() {
   static const std::vector<Row> rows = {Row::Scale, Row::Aspect, Row::HudLayout, Row::FXAA,
     Row::VSync,
 #ifdef __APPLE__
     Row::MetalHUD,
 #endif
-    Row::MenuButton, Row::Exit};
+    Row::Prompts, Row::MenuButton, Row::Exit};
   return rows;
 }
 const char* RowLabel(Row row) {
@@ -100,6 +104,7 @@ const char* RowLabel(Row row) {
   case Row::FXAA: return "FXAA";
   case Row::VSync: return "V-Sync";
   case Row::MetalHUD: return "Metal HUD";
+  case Row::Prompts: return "Button prompts";
   case Row::MenuButton: return "Options menu button";
   case Row::Exit: return "Exit The Game";
   }
@@ -232,6 +237,7 @@ struct OptionsMenu::Impl {
   int exit_choice = 0;  // 0 = No (left, default), 1 = Yes (right)
   bool exiting = false;
   std::string save_error;
+  mutable std::string value_text;
   MenuButtonBinding binding;
 
   Impl(std::filesystem::path path, void* view, std::function<void()> exit,
@@ -370,6 +376,14 @@ struct OptionsMenu::Impl {
     case Row::FXAA: fxaa = !fxaa; ApplyFXAA(); break;
     case Row::VSync: vsync = !vsync; ApplyVSync(); break;
     case Row::MetalHUD: metal_hud = !metal_hud; ApplyMetalHUD(); break;
+    case Row::Prompts: {
+      const int next = (static_cast<int>(GetPromptPreference()) + delta + 4) % 4;
+      SetPromptPreference(static_cast<PromptPreference>(next));
+      save_error = SaveTurbulenceIni(directory, [&](Common::IniFile& ini) {
+        ini.GetOrCreateSection("Controls")->Set("ButtonPrompts", std::string(kPromptNames[next]));
+      }) ? "" : "Could not save the prompt style; change applies this session.";
+      break;
+    }
     case Row::MenuButton:  // Left/Right restore the default R1 / Tab.
       if (binding.pad != MenuButtonBinding{}.pad || binding.key != MenuButtonBinding{}.key) {
         binding = MenuButtonBinding{}; SaveMenuButton();
@@ -382,7 +396,7 @@ struct OptionsMenu::Impl {
     switch (CurrentRow()) {
     case Row::Exit: confirm_exit = true; exit_choice = 0; break;
     case Row::MenuButton: StartCapture(); break;
-    case Row::HudLayout: case Row::FXAA: case Row::VSync: case Row::MetalHUD: Step(1); break;
+    case Row::HudLayout: case Row::FXAA: case Row::VSync: case Row::MetalHUD: case Row::Prompts: Step(1); break;
     default: break;
     }
   }
@@ -400,6 +414,13 @@ struct OptionsMenu::Impl {
     case Row::FXAA: return fxaa ? "On" : "Off";
     case Row::VSync: return vsync ? "On" : "Off";
     case Row::MetalHUD: return metal_hud ? "On" : "Off";
+    case Row::Prompts: {
+      static constexpr const char* styles[] = {"GameCube", "Xbox", "PlayStation"};
+      if (GetPromptPreference() != PromptPreference::Automatic)
+        return kPromptLabels[static_cast<int>(GetPromptPreference())];
+      value_text = std::string("Automatic (") + styles[CurrentPromptStyle() % 3] + ")";
+      return value_text.c_str();
+    }
     case Row::MenuButton:
       if (capturing) return "Press a button or key...";
       binding_text = PadLabel(binding.pad) + " / " + binding.key;
@@ -566,6 +587,10 @@ void PrepareOptions(const std::filesystem::path& directory) {
   bool stretched = false;
   ini.GetOrCreateSection("Video")->Get("HudStretched", &stretched, false);
   g_turbulence_hud_stretched = stretched;
+  std::string prompts = "auto";
+  ini.GetOrCreateSection("Controls")->Get("ButtonPrompts", &prompts, "auto");
+  for (int i = 0; i < 4; ++i)
+    if (prompts == kPromptNames[i]) SetPromptPreference(static_cast<PromptPreference>(i));
 }
 
 bool LoadMetalHUDPreference(const std::filesystem::path& directory) {
