@@ -30,6 +30,27 @@ Metal City race on the recompiled REL at 60 fps.
 - Gemini had reverted upstream's JitArm64 fix, which left the static recomp
   mostly inert on Apple Silicon.
 
+## Frame pacing (on-glass times, 120 Hz MacBook Pro display, windowed)
+Measured with the pacing recorder (`TURBULENCE_PACING_DIR`, touch
+`pacing-request`; `scripts/pacing-report.py`), 600 frames each:
+| | Gemini's pacing | ReFare's pacing |
+|---|---|---|
+| Race: frames on the 16.67 ms cadence | 593/598 (5 at 25 ms) | 598/598, sd 0.001 ms |
+| Race: present vs. schedule (p50) | ~3,560 ms behind | 15 ms |
+| Loading into a race | not measured | 576/591, 14 at 25 ms, no drops or 2-frame hitches |
+
+Changes: minimum present duration matched to the display (16.17 ms on
+60/120 Hz) instead of a fixed 14 ms; no 3-drawable queue; no
+present-before-wait reorder; stall catch-up; time-drift correction no longer
+forced on; user-interactive QoS for CPU and render threads; no App Nap.
+Remaining: one-refresh-late frames while a race loads (file loading and
+shader compilation).
+
+## Metal HUD
+Now as in ReFare: MTL_HUD_ENABLED set before Metal starts, the menu only flips
+the layer's HUD mode. Gemini's version set the variable after Metal had read
+it and replaced the layer's HUD properties, so the HUD never appeared.
+
 ## Options menu
 Ported from ReFare (`src/turbulence_options.cpp`), Sonic Riders palette.
 R1 / Tab by default, rebindable. Not yet checked visually: automation
