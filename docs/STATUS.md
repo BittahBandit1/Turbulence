@@ -75,9 +75,15 @@ R1 / Tab by default, rebindable. Not yet checked visually: automation
 screenshots capture the game image without overlays.
 
 ## Open
-- Widescreen: still Gemini's heuristics in Dolphin's video code. Races look
-  right; title / menu screens show stretched edge bars. To be redone as
-  game-side fixes (like ReFare's culling hook).
+- Widescreen: 3D is drawn at 16:9 through Dolphin's widescreen hack. Every 2D
+  draw is classified by its measured on-screen extent (VertexManagerBase):
+  full-width backgrounds and frame-copy effects stretch, bars touching one edge
+  extend to that edge, everything else (race HUD, menu panels, loading art)
+  stays centered at 4:3. Checked on the title, Player Entry, loading and race
+  screens. `TURBULENCE_WS_CLASSIFY=0` centers all 2D (diagnostic);
+  `TURBULENCE_WS_TRACE=1` logs extents. Possible follow-up: a game-side aspect
+  hook at 0x800645DC so the game itself culls for 16:9 (objects can still pop
+  in at the far edges).
 - Gemini's `presentDrawable:afterMinimumDuration:0.014` and texture-cache
   changes are still in place, unreviewed.
 
