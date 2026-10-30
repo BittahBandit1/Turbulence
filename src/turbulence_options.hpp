@@ -23,7 +23,8 @@ class OptionsMenu {
 public:
   // request_exit is called (from the render thread) after the player confirms
   // "Exit The Game". It must only request a shutdown, never block.
-  explicit OptionsMenu(std::filesystem::path user_directory,
+  // render_view: the platform's render window (macOS NSView), for the Metal HUD.
+  explicit OptionsMenu(std::filesystem::path user_directory, void* render_view,
                        std::function<void()> request_exit = {},
                        std::function<OptionsInput()> input_source = {},
                        std::function<MenuButtonCapture()> capture_source = {});
@@ -33,9 +34,14 @@ private:
   std::unique_ptr<Impl> m_impl;
 };
 bool OptionsMenuBlocksInput();
-// Call before the video backend is created (Metal HUD machinery, saved
-// Turbulence.ini preferences that the renderer reads at startup).
+// First thing at startup, before Metal is touched: enables the Metal HUD
+// machinery (shown or hidden later from the saved preference) and keeps macOS
+// from napping or throttling the game.
+void PrepareMetalHUD();
+// Before the video backend is created: saved Turbulence.ini preferences the
+// renderer reads at startup.
 void PrepareOptions(const std::filesystem::path& user_directory);
 MenuButtonBinding LoadMenuButtonBinding(const std::filesystem::path& user_directory);
+bool LoadMetalHUDPreference(const std::filesystem::path& user_directory);
 bool SaveMenuButtonBinding(const std::filesystem::path& user_directory, const MenuButtonBinding& binding);
 }  // namespace turbulence

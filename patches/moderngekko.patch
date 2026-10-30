@@ -1,8 +1,8 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index c0548a0..4ddc102 100644
+index c0548a0..8ff7a24 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -281,6 +281,12 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+@@ -281,6 +281,16 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
          target_compile_definitions(moderngekko PRIVATE _M_GENERIC=1)
      endif()
      target_link_libraries(moderngekko PRIVATE core uicommon)
@@ -11,12 +11,16 @@ index c0548a0..4ddc102 100644
 +        target_include_directories(moderngekko PRIVATE "${TURBULENCE_OPTIONS_SOURCE_DIR}")
 +        target_link_libraries(moderngekko PRIVATE imgui)
 +        target_compile_definitions(moderngekko PRIVATE TURBULENCE_OPTIONS_MENU=1)
++        if(APPLE)
++            target_sources(moderngekko PRIVATE "${TURBULENCE_OPTIONS_SOURCE_DIR}/turbulence_metal.mm")
++            set_source_files_properties("${TURBULENCE_OPTIONS_SOURCE_DIR}/turbulence_metal.mm" PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
++        endif()
 +    endif()
      if(TARGET PkgConfig::X11)
          target_sources(moderngekko PRIVATE
              vendor/dolphin/Source/Core/DolphinNoGUI/PlatformX11.cpp)
 diff --git a/src/runtime/dolphin_runtime.cpp b/src/runtime/dolphin_runtime.cpp
-index f9b5405..2f25403 100644
+index f9b5405..007f6f2 100644
 --- a/src/runtime/dolphin_runtime.cpp
 +++ b/src/runtime/dolphin_runtime.cpp
 @@ -1,4 +1,8 @@
@@ -56,7 +60,17 @@ index f9b5405..2f25403 100644
  }
  bool Host_RendererHasFullFocus() { return Host_RendererHasFocus(); }
  bool Host_RendererIsFullscreen() {
-@@ -665,6 +676,29 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -547,6 +558,9 @@ ModuleSource::AttachedDescriptor(const ModernGekkoModuleDesc *descriptor) {
+ Runtime::Runtime(std::unique_ptr<Impl> impl) : m_impl(std::move(impl)) {}
+ 
+ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
++#ifdef TURBULENCE_OPTIONS_MENU
++  turbulence::PrepareMetalHUD();
++#endif
+   std::lock_guard lock(s_runtime_mutex);
+   if (s_runtime_active)
+     return {
+@@ -665,6 +679,43 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
    if (impl->config.graphics.internal_resolution_scale)
      Config::SetBase(Config::GFX_EFB_SCALE,
                      *impl->config.graphics.internal_resolution_scale);
@@ -78,15 +92,29 @@ index f9b5405..2f25403 100644
 +#ifdef TURBULENCE_OPTIONS_MENU
 +  turbulence::PrepareOptions(impl->config.user_directory);
 +#endif
-+  Config::SetBaseOrCurrent(Config::GFX_MTL_USE_PRESENT_DRAWABLE, TriState::On);
-+  Config::SetBaseOrCurrent(Config::MAIN_PRECISION_FRAME_TIMING, true);
-+  Config::SetBaseOrCurrent(Config::MAIN_RUSH_FRAME_PRESENTATION, false);
-+  Config::SetBaseOrCurrent(Config::MAIN_SMOOTH_EARLY_PRESENTATION, true);
-+  Config::SetBaseOrCurrent(Config::MAIN_CORRECT_TIME_DRIFT, true);
++  // Turbulence frame pacing (ReFare's measured setup): precise frame timing
++  // and early-presentation smoothing, no rushed presentation, and Metal
++  // presentation at a minimum duration matched to the display's refresh
++  // (-1 = auto: 60 Hz cadence on 60/120 Hz displays). Defaults only, except
++  // time-drift correction, which an earlier build forced on and saved: it
++  // left presentation ~3.5 s behind its schedule for the whole session.
++  {
++    const auto set_default = [](const auto& key, auto value) {
++      const auto base = Config::GetLayer(Config::LayerType::Base);
++      if (base && !base->Exists(key.GetLocation()))
++        Config::SetBase(key, value);
++    };
++    set_default(Config::MAIN_PRECISION_FRAME_TIMING, true);
++    set_default(Config::MAIN_SMOOTH_EARLY_PRESENTATION, true);
++    set_default(Config::MAIN_RUSH_FRAME_PRESENTATION, false);
++    set_default(Config::GFX_MTL_USE_PRESENT_DRAWABLE, TriState::Auto);
++    set_default(Config::GFX_MTL_MINIMUM_PRESENT_DURATION, -1.0);
++    Config::SetBase(Config::MAIN_CORRECT_TIME_DRIFT, false);
++  }
    Config::SetBase(Config::GFX_SHADER_CACHE, true);
    Config::SetBase(Config::GFX_SHADER_COMPILATION_MODE,
                    ShaderCompilationMode::AsynchronousUberShaders);
-@@ -688,8 +722,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -688,8 +739,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
    Config::SetBase(Config::MAIN_AUDIO_BACKEND, impl->config.audio.backend);
    if (impl->config.audio.mute)
      Config::SetBase(Config::MAIN_AUDIO_VOLUME, 0);
@@ -96,7 +124,7 @@ index f9b5405..2f25403 100644
  
    auto &jit = Core::System::GetInstance().GetJitInterface();
    StaticRecompModuleSource recomp_source;
-@@ -790,6 +823,15 @@ RuntimeRunResult Runtime::Run() {
+@@ -790,6 +840,16 @@ RuntimeRunResult Runtime::Run() {
                           "Dolphin could not boot sys/main.dol"}};
    }
    m_impl->booted = true;
@@ -106,6 +134,7 @@ index f9b5405..2f25403 100644
 +  if (!m_impl->config.headless)
 +    options_menu = std::make_unique<turbulence::OptionsMenu>(
 +        m_impl->config.user_directory,
++        s_platform ? s_platform->GetWindowSystemInfo().render_window : nullptr,
 +        // "Exit The Game": same clean shutdown request as the automation stop.
 +        [this] { RequestStop(); });
 +#endif

@@ -3,6 +3,7 @@
 // thread; reads controllers through Dolphin's controller interface, so it
 // respects window focus like the game does.
 #include "turbulence_options.hpp"
+#include "turbulence_metal.hpp"
 #include "Common/Config/Config.h"
 #include "Common/IniFile.h"
 #include "Core/Config/GraphicsSettings.h"
@@ -18,11 +19,8 @@
 #include <string>
 #include <vector>
 
-// Defined in Dolphin's VideoCommon (HUD layout) and Metal backend (HUD).
+// Defined in Dolphin's VideoCommon (HUD layout).
 extern bool g_turbulence_hud_stretched;
-#ifdef __APPLE__
-extern bool g_turbulence_metal_hud_enabled;
-#endif
 
 namespace turbulence {
 namespace {
@@ -211,6 +209,8 @@ bool SaveTurbulenceIni(const std::filesystem::path& directory,
 
 struct OptionsMenu::Impl {
   std::filesystem::path directory;
+  void* render_view = nullptr;
+  bool hud_applied = false;
   Common::EventHook draw_hook;
   std::function<OptionsInput()> input_source;
   std::function<void()> request_exit;
@@ -234,13 +234,15 @@ struct OptionsMenu::Impl {
   std::string save_error;
   MenuButtonBinding binding;
 
-  Impl(std::filesystem::path path, std::function<void()> exit,
+  Impl(std::filesystem::path path, void* view, std::function<void()> exit,
        std::function<OptionsInput()> source, std::function<MenuButtonCapture()> capture)
-      : directory(std::move(path)), input_source(source ? std::move(source) : ReadButtons),
+      : directory(std::move(path)), render_view(view),
+        input_source(source ? std::move(source) : ReadButtons),
         request_exit(std::move(exit)),
         capture_source(capture ? std::move(capture) : ReadCapture) {
     s_menu_binding = LoadMenuButtonBinding(directory);
     binding = s_menu_binding;
+    metal_hud = LoadMetalHUDPreference(directory);
     draw_hook = GetVideoEvents().imgui_draw_event.Register([this] { Draw(); });
     // Unattended tests (scripts/turbulence_agent.sh) can't press the real menu
     // button: automation input drives the emulated GameCube pad.
@@ -252,9 +254,6 @@ struct OptionsMenu::Impl {
   Row CurrentRow() const { return Rows()[selected]; }
   void ReadSettings() {
     stretch_hud = g_turbulence_hud_stretched;
-#ifdef __APPLE__
-    metal_hud = g_turbulence_metal_hud_enabled;
-#endif
     fxaa = Config::Get(Config::GFX_ENHANCE_POST_SHADER) == kFXAAShader;
     vsync = Config::Get(Config::GFX_VSYNC);
     const int scale = Config::Get(Config::GFX_EFB_SCALE);
@@ -333,9 +332,7 @@ struct OptionsMenu::Impl {
     });
   }
   void ApplyMetalHUD() {
-#ifdef __APPLE__
-    g_turbulence_metal_hud_enabled = metal_hud;  // The Metal backend syncs it at present.
-#endif
+    SetMetalHUDVisible(render_view, metal_hud);
     save_error = SaveTurbulenceIni(directory, [&](Common::IniFile& ini) {
       ini.GetOrCreateSection("Video")->Set("MetalHUD", metal_hud);
     }) ? "" : "Could not save the HUD setting; change applies this session.";
@@ -461,6 +458,13 @@ struct OptionsMenu::Impl {
   }
   void Draw() {
     if (!ImGui::GetCurrentContext()) return;
+    if (!hud_applied) {
+      PrioritizeCurrentThread();  // Render thread.
+      // With MTL_HUD_ENABLED set at launch the HUD is already showing. Only
+      // touch the layer for a saved Off (see SetMetalHUDVisible).
+      if (!metal_hud) SetMetalHUDVisible(render_view, false);
+      hud_applied = true;
+    }
     const Buttons down = input_source();
     Buttons pressed{};
     for (int i=0;i<Count;++i) pressed[i] = down[i] && !previous[i];
@@ -537,29 +541,39 @@ struct OptionsMenu::Impl {
   }
 };
 
-OptionsMenu::OptionsMenu(std::filesystem::path directory, std::function<void()> request_exit,
+OptionsMenu::OptionsMenu(std::filesystem::path directory, void* render_view,
+                         std::function<void()> request_exit,
                          std::function<OptionsInput()> source,
                          std::function<MenuButtonCapture()> capture_source)
-  : m_impl(std::make_unique<Impl>(std::move(directory), std::move(request_exit),
+  : m_impl(std::make_unique<Impl>(std::move(directory), render_view, std::move(request_exit),
                                   std::move(source), std::move(capture_source))) {}
 OptionsMenu::~OptionsMenu() = default;
 bool OptionsMenuBlocksInput() { return s_blocks_input.load(); }
 
+void PrepareMetalHUD() {
+#ifdef __APPLE__
+  // Metal reads this when the device is created. Set it even for a saved Off
+  // preference, so the HUD can be switched back on without restarting; the
+  // menu hides it on its first frame instead.
+  setenv("MTL_HUD_ENABLED", "1", 0);
+  KeepGameResponsive();
+#endif
+}
+
 void PrepareOptions(const std::filesystem::path& directory) {
   Common::IniFile ini;
   ini.Load(TurbulenceIni(directory));
-  auto* video = ini.GetOrCreateSection("Video");
   bool stretched = false;
-  video->Get("HudStretched", &stretched, false);
+  ini.GetOrCreateSection("Video")->Get("HudStretched", &stretched, false);
   g_turbulence_hud_stretched = stretched;
-#ifdef __APPLE__
-  bool metal_hud = true;
-  video->Get("MetalHUD", &metal_hud, true);
-  g_turbulence_metal_hud_enabled = metal_hud;
-  // Enable the HUD machinery before Metal device creation, even for a saved
-  // Off preference, so the layer can be toggled back on without restarting.
-  setenv("MTL_HUD_ENABLED", "1", 0);
-#endif
+}
+
+bool LoadMetalHUDPreference(const std::filesystem::path& directory) {
+  Common::IniFile ini;
+  ini.Load(TurbulenceIni(directory));
+  bool enabled = true;
+  ini.GetOrCreateSection("Video")->Get("MetalHUD", &enabled, true);
+  return enabled;
 }
 
 // Config/Turbulence.ini, which only Turbulence writes ([Controls] MenuPad, MenuKey).
