@@ -20,7 +20,7 @@ index c0548a0..8ff7a24 100644
          target_sources(moderngekko PRIVATE
              vendor/dolphin/Source/Core/DolphinNoGUI/PlatformX11.cpp)
 diff --git a/src/runtime/dolphin_runtime.cpp b/src/runtime/dolphin_runtime.cpp
-index f9b5405..007f6f2 100644
+index f9b5405..e0eea99 100644
 --- a/src/runtime/dolphin_runtime.cpp
 +++ b/src/runtime/dolphin_runtime.cpp
 @@ -1,4 +1,8 @@
@@ -70,7 +70,18 @@ index f9b5405..007f6f2 100644
    std::lock_guard lock(s_runtime_mutex);
    if (s_runtime_active)
      return {
-@@ -665,6 +679,43 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -609,6 +623,10 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+ 
+   if (!s_external_ui_common) {
+     UICommon::SetUserDirectory(impl->config.user_directory.string());
++    // Turbulence: create Cache/, Cache/Shaders/, Load/Textures/ etc. Dolphin's
++    // cache files fail to open (silently) without them, so the pipeline UID
++    // cache was never written and every launch recompiled shaders mid-game.
++    UICommon::CreateDirectories();
+     UICommon::Init();
+     impl->ui_initialized = true;
+   }
+@@ -665,6 +683,43 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
    if (impl->config.graphics.internal_resolution_scale)
      Config::SetBase(Config::GFX_EFB_SCALE,
                      *impl->config.graphics.internal_resolution_scale);
@@ -114,7 +125,7 @@ index f9b5405..007f6f2 100644
    Config::SetBase(Config::GFX_SHADER_CACHE, true);
    Config::SetBase(Config::GFX_SHADER_COMPILATION_MODE,
                    ShaderCompilationMode::AsynchronousUberShaders);
-@@ -688,8 +739,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -688,8 +743,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
    Config::SetBase(Config::MAIN_AUDIO_BACKEND, impl->config.audio.backend);
    if (impl->config.audio.mute)
      Config::SetBase(Config::MAIN_AUDIO_VOLUME, 0);
@@ -124,7 +135,7 @@ index f9b5405..007f6f2 100644
  
    auto &jit = Core::System::GetInstance().GetJitInterface();
    StaticRecompModuleSource recomp_source;
-@@ -790,6 +840,16 @@ RuntimeRunResult Runtime::Run() {
+@@ -790,6 +844,16 @@ RuntimeRunResult Runtime::Run() {
                           "Dolphin could not boot sys/main.dol"}};
    }
    m_impl->booted = true;
