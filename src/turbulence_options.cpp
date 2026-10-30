@@ -28,25 +28,26 @@ namespace turbulence {
 namespace {
 std::atomic<bool> s_blocks_input{false};
 
-// Sonic Riders palette, sampled from the title screen: the deep indigo of the
-// Sonic silhouette for panels, the sky blue behind the logo for frames and
-// highlights, the logo's gold for focus, and the orange-red of its "R".
+// Sonic Riders palette, sampled from the game: indigo panels and the teal
+// selection pill with a bright cyan outline from its own menus (save data,
+// Player Entry), the logo's gold for the title, and the orange-red of the
+// logo's "R" for Exit.
 struct Palette {
-  ImVec4 window{0.090f, 0.086f, 0.290f, 0.96f};       // indigo #17164A
-  ImVec4 border{0.180f, 0.560f, 0.960f, 0.90f};       // sky blue #2E8FF5
+  ImVec4 window{0.075f, 0.070f, 0.300f, 0.96f};       // menu indigo #13124D
+  ImVec4 border{0.150f, 0.840f, 0.930f, 0.90f};       // selection outline #26D6ED
   ImVec4 title{1.000f, 0.820f, 0.080f, 1.00f};        // logo gold #FFD114
-  ImVec4 accent{0.360f, 0.720f, 1.000f, 1.00f};       // light sky #5CB8FF
+  ImVec4 accent{0.150f, 0.840f, 0.930f, 1.00f};       // cyan
   ImVec4 text{0.960f, 0.970f, 1.000f, 1.00f};
-  ImVec4 text_dim{0.620f, 0.680f, 0.880f, 1.00f};
-  ImVec4 button{0.160f, 0.170f, 0.470f, 1.00f};
-  ImVec4 button_hover{0.150f, 0.440f, 0.860f, 1.00f};
-  ImVec4 button_active{0.180f, 0.560f, 0.960f, 1.00f};
-  ImVec4 row_selected{0.180f, 0.560f, 0.960f, 0.45f};
-  ImVec4 row_hover{0.180f, 0.560f, 0.960f, 0.25f};
-  ImVec4 focus{1.000f, 0.820f, 0.080f, 1.00f};        // logo gold
-  ImVec4 focus_text{0.090f, 0.086f, 0.290f, 1.00f};   // indigo on gold
-  ImVec4 danger{0.910f, 0.290f, 0.100f, 1.00f};       // the "R" #E84A1A
-  ImVec4 separator{0.180f, 0.560f, 0.960f, 0.40f};
+  ImVec4 text_dim{0.600f, 0.660f, 0.860f, 1.00f};
+  ImVec4 button{0.140f, 0.150f, 0.440f, 1.00f};
+  ImVec4 button_hover{0.130f, 0.430f, 0.500f, 1.00f};
+  ImVec4 button_active{0.170f, 0.520f, 0.580f, 1.00f};
+  ImVec4 row_selected{0.170f, 0.500f, 0.560f, 0.90f}; // selection pill teal #2B808F
+  ImVec4 row_hover{0.170f, 0.500f, 0.560f, 0.45f};
+  ImVec4 focus{0.150f, 0.840f, 0.930f, 1.00f};        // cyan
+  ImVec4 focus_text{0.050f, 0.050f, 0.200f, 1.00f};   // indigo on cyan
+  ImVec4 danger{0.910f, 0.290f, 0.100f, 1.00f};       // logo "R" #E84A1A
+  ImVec4 separator{0.150f, 0.840f, 0.930f, 0.35f};
 };
 const Palette kPalette;
 
@@ -491,7 +492,7 @@ struct OptionsMenu::Impl {
       const Row row = rows[index];
       const bool is_selected = selected == index;
       ImGui::PushID(index);
-      ImGui::PushStyleColor(ImGuiCol_Text, is_selected ? p.focus : p.text);
+      ImGui::PushStyleColor(ImGuiCol_Text, p.text);
       const bool clicked = row != Row::Exit && ImGui::Selectable(RowLabel(row), is_selected);
       ImGui::PopStyleColor();
       if (clicked) selected = index;
