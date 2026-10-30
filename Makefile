@@ -20,6 +20,13 @@ JOBS ?= $(shell sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
 CMAKE_BUILD_TYPE ?= Release
 BUILD_TESTING ?= OFF
 
+# Turbulence: where Sonic Riders (USA) links files/_Main.rel at run time
+# (OSLink load address and .bss), read from RAM and verified across boots.
+# moderngekko-port recompiles the REL with these baked in; set
+# TURBULENCE_REL_DISABLE=1 to leave the REL to the fallback JIT instead.
+export TURBULENCE_REL_BASE ?= 0x803FBD00
+export TURBULENCE_REL_BSS ?= 0x805FB080
+
 # Generated-code backend: portable C or native LLVM objects.
 BACKEND ?= c
 LLVM_DIR ?=

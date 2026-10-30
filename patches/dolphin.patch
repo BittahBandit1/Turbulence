@@ -1,3 +1,17 @@
+diff --git a/Data/Sys/GameSettings/GXEE8P.ini b/Data/Sys/GameSettings/GXEE8P.ini
+index 3a81fe3..e5d08fe 100644
+--- a/Data/Sys/GameSettings/GXEE8P.ini
++++ b/Data/Sys/GameSettings/GXEE8P.ini
+@@ -1,2 +1,8 @@
++# GXEE8P - Sonic Riders (USA)
+ [Core]
+-StaticRecompFallbackRanges = 0x8000ADE0-0x8000B5E0
++# Turbulence: the SDK cache routines at 0x8000ADE0-0x8000B5E0 (DCFlushRange,
++# ICInvalidateRange, ...) used to be forced into the interpreter -- over a
++# billion interpreted instructions per three minutes. The module's
++# cache-control hooks handle dcbf/dcbst/icbi natively; runs with this empty
++# keep 60 fps with every chunk verified and no SMC failures.
++StaticRecompFallbackRanges =
 diff --git a/Source/Core/Common/Timer.cpp b/Source/Core/Common/Timer.cpp
 index fcbbd7b..9c4fa9d 100644
 --- a/Source/Core/Common/Timer.cpp
