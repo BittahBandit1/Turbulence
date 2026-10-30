@@ -902,7 +902,7 @@ index 0000000..9c5cdfa
 +bool MayMatch(u32 width, u32 height, u32 gx_format);
 +}  // namespace TurbulencePromptTextures
 diff --git a/Source/Core/VideoCommon/VertexManagerBase.cpp b/Source/Core/VideoCommon/VertexManagerBase.cpp
-index 2bc6d58..0b8688f 100644
+index 2bc6d58..8d454bb 100644
 --- a/Source/Core/VideoCommon/VertexManagerBase.cpp
 +++ b/Source/Core/VideoCommon/VertexManagerBase.cpp
 @@ -4,7 +4,12 @@
@@ -926,14 +926,14 @@ index 2bc6d58..0b8688f 100644
  #include "VideoCommon/VertexLoaderManager.h"
  #include "VideoCommon/VertexShaderManager.h"
  #include "VideoCommon/VideoBackendBase.h"
-@@ -432,6 +438,51 @@ BitSet32 VertexManagerBase::UsedTextures() const
+@@ -432,6 +438,53 @@ BitSet32 VertexManagerBase::UsedTextures() const
    return usedtextures;
  }
  
 +// Turbulence widescreen: set per 2D draw, read by VertexShaderManager.
-+bool g_turbulence_stretch_2d = false;
++TurbulenceDraw2D g_turbulence_draw_2d;
 +
-+bool VertexManagerBase::CoversFullWidth(NativeVertexFormat* format) const
++bool VertexManagerBase::MeasureExtent(NativeVertexFormat* format, float* out_min, float* out_max) const
 +{
 +  if (!format)
 +    return false;
@@ -972,13 +972,15 @@ index 2bc6d58..0b8688f 100644
 +    if (seen.size() < 4000 && seen.insert(key).second)
 +      std::fprintf(stderr, "[ws] 2D extent %.3f .. %.3f (%u vertices)\n", min_x, max_x, count);
 +  }
-+  return min_x <= -0.98f && max_x >= 0.98f;
++  *out_min = min_x;
++  *out_max = max_x;
++  return true;
 +}
 +
  void VertexManagerBase::Flush()
  {
    if (m_is_flushed)
-@@ -562,6 +613,12 @@ void VertexManagerBase::Flush()
+@@ -562,6 +615,12 @@ void VertexManagerBase::Flush()
    std::vector<std::string> texture_names;
    Common::SmallVector<u32, 8> texture_units;
    std::array<SamplerState, 8> samplers;
@@ -991,7 +993,7 @@ index 2bc6d58..0b8688f 100644
    if (!m_cull_all)
    {
      if (!g_ActiveConfig.bGraphicMods)
-@@ -571,6 +628,7 @@ void VertexManagerBase::Flush()
+@@ -571,6 +630,7 @@ void VertexManagerBase::Flush()
          const auto cache_entry = g_texture_cache->Load(i);
          if (!cache_entry)
            continue;
@@ -999,7 +1001,7 @@ index 2bc6d58..0b8688f 100644
          const float custom_tex_scale = cache_entry->GetWidth() / float(cache_entry->native_width);
          samplers[i] = TextureCacheBase::GetSamplerState(
              i, custom_tex_scale, cache_entry->is_custom_tex, cache_entry->has_arbitrary_mips);
-@@ -583,6 +641,7 @@ void VertexManagerBase::Flush()
+@@ -583,6 +643,7 @@ void VertexManagerBase::Flush()
          const auto cache_entry = g_texture_cache->Load(i);
          if (cache_entry)
          {
@@ -1007,7 +1009,7 @@ index 2bc6d58..0b8688f 100644
            if (!Common::Contains(texture_names, cache_entry->texture_info_name))
            {
              texture_names.push_back(cache_entry->texture_info_name);
-@@ -596,6 +655,20 @@ void VertexManagerBase::Flush()
+@@ -596,6 +657,35 @@ void VertexManagerBase::Flush()
        }
      }
    }
@@ -1016,33 +1018,66 @@ index 2bc6d58..0b8688f 100644
 +  // ones that sample a frame copy, off-screen renders into a narrow viewport
 +  // (render-to-texture), and anything covering the whole 4:3 width (sky,
 +  // backdrops, fades), measured on every vertex after its position matrix.
++  //  Bars that end exactly at one edge of the 4:3 screen are extended to that
++  //  edge of the wide screen (their inner end stays where centering puts it).
 +  {
-+    bool stretch = false;
++    TurbulenceDraw2D draw;
 +    if (xfmem.projection.type == ProjectionType::Orthographic && !m_cull_all)
 +    {
-+      stretch = samples_frame_copy || std::fabs(xfmem.viewport.wd) < 300.0f ||
-+                CoversFullWidth(VertexLoaderManager::GetCurrentVertexFormat());
++      float min_x = 0.0f, max_x = 0.0f;
++      if (samples_frame_copy || std::fabs(xfmem.viewport.wd) < 300.0f)
++        draw.mode = TurbulenceDraw2D::Stretch;
++      else if (MeasureExtent(VertexLoaderManager::GetCurrentVertexFormat(), &min_x, &max_x))
++      {
++        constexpr float kEdge = 0.05f;
++        const bool at_left = std::fabs(min_x + 1.0f) < kEdge || (min_x <= -1.0f && min_x > -1.0f - kEdge);
++        const bool at_right = std::fabs(max_x - 1.0f) < kEdge;
++        if (min_x <= -1.0f + kEdge && max_x >= 1.0f - kEdge)
++          draw.mode = TurbulenceDraw2D::Stretch;
++        else if (at_right && max_x <= 1.0f + kEdge && max_x - min_x >= 0.5f)
++          draw = {TurbulenceDraw2D::ExtendRight, min_x, max_x};
++        else if (at_left && max_x - min_x >= 0.5f)
++          draw = {TurbulenceDraw2D::ExtendLeft, min_x, max_x};
++      }
 +    }
-+    g_turbulence_stretch_2d = stretch;
++    g_turbulence_draw_2d = draw;
 +  }
    vertex_shader_manager.SetConstants(texture_names, xf_state_manager);
    if (!bpmem.genMode.zfreeze)
    {
 diff --git a/Source/Core/VideoCommon/VertexManagerBase.h b/Source/Core/VideoCommon/VertexManagerBase.h
-index 715dbee..335b118 100644
+index 715dbee..9d6e61b 100644
 --- a/Source/Core/VideoCommon/VertexManagerBase.h
 +++ b/Source/Core/VideoCommon/VertexManagerBase.h
-@@ -192,6 +192,8 @@ protected:
+@@ -20,6 +20,17 @@ class CustomShaderCache;
+ class DataReader;
+ class GeometryShaderManager;
+ class NativeVertexFormat;
++
++// Turbulence widescreen: how the current 2D (orthographic) draw maps onto a
++// widened screen. Center: 4:3 layout in the middle; Stretch: across the whole
++// screen; ExtendLeft/Right: a bar touching that 4:3 edge reaches the screen
++// edge while its other end keeps its centered position.
++struct TurbulenceDraw2D
++{
++  enum Mode { Center, Stretch, ExtendLeft, ExtendRight } mode = Center;
++  float min_x = 0.0f, max_x = 0.0f;  // clip-space extent at 4:3
++};
++extern TurbulenceDraw2D g_turbulence_draw_2d;
+ class PixelShaderManager;
+ class PointerWrap;
+ struct PortableVertexDeclaration;
+@@ -192,6 +203,8 @@ protected:
    u32 GetRemainingIndices(OpcodeDecoder::Primitive primitive) const;
  
    void CalculateZSlope(NativeVertexFormat* format);
-+  // Turbulence widescreen: does the pending 2D batch span the whole 4:3 width?
-+  bool CoversFullWidth(NativeVertexFormat* format) const;
++  // Turbulence widescreen: horizontal clip-space extent of the pending batch.
++  bool MeasureExtent(NativeVertexFormat* format, float* out_min, float* out_max) const;
    void CalculateNormals(NativeVertexFormat* format);
  
    BitSet32 UsedTextures() const;
 diff --git a/Source/Core/VideoCommon/VertexShaderManager.cpp b/Source/Core/VideoCommon/VertexShaderManager.cpp
-index 6d69803..60ac04c 100644
+index 6d69803..cdbc81a 100644
 --- a/Source/Core/VideoCommon/VertexShaderManager.cpp
 +++ b/Source/Core/VideoCommon/VertexShaderManager.cpp
 @@ -7,6 +7,7 @@
@@ -1053,63 +1088,84 @@ index 6d69803..60ac04c 100644
  
  #include "Common/ChunkFile.h"
  #include "Common/CommonTypes.h"
-@@ -38,6 +39,31 @@ void VertexShaderManager::Init()
+@@ -38,6 +39,52 @@ void VertexShaderManager::Init()
    dirty = true;
  }
  
 +// Turbulence: HUD layout (set by the options menu) and whether the current
 +// draw samples an EFB copy / full-screen pass (set by VertexManagerBase).
 +bool g_turbulence_hud_stretched = false;
-+extern bool g_turbulence_stretch_2d;  // VertexManagerBase, per 2D draw
-+
 +namespace
 +{
-+// Horizontal/vertical scale for 2D (orthographic) draws on a widened screen:
-+// the widescreen hack's ratio keeps 4:3 art at its shape in the middle;
-+// 1 stretches the draw across the screen (option "HUD and menus: Stretched",
-+// or a draw VertexManagerBase classified as full-width / frame copy).
-+std::pair<float, float> TurbulenceOrthoScale()
++// Horizontal mapping x' = a * x + b (clip space) for the current 2D draw on a
++// widened screen, and the vertical scale. w is the widescreen hack's ratio
++// (0.75 for 4:3 art on 16:9). "HUD and menus: Stretched" maps everything 1:1.
++struct TurbulenceOrtho
 +{
-+  if (!g_ActiveConfig.bWidescreenHack || g_turbulence_hud_stretched || g_turbulence_stretch_2d)
-+    return {1.0f, 1.0f};
-+  return {g_ActiveConfig.fAspectRatioHackW, g_ActiveConfig.fAspectRatioHackH};
++  float a = 1.0f, b = 0.0f, y = 1.0f;
++  bool operator==(const TurbulenceOrtho&) const = default;
++};
++TurbulenceOrtho TurbulenceOrthoScale()
++{
++  if (!g_ActiveConfig.bWidescreenHack || g_turbulence_hud_stretched)
++    return {};
++  const float w = g_ActiveConfig.fAspectRatioHackW, h = g_ActiveConfig.fAspectRatioHackH;
++  const TurbulenceDraw2D& d = g_turbulence_draw_2d;
++  switch (d.mode)
++  {
++  case TurbulenceDraw2D::Stretch:
++    return {};
++  case TurbulenceDraw2D::ExtendRight:  // min_x -> min_x * w, 1 -> 1
++  {
++    const float a = (1.0f - d.min_x * w) / (1.0f - d.min_x);
++    return {a, 1.0f - a, h};
++  }
++  case TurbulenceDraw2D::ExtendLeft:  // -1 -> -1, max_x -> max_x * w
++  {
++    const float a = (d.max_x * w + 1.0f) / (d.max_x + 1.0f);
++    return {a, a - 1.0f, h};
++  }
++  case TurbulenceDraw2D::Center:
++  default:
++    return {w, 0.0f, h};
++  }
 +}
-+std::pair<float, float> s_turbulence_loaded_ortho_scale{1.0f, 1.0f};
++TurbulenceOrtho s_turbulence_loaded_ortho;
 +bool TurbulenceOrthoScaleChanged()
 +{
 +  return xfmem.projection.type == ProjectionType::Orthographic &&
-+         TurbulenceOrthoScale() != s_turbulence_loaded_ortho_scale;
++         !(TurbulenceOrthoScale() == s_turbulence_loaded_ortho);
 +}
 +}  // namespace
 +
  Common::Matrix44 VertexShaderManager::LoadProjectionMatrix()
  {
    const auto& rawProjection = xfmem.projection.rawProjection;
-@@ -76,15 +102,19 @@ Common::Matrix44 VertexShaderManager::LoadProjectionMatrix()
+@@ -76,15 +123,19 @@ Common::Matrix44 VertexShaderManager::LoadProjectionMatrix()
  
    case ProjectionType::Orthographic:
    {
 -    m_projection_matrix[0] = rawProjection[0];
 +    // Turbulence: scale about the screen center, translation included, so
 +    // 4:3 2D art keeps its layout in the middle of the widened screen.
-+    const auto [hud_scale_w, hud_scale_h] = TurbulenceOrthoScale();
-+    s_turbulence_loaded_ortho_scale = {hud_scale_w, hud_scale_h};
-+    m_projection_matrix[0] = rawProjection[0] * hud_scale_w;
++    const TurbulenceOrtho ortho = TurbulenceOrthoScale();
++    s_turbulence_loaded_ortho = ortho;
++    m_projection_matrix[0] = rawProjection[0] * ortho.a;
      m_projection_matrix[1] = 0.0f;
      m_projection_matrix[2] = 0.0f;
 -    m_projection_matrix[3] = rawProjection[1];
-+    m_projection_matrix[3] = rawProjection[1] * hud_scale_w;
++    m_projection_matrix[3] = rawProjection[1] * ortho.a + ortho.b;
  
      m_projection_matrix[4] = 0.0f;
 -    m_projection_matrix[5] = rawProjection[2];
-+    m_projection_matrix[5] = rawProjection[2] * hud_scale_h;
++    m_projection_matrix[5] = rawProjection[2] * ortho.y;
      m_projection_matrix[6] = 0.0f;
 -    m_projection_matrix[7] = rawProjection[3];
-+    m_projection_matrix[7] = rawProjection[3] * hud_scale_h;
++    m_projection_matrix[7] = rawProjection[3] * ortho.y;
  
      m_projection_matrix[8] = 0.0f;
      m_projection_matrix[9] = 0.0f;
-@@ -121,11 +151,13 @@ Common::Matrix44 VertexShaderManager::LoadProjectionMatrix()
+@@ -121,11 +172,13 @@ Common::Matrix44 VertexShaderManager::LoadProjectionMatrix()
  
  void VertexShaderManager::SetProjectionMatrix(XFStateManager& xf_state_manager)
  {
@@ -1124,7 +1180,7 @@ index 6d69803..60ac04c 100644
    }
  }
  
-@@ -411,8 +443,10 @@ void VertexShaderManager::SetConstants(std::span<const std::string> textures,
+@@ -411,8 +464,10 @@ void VertexShaderManager::SetConstants(std::span<const std::string> textures,
      }
    }
  
