@@ -85,7 +85,7 @@ while true; do
   cp -f "$ROOT/config/GCPadNew.ini" "$ROOT/$USERDIR/Config/GCPadNew.ini" 2>/dev/null
   start=$(date +%s)
   env "${envs[@]+"${envs[@]}"}" make run GAME=$GAME JOBS=8 \
-    RUN_ARGS="--graphics Metal --user-dir $USERDIR --automation-dir $AUTO" > "$log" 2>&1 &
+    RUN_ARGS="--graphics Metal --mute --user-dir $USERDIR --automation-dir $AUTO" > "$log" 2>&1 &
   pid=$!
   booted=""
   while kill -0 $pid 2>/dev/null; do

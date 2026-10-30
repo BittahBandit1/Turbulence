@@ -39,10 +39,39 @@ index e37c893..99cecc1 100644
          return 0;
      }
 diff --git a/src/frontend/container/rel.c b/src/frontend/container/rel.c
-index b894a36..bec944a 100644
+index b894a36..484de19 100644
 --- a/src/frontend/container/rel.c
 +++ b/src/frontend/container/rel.c
-@@ -421,6 +421,22 @@ bool rel_load_image(RELFile* rel, const char* path, u32 base_address) {
+@@ -205,6 +205,28 @@ static int apply_relocation(RELSection* section, u32 offset, u32 patch_address,
+     if (type == R_PPC_NONE)
+         return 1;
+ 
++    /* Turbulence: REL relocations, like ELF ones, point at the field they
++       patch. For the 16-bit types that is the immediate half of the
++       instruction (instruction + 2), so the patch is two bytes at the offset
++       itself -- writing at offset + 2 clobbered the next instruction. */
++    if (type == R_PPC_ADDR16 || type == R_PPC_ADDR16_LO || type == R_PPC_ADDR16_HI ||
++        type == R_PPC_ADDR16_HA) {
++        if (!section_has_file_data(section) || offset > section->size ||
++            section->size - offset < 2) {
++            fprintf(stderr, "error: REL relocation patch is outside section %u\n",
++                    section->index);
++            return 0;
++        }
++        u8* half = section->owned_data + offset;
++        if (type == R_PPC_ADDR16_HI)
++            write_be16(half, (u16)(target >> 16));
++        else if (type == R_PPC_ADDR16_HA)
++            write_be16(half, (u16)((target + 0x8000u) >> 16));
++        else
++            write_be16(half, (u16)target);
++        return 1;
++    }
++
+     if (!require_patch_range(section, offset))
+         return 0;
+ 
+@@ -421,6 +443,22 @@ bool rel_load_image(RELFile* rel, const char* path, u32 base_address) {
          rel_free(rel);
          return false;
      }
@@ -65,7 +94,7 @@ index b894a36..bec944a 100644
  
      u32 executable_count = 0;
      for (u32 i = 0; i < rel->section_count; i++) {
-@@ -477,11 +493,15 @@ bool rel_load_image(RELFile* rel, const char* path, u32 base_address) {
+@@ -477,11 +515,15 @@ bool rel_load_image(RELFile* rel, const char* path, u32 base_address) {
              rel_free(rel);
              return false;
          }

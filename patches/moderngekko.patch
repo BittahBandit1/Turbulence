@@ -195,3 +195,24 @@ index af1c2a5..c59f2b6 100644
    if (!pgo_compile_flags.empty())
      configure += " -DCMAKE_C_FLAGS=" + QuoteText(pgo_compile_flags) +
                   " -DCMAKE_SHARED_LINKER_FLAGS=" + QuoteText(pgo_compile_flags);
+diff --git a/tools/moderngekko_run.cpp b/tools/moderngekko_run.cpp
+index d6b3569..d4fb8de 100644
+--- a/tools/moderngekko_run.cpp
++++ b/tools/moderngekko_run.cpp
+@@ -191,6 +191,7 @@ int RunMain(int argc, char **argv) {
+       config.window_system = moderngekko::WindowSystem::Wayland;
+     else if (arg == "--mute")
+       config.audio.mute = true;
++    // Turbulence: unattended test runs (scripts/turbulence_agent.sh) stay silent.
+     else if (arg == "--automation-dir")
+       config.automation.directory = value("--automation-dir");
+     else if (arg == "--headless")
+@@ -279,6 +280,8 @@ int RunMain(int argc, char **argv) {
+   if (dol_changed)
+     std::cout << "Applied native DOL patches\n";
+ #endif
++  if (const char* mute = std::getenv("TURBULENCE_MUTE"); mute && mute[0] && mute[0] != '0')
++    config.audio.mute = true;
+   const auto inspected = moderngekko::InspectGame(config.game_root);
+   if (!inspected) {
+     std::cerr << "invalid game: " << inspected.error << '\n';
