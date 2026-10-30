@@ -62,10 +62,19 @@ index e3581cc..683d766 100644
    ++m_reverify_events;
  }
 diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
-index d084fea..99c56b8 100644
+index d084fea..f0f4ec1 100644
 --- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
 +++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
-@@ -194,6 +194,12 @@ private:
+@@ -3,6 +3,8 @@
+ 
+ #pragma once
+ 
++#include <chrono>
++
+ #include <string>
+ #include <unordered_map>
+ #include <unordered_set>
+@@ -194,6 +196,13 @@ private:
    std::vector<int> m_chunk_rel_sections;
    std::vector<u64> m_effective_chunk_hashes;
    u64 m_rel_mapping_generation = 0;
@@ -75,11 +84,43 @@ index d084fea..99c56b8 100644
 +  // an icache invalidation (OSLink ends with one) or a state load.
 +  bool m_rel_scan_dirty = true;
 +  std::vector<u32> m_rel_last_candidate;  // header offset per REL module
++  std::chrono::steady_clock::time_point m_rel_last_scan{};
    u32 m_failed_chunks = 0;    // chunks currently failing verification (real SMC)
    u64 m_verifications = 0;    // chunk hash checks performed
    u64 m_reverify_events = 0;  // invalidations that reset a chunk to Unverified
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
+index d91ec2d..25eaa5e 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
+@@ -2,6 +2,8 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "Core/PowerPC/StaticRecomp/StaticRecompCore.h"
++
++#include <chrono>
+ #include "Core/System.h"
+ #include "Core/PowerPC/PowerPC.h"
+ #include "Core/PowerPC/Interpreter/Interpreter.h"
+@@ -120,6 +122,17 @@ void StaticRecompCore::Run()
+   while (*state_ptr == CPU::State::Running)
+   {
+     core_timing.Advance();
++    // Turbulence: look for (re)loaded REL modules after code memory changed,
++    // at most every 50 ms of host time: a full scan reads all of guest RAM.
++    if (m_has_rel_modules && m_rel_scan_dirty)
++    {
++      const auto now = std::chrono::steady_clock::now();
++      if (now - m_rel_last_scan >= std::chrono::milliseconds(50))
++      {
++        m_rel_last_scan = now;
++        RefreshRelSections();
++      }
++    }
+     const std::string current_game_id = SConfig::GetInstance().GetGameID();
+     m_module_active = m_module && (current_game_id.empty() || current_game_id == m_module->game_id);
+ 
 diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
-index 491c57e..f5fad12 100644
+index 491c57e..7d6c886 100644
 --- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
 +++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
 @@ -22,6 +22,9 @@ void StaticRecompCore::RefreshRelSections()
@@ -134,7 +175,21 @@ index 491c57e..f5fad12 100644
          break;
        }
      }
-@@ -339,6 +357,7 @@ void StaticRecompCore::OnICacheInvalidate(u32 address, u32 length)
+@@ -132,8 +150,11 @@ bool StaticRecompCore::ResolveNativeAddress(u32 runtime_address, u32* linked_add
+       return true;
+     }
+   }
+-  RefreshRelSections();
+-  return resolve_active();
++  // Turbulence: never rescan guest RAM from here. This runs for every
++  // dispatch, chunk lookup and icache line invalidation; Run() rescans
++  // (throttled) after code memory changed. Until then this address simply
++  // stays with the fallback JIT.
++  return false;
+ }
+ 
+ bool StaticRecompCore::ResolveRuntimeAddress(u32 linked_address, u32* runtime_address) const
+@@ -339,6 +360,7 @@ void StaticRecompCore::OnICacheInvalidate(u32 address, u32 length)
  
    if (!m_module_active || length == 0)
      return;
