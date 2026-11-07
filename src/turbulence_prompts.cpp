@@ -1,7 +1,11 @@
 #include "turbulence_prompts.hpp"
+#include "turbulence_prompt_recipes.hpp"
 #include "Common/HookableEvent.h"
 #include "Core/Host.h"
 #include "InputCommon/ControllerInterface/ControllerInterface.h"
+#ifdef HAVE_SDL3
+#include "InputCommon/ControllerInterface/SDL/SDLGamepad.h"
+#endif
 #include "VideoCommon/TurbulencePromptTextures.h"
 #include "VideoCommon/VideoEvents.h"
 #include <atomic>
@@ -20,19 +24,8 @@ std::atomic<int> s_style{Style::GameCube};
 // Xbox and PlayStation 2 icons side by side; the GameCube cell is the one the
 // game draws. Cells measured from the game's own textures.
 void RegisterRecipes() {
-  using TurbulencePromptTextures::CellCopy;
-  using TurbulencePromptTextures::Recipe;
-  // 256x128 HUD/menu sheet: A row (GC teal A, Xbox green A, PS cross, PS
-  // triangle) at y 91, Y row (GC grey Y, Xbox gold Y, PS circle) at y 109.
-  TurbulencePromptTextures::Register(Recipe{
-      "tex1_256x128_af289750027e9b53", 9,
-      {CellCopy{1, 91, 19, 18, {1, 20, 39}, {91, 91, 91}},      // A -> A / cross
-       CellCopy{1, 109, 19, 18, {1, 20, 58}, {109, 109, 91}}}}); // Y -> Y / triangle
-  // 512x128 "Select / Back" bar: A row at y 0, B row at y 22, 24 px cells.
-  TurbulencePromptTextures::Register(Recipe{
-      "tex1_512x128_585837ce16d8abc6", 9,
-      {CellCopy{0, 0, 24, 22, {0, 24, 48}, {0, 0, 0}},          // A -> A / cross
-       CellCopy{0, 22, 24, 22, {0, 24, 48}, {22, 22, 22}}}});   // B -> B / circle
+  for (auto recipe : BuildPromptRecipes())
+    TurbulencePromptTextures::Register(std::move(recipe));
 }
 
 Style StyleForDevice(const std::string& name) {
@@ -45,9 +38,27 @@ Style StyleForDevice(const std::string& name) {
   return Style::GameCube;
 }
 
+Style StyleForDevice(const ciface::Core::Device& device) {
+  if (device.GetSource() == "XInput") return Style::Xbox;
+#ifdef HAVE_SDL3
+  if (const auto* pad = dynamic_cast<const ciface::SDL::Gamepad*>(&device)) {
+    switch (SDL_GetGamepadTypeForID(pad->GetSDLInstanceID())) {
+    case SDL_GAMEPAD_TYPE_PS3:
+    case SDL_GAMEPAD_TYPE_PS4:
+    case SDL_GAMEPAD_TYPE_PS5: return Style::PlayStation;
+    case SDL_GAMEPAD_TYPE_XBOX360:
+    case SDL_GAMEPAD_TYPE_XBOXONE: return Style::Xbox;
+    default: break;
+    }
+  }
+#endif
+  return StyleForDevice(device.GetName());
+}
+
 void Apply(int style) {
+  // Keep backend and frontend synchronized across a runtime restart too.
+  TurbulencePromptTextures::SetStyle(static_cast<Style>(style));
   if (s_style.exchange(style) != style) {
-    TurbulencePromptTextures::SetStyle(static_cast<Style>(style));
     std::fprintf(stderr, "[turbulence] button prompts: %s\n",
                  style == Style::Xbox ? "Xbox" : style == Style::PlayStation ? "PlayStation"
                                                                               : "GameCube");
@@ -83,8 +94,9 @@ struct ButtonPrompts::Impl {
     const bool focused = Host_RendererHasFocus();
     int first_pad = -1, used = -1;
     for (const auto& device : g_controller_interface.GetAllDevices()) {
-      if (device->GetSource() != "SDL") continue;
-      const int style = StyleForDevice(device->GetName());
+      const auto source = device->GetSource();
+      if (source != "SDL" && source != "XInput" && source != "DInput") continue;
+      const int style = StyleForDevice(*device);
       if (first_pad < 0) first_pad = style;
       if (!focused || used >= 0) continue;
       for (const auto* input : device->Inputs()) {

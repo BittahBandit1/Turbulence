@@ -1,8 +1,7 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index c0548a0..ccac3a0 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -281,6 +281,16 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+@@ -281,6 +281,16 @@
          target_compile_definitions(moderngekko PRIVATE _M_GENERIC=1)
      endif()
      target_link_libraries(moderngekko PRIVATE core uicommon)
@@ -19,11 +18,20 @@ index c0548a0..ccac3a0 100644
      if(TARGET PkgConfig::X11)
          target_sources(moderngekko PRIVATE
              vendor/dolphin/Source/Core/DolphinNoGUI/PlatformX11.cpp)
+@@ -495,7 +505,8 @@
+     add_custom_command(TARGET moderngekko-run POST_BUILD
+         COMMAND ${CMAKE_COMMAND} -E copy_directory
+                 "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/Data/Sys"
+-                "$<TARGET_FILE_DIR:moderngekko-run>/Sys")
++            "$<TARGET_FILE_DIR:moderngekko-run>/Sys"
++        VERBATIM)
+     if(MODERNGEKKO_DOL_PATCH_MANIFEST)
+         add_custom_command(TARGET moderngekko-run POST_BUILD
+             COMMAND ${CMAKE_COMMAND} -E make_directory
 diff --git a/src/runtime/dolphin_runtime.cpp b/src/runtime/dolphin_runtime.cpp
-index f9b5405..7b83c50 100644
 --- a/src/runtime/dolphin_runtime.cpp
 +++ b/src/runtime/dolphin_runtime.cpp
-@@ -1,4 +1,9 @@
+@@ -1,8 +1,14 @@
  #include "moderngekko/runtime.hpp"
 +#ifdef TURBULENCE_OPTIONS_MENU
 +#include "turbulence_options.hpp"
@@ -33,7 +41,12 @@ index f9b5405..7b83c50 100644
  
  #include "AudioCommon/AudioCommon.h"
  #include "Common/Config/Config.h"
-@@ -110,10 +115,17 @@ PowerPC::CPUCore SelectCPUCore() {
+ #include "Common/HookableEvent.h"
++#include "Common/FileUtil.h"
+ #include "Common/StringUtil.h"
+ #include "Core/Boot/Boot.h"
+ #include "Core/Boot/BootManager.h"
+@@ -110,10 +116,17 @@
  }
  } // namespace
  
@@ -52,7 +65,7 @@ index f9b5405..7b83c50 100644
  void Host_Message(HostMessageID id) {
    if (id == HostMessageID::WMUserStop && s_platform)
      s_platform->Stop();
-@@ -134,7 +146,7 @@ void Host_JitCacheInvalidation() {}
+@@ -134,7 +147,7 @@
  void Host_JitProfileDataWiped() {}
  void Host_RequestRenderWindowSize(int, int) {}
  bool Host_RendererHasFocus() {
@@ -61,7 +74,18 @@ index f9b5405..7b83c50 100644
  }
  bool Host_RendererHasFullFocus() { return Host_RendererHasFocus(); }
  bool Host_RendererIsFullscreen() {
-@@ -547,6 +559,9 @@ ModuleSource::AttachedDescriptor(const ModernGekkoModuleDesc *descriptor) {
+@@ -203,6 +216,10 @@
+ 
+ void ApplyAutomationPad(const automation::PadState& pad)
+ {
++  // Boot/config reloads may recreate controller bindings after initial setup.
++  // Reattach the test overrides when actually issuing input.
++  ciface::Touch::RegisterGameCubeInputOverrider(pad.port);
++  ciface::Touch::RegisterWiiInputOverrider(pad.port);
+   ClearAutomationPad(pad.port);
+   for (std::size_t index = 0; index < pad.controls.size(); ++index)
+   {
+@@ -547,6 +564,9 @@
  Runtime::Runtime(std::unique_ptr<Impl> impl) : m_impl(std::move(impl)) {}
  
  RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
@@ -71,7 +95,7 @@ index f9b5405..7b83c50 100644
    std::lock_guard lock(s_runtime_mutex);
    if (s_runtime_active)
      return {
-@@ -609,6 +624,10 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -609,6 +629,10 @@
  
    if (!s_external_ui_common) {
      UICommon::SetUserDirectory(impl->config.user_directory.string());
@@ -82,7 +106,7 @@ index f9b5405..7b83c50 100644
      UICommon::Init();
      impl->ui_initialized = true;
    }
-@@ -665,6 +684,50 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -665,6 +689,63 @@
    if (impl->config.graphics.internal_resolution_scale)
      Config::SetBase(Config::GFX_EFB_SCALE,
                      *impl->config.graphics.internal_resolution_scale);
@@ -125,25 +149,40 @@ index f9b5405..7b83c50 100644
 +  }
 +  // Turbulence diagnostic: TURBULENCE_DUMP_TEXTURES=1 dumps every texture the
 +  // game uses to <user>/Dump/Textures/GXEE8P for this session only.
-+  if (const char* dump = std::getenv("TURBULENCE_DUMP_TEXTURES"); dump && *dump == '1')
++  const char* dump = std::getenv("TURBULENCE_DUMP_TEXTURES");
++  const char* dump_ui = std::getenv("TURBULENCE_DUMP_UI");
++  if ((dump && *dump == '1') || (dump_ui && *dump_ui == '1'))
 +  {
 +    Config::SetCurrent(Config::GFX_DUMP_TEXTURES, true);
 +    Config::SetCurrent(Config::GFX_DUMP_BASE_TEXTURES, true);
++    if (dump_ui && *dump_ui == '1')
++    {
++      if (const char* directory = std::getenv("TURBULENCE_UI_DUMP_DIR"); directory && *directory)
++      {
++        const auto raw = std::filesystem::path(directory) / "raw";
++        std::error_code ec;
++        std::filesystem::create_directories(raw, ec);
++        if (!ec)
++          File::SetUserPath(D_DUMPTEXTURES_IDX, raw.string() + "/");
++      }
++    }
 +  }
    Config::SetBase(Config::GFX_SHADER_CACHE, true);
    Config::SetBase(Config::GFX_SHADER_COMPILATION_MODE,
                    ShaderCompilationMode::AsynchronousUberShaders);
-@@ -688,8 +751,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -687,9 +768,8 @@
+   }
    Config::SetBase(Config::MAIN_AUDIO_BACKEND, impl->config.audio.backend);
    if (impl->config.audio.mute)
-     Config::SetBase(Config::MAIN_AUDIO_VOLUME, 0);
+-    Config::SetBase(Config::MAIN_AUDIO_VOLUME, 0);
 -  Config::SetBase(Config::MAIN_INPUT_BACKGROUND_INPUT,
 -                  impl->config.input.background_input);
++    Config::SetCurrent(Config::MAIN_AUDIO_VOLUME, 0);
 +  Config::SetBaseOrCurrent(Config::MAIN_INPUT_BACKGROUND_INPUT, false);
  
    auto &jit = Core::System::GetInstance().GetJitInterface();
    StaticRecompModuleSource recomp_source;
-@@ -790,6 +852,17 @@ RuntimeRunResult Runtime::Run() {
+@@ -790,6 +870,17 @@
                           "Dolphin could not boot sys/main.dol"}};
    }
    m_impl->booted = true;

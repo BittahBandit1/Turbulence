@@ -12,3 +12,7 @@ CMakeUserPresets.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Python test and diagnostics caches
+__pycache__/
+*.py[cod]

@@ -28,7 +28,7 @@ struct FramePacingRecorder::Impl {
       if (!file) return;
       remaining = 600;
       start = Clock::now();
-      std::fprintf(file, "present,frame,reason,emulated_us,intended_ms,actual_ms,host_ms,accuracy\n");
+      std::fprintf(file, "present,frame,reason,emulated_us,intended_ms,actual_ms,host_ms,accuracy,drawable_wait_ms,submit_ms,drawable_requests,drawable_failures,display_callbacks\n");
       glass_tail = TurbulencePresentTimes::Get().head.load(std::memory_order_acquire);
     }
     // On-glass times (steady_clock and CACurrentMediaTime share mach time).
@@ -46,13 +46,19 @@ struct FramePacingRecorder::Impl {
                  ? -1.0
                  : std::chrono::duration<double, std::milli>(t - start).count();
     };
-    std::fprintf(file, "%llu,%llu,%d,%llu,%.3f,%.3f,%.3f,%d\n",
+    auto& timing = TurbulencePresentTimes::Get();
+    std::fprintf(file, "%llu,%llu,%d,%llu,%.3f,%.3f,%.3f,%d,%.3f,%.3f,%llu,%llu,%llu\n",
                  static_cast<unsigned long long>(info.present_count),
                  static_cast<unsigned long long>(info.frame_count),
                  static_cast<int>(info.reason),
                  static_cast<unsigned long long>(info.emulated_timestamp),
                  ms(info.intended_present_time), ms(info.actual_present_time),
-                 ms(Clock::now()), static_cast<int>(info.present_time_accuracy));
+                 ms(Clock::now()), static_cast<int>(info.present_time_accuracy),
+                 timing.drawable_wait_ms.load(std::memory_order_relaxed),
+                 timing.submit_ms.load(std::memory_order_relaxed),
+                 static_cast<unsigned long long>(timing.drawable_requests.load()),
+                 static_cast<unsigned long long>(timing.drawable_failures.load()),
+                 static_cast<unsigned long long>(timing.head.load()));
     if (--remaining <= 0) { std::fclose(file); file = nullptr; }
   }
 };
