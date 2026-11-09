@@ -15,6 +15,8 @@ struct FramePacingRecorder::Impl {
   unsigned poll = 0;
   Clock::time_point start{};
   uint64_t glass_tail = 0;
+  bool glass_origin_ready = false;
+  double glass_origin_seconds = 0;
   void OnPresent(const PresentInfo& info) {
     namespace fs = std::filesystem;
     if (!file) {
@@ -28,17 +30,25 @@ struct FramePacingRecorder::Impl {
       if (!file) return;
       remaining = 600;
       start = Clock::now();
-      std::fprintf(file, "present,frame,reason,emulated_us,intended_ms,actual_ms,host_ms,accuracy,drawable_wait_ms,submit_ms,drawable_requests,drawable_failures,display_callbacks\n");
+      std::fprintf(file, "present,frame,reason,emulated_us,intended_ms,actual_ms,host_ms,accuracy,drawable_wait_ms,submit_ms,drawable_requests,drawable_failures,display_callbacks,early_render_submits\n");
       glass_tail = TurbulencePresentTimes::Get().head.load(std::memory_order_acquire);
+      glass_origin_ready = false;
     }
-    // On-glass times (steady_clock and CACurrentMediaTime share mach time).
+    // Use a fixed per-capture epoch mapping, so callback scheduling cannot
+    // introduce jitter into otherwise precise native display timestamps.
     {
       auto& ring = TurbulencePresentTimes::Get();
       const uint64_t head = ring.head.load(std::memory_order_acquire);
+      // Avoid replaying overwritten slots if a capture is paused for too long.
+      if (head - glass_tail > ring.seconds.size()) glass_tail = head - ring.seconds.size();
       const double start_s = std::chrono::duration<double>(start.time_since_epoch()).count();
       for (; glass_tail < head; ++glass_tail) {
         const double t = ring.seconds[glass_tail % ring.seconds.size()].load(std::memory_order_relaxed);
-        std::fprintf(file, "glass,%.3f\n", t > 0.0 ? (t - start_s) * 1000.0 : -1.0);
+        if (t > 0.0 && !glass_origin_ready) {
+          glass_origin_seconds = start_s - ring.clock_offset_seconds.load(std::memory_order_relaxed);
+          glass_origin_ready = true;
+        }
+        std::fprintf(file, "glass,%.3f\n", t > 0.0 ? (t - glass_origin_seconds) * 1000.0 : -1.0);
       }
     }
     const auto ms = [this](Clock::time_point t) {
@@ -47,7 +57,7 @@ struct FramePacingRecorder::Impl {
                  : std::chrono::duration<double, std::milli>(t - start).count();
     };
     auto& timing = TurbulencePresentTimes::Get();
-    std::fprintf(file, "%llu,%llu,%d,%llu,%.3f,%.3f,%.3f,%d,%.3f,%.3f,%llu,%llu,%llu\n",
+    std::fprintf(file, "%llu,%llu,%d,%llu,%.3f,%.3f,%.3f,%d,%.3f,%.3f,%llu,%llu,%llu,%llu\n",
                  static_cast<unsigned long long>(info.present_count),
                  static_cast<unsigned long long>(info.frame_count),
                  static_cast<int>(info.reason),
@@ -58,7 +68,8 @@ struct FramePacingRecorder::Impl {
                  timing.submit_ms.load(std::memory_order_relaxed),
                  static_cast<unsigned long long>(timing.drawable_requests.load()),
                  static_cast<unsigned long long>(timing.drawable_failures.load()),
-                 static_cast<unsigned long long>(timing.head.load()));
+                 static_cast<unsigned long long>(timing.head.load()),
+                 static_cast<unsigned long long>(timing.early_render_submits.load()));
     if (--remaining <= 0) { std::fclose(file); file = nullptr; }
   }
 };

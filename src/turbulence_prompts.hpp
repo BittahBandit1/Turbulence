@@ -10,6 +10,9 @@ void SetPromptPreference(PromptPreference preference);
 PromptPreference GetPromptPreference();
 // Which icons are showing now (for the options menu): 0 GC, 1 Xbox, 2 PS.
 int CurrentPromptStyle();
+// Native mobile hosts report the active controller family (0 GC/touch, 1 Xbox, 2 PS; -1 clears).
+// A manual quick-menu preference always takes priority.
+void SetAutomaticControllerStyle(int style);
 
 class ButtonPrompts {
 public:

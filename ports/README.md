@@ -1,0 +1,55 @@
+# Turbulence mobile builds
+
+The Android and iOS hosts are adapted from Crazy Taxi ReFare's mobile ports
+(ReFare contributors, GPL-3.0; see COPYING). Turbulence keeps its own disc ID,
+DOL/REL validation, static game modules, options, prompts and Sonic Riders touch
+controls. Runtime adaptations retain their existing SPDX notices.
+
+Both apps import a personal Sonic Riders USA revision 0 ISO, GCM or GameCube
+CISO. The APK and IPA include generated native code and runtime system files;
+they do not include the game's extracted assets or a disc image. Both main.dol
+and _Main.rel must match the compiled version. Import is transactional and
+rejects traversal, truncation, wrong revisions and replacement of a library.
+
+## Build
+
+Generate the personal main.dol and REL C outputs through the existing project
+build first. The scripts find matching outputs in build/modules/GXEE8P, or
+accept explicit --generated and --rel-generated directories. From a fresh
+checkout, initialize the submodules and run scripts/apply-patches.sh first.
+
+Android requires JDK, SDK platform/build tools 35, and NDK 27.3.13750724:
+
+```sh
+python3 scripts/android.py --sdk "$ANDROID_HOME"
+```
+
+The debug-signed ARM64 APK is written under build/release. A local signing key
+is generated only in build/android-tools. Minimum Android version is 8.0/API26.
+Touch controls include an analog pad, jump A, boost B, independent L/R drift,
+and Start. A three-finger tap opens options; controllers are also supported.
+
+Physical iPhone/iPad requires macOS and Xcode with the iPhoneOS SDK:
+
+```sh
+python3 scripts/ios.py gameplay-app --ipa
+```
+
+The ARM64 IPA under build/release targets iOS 15 and newer. It is unsigned and
+must be signed by a personal sideloading/development workflow before device
+installation. It statically links both game modules, uses Metal and native iOS
+audio, and includes touch/game-controller input. Runtime compilation and an
+executable JIT are disabled; unmatched guest code uses interpreter fallback.
+The scripts verify device Mach-O architecture and minimum OS before packaging.
+
+Game controller family changes update automatic prompts; manual choices in
+Turbulence's options take priority. Apps pause input/audio when backgrounded.
+Desktop settings are separate; mobile starts at native internal resolution.
+
+## Verification
+
+Tests: tests/android_import_test.py, tests/ios_import_test.swift,
+tests/mobile_touch_test.swift, and tests/mobile_build_test.py. The importer
+checks run with synthetic images and do not need a game disc. Physical-device
+playback and thermal/frame-pacing behavior must be checked separately from
+successful cross-compilation and package validation.

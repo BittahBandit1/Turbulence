@@ -12,12 +12,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <mutex>
 
 namespace turbulence {
 namespace {
 using TurbulencePromptTextures::Style;
 std::atomic<int> s_preference{static_cast<int>(PromptPreference::Automatic)};
 std::atomic<int> s_style{Style::GameCube};
+std::atomic<int> s_host_style{-1};
 
 // Sonic Riders (USA) prompt textures, identified by Dolphin's texture name
 // without the palette hash (CI8 = GX format 9). Each holds the GameCube,
@@ -79,6 +81,9 @@ PromptPreference GetPromptPreference() {
   return static_cast<PromptPreference>(s_preference.load());
 }
 int CurrentPromptStyle() { return s_style.load(); }
+void SetAutomaticControllerStyle(int style) {
+  s_host_style.store(style >= -1 && style <= 2 ? style : -1);
+}
 
 struct ButtonPrompts::Impl {
   Common::EventHook hook;
@@ -89,6 +94,9 @@ struct ButtonPrompts::Impl {
     if (s_preference.load() != static_cast<int>(PromptPreference::Automatic)) {
       chosen = false;
       return;
+    }
+    if (const int style = s_host_style.load(); style >= 0) {
+      Apply(style); chosen = true; return;
     }
     if ((tick++ % 2u) != 0u || !g_controller_interface.IsInit()) return;
     const bool focused = Host_RendererHasFocus();
@@ -111,7 +119,8 @@ struct ButtonPrompts::Impl {
 };
 
 ButtonPrompts::ButtonPrompts() : m_impl(std::make_unique<Impl>()) {
-  RegisterRecipes();
+  static std::once_flag recipes;
+  std::call_once(recipes, RegisterRecipes);
   // Diagnostic / unattended tests: TURBULENCE_PROMPTS=xbox|playstation|gamecube.
   if (const char* force = std::getenv("TURBULENCE_PROMPTS")) {
     const std::string f = force;
@@ -124,6 +133,7 @@ ButtonPrompts::ButtonPrompts() : m_impl(std::make_unique<Impl>()) {
 }
 ButtonPrompts::~ButtonPrompts() {
   m_impl->hook.reset();
+  s_host_style = -1;
   TurbulencePromptTextures::SetStyle(Style::GameCube);
 }
 }  // namespace turbulence

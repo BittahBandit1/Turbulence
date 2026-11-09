@@ -1,7 +1,50 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9f837ec..9ea6d7c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -334,6 +334,10 @@ else()
+   endif()
+ endif()
+ 
++if(IOS)
++  find_library(COREFOUNDATION_LIBRARY CoreFoundation REQUIRED)
++  find_library(FOUNDATION_LIBRARY Foundation REQUIRED)
++endif()
+ if(CMAKE_SYSTEM_NAME MATCHES "Darwin")
+   if(NOT MACOS_USE_DEFAULT_SEARCH_PATH)
+     # Hack up the path to prioritize the path to built-in OS libraries to
+@@ -661,7 +665,7 @@ if(ENABLE_VULKAN)
+   endif()
+ endif()
+ 
+-if(NOT (WIN32 AND _M_ARM_64))
++if(NOT IOS AND NOT (WIN32 AND _M_ARM_64))
+   # OpenGL is available on all platforms except windows-arm64
+   add_definitions(-DHAS_OPENGL)
+ endif()
+@@ -715,7 +719,7 @@ if(ENABLE_CUBEB)
+   add_definitions(-DHAVE_CUBEB)
+ endif()
+ 
+-if(NOT ANDROID)
++if(NOT ANDROID AND NOT IOS)
+   dolphin_find_optional_system_library(LibUSB Externals/libusb)
+   add_definitions(-D__LIBUSB__)
+ endif()
+@@ -743,7 +747,7 @@ dolphin_find_optional_system_library(MBEDTLS Externals/mbedtls 2.28)
+ 
+ dolphin_find_optional_system_library(CURL Externals/curl)
+ 
+-if(NOT ANDROID)
++if(NOT ANDROID AND NOT IOS)
+   dolphin_find_optional_system_library(HIDAPI Externals/hidapi)
+ endif()
+ 
 diff --git a/Data/Sys/GameSettings/GXEE8P.ini b/Data/Sys/GameSettings/GXEE8P.ini
+index 3a81fe3..037d4b1 100644
 --- a/Data/Sys/GameSettings/GXEE8P.ini
 +++ b/Data/Sys/GameSettings/GXEE8P.ini
-@@ -1,2 +1,13 @@
+@@ -1,2 +1,17 @@
 +# GXEE8P - Sonic Riders (USA)
  [Core]
 -StaticRecompFallbackRanges = 0x8000ADE0-0x8000B5E0
@@ -16,11 +59,424 @@ diff --git a/Data/Sys/GameSettings/GXEE8P.ini b/Data/Sys/GameSettings/GXEE8P.ini
 +# The runtime checks the instruction signature, queue bitmap and interrupt
 +# state before advancing to the next scheduled event.
 +StaticRecompIdlePC = 0x80010574
++
++# Keep obsolete host deadlines from carrying a six-frame backlog after a stall.
++# Small timing errors still recover naturally; no rendered frames are skipped.
++MaxFallback = 20
+diff --git a/GXRuntime/src/core/cpu.c b/GXRuntime/src/core/cpu.c
+index 345b960..b85f7fa 100644
+--- a/GXRuntime/src/core/cpu.c
++++ b/GXRuntime/src/core/cpu.c
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ #include "core/cpu.h"
++#include "core/psq_scale.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -194,7 +195,7 @@ static u32 psq_type_size(u8 type) {
+ static f64 psq_dequant(f64 value, s32 scale) {
+     if (scale == 0)
+         return (f64)(f32)value;
+-    return (f64)(f32)ldexp(value, -scale);
++    return (f64)((f32)value * psq_scale_factor(-scale));
+ }
+ 
+ static f64 psq_load_value(CPUState* cpu, u32 ea, u8 type, s32 scale) {
+@@ -215,7 +216,7 @@ static f64 psq_load_value(CPUState* cpu, u32 ea, u8 type, s32 scale) {
+ }
+ 
+ static s64 psq_quantize_int(f64 value, s64 min_value, s64 max_value, s32 scale) {
+-    f32 conv = (f32)value * ldexpf(1.0f, scale);
++    f32 conv = (f32)value * psq_scale_factor(scale);
+     if (isnan(conv))
+         return 0;
+     if (conv <= (f32)min_value)
+@@ -283,6 +284,16 @@ bool ppc_psq_store(CPUState* cpu, u8 frS, u32 ea, bool w, u8 gqr_index, bool ind
+     if (size == 0) /* invalid GQR type: nothing is stored */
+         return true;
+ 
++    // MPEG pixel output is a pair of quantized unsigned bytes. Dispatch once
++    // for the pair, rather than entering the general type switch per lane.
++    // Keep normal byte writes so MMIO, reservations and journals still work.
++    if (type == 4) {
++        mem_write8(cpu, ea, (u8)psq_quantize_int(cpu->fpr[frS], 0, 255, scale));
++        if (!w)
++            mem_write8(cpu, ea + 1u, (u8)psq_quantize_int(cpu->ps1[frS], 0, 255, scale));
++        return true;
++    }
++
+     psq_store_value(cpu, ea, type, scale, cpu->fpr[frS]);
+     if (!w)
+         psq_store_value(cpu, ea + size, type, scale, cpu->ps1[frS]);
+diff --git a/Source/CMakeLists.txt b/Source/CMakeLists.txt
+index 7871083..d0e56cc 100644
+--- a/Source/CMakeLists.txt
++++ b/Source/CMakeLists.txt
+@@ -80,7 +80,7 @@ if(HAVE_ELF_AUX_INFO)
+ endif()
+ 
+ add_subdirectory(Core)
+-if (ANDROID)
++if (ANDROID AND NOT TURBULENCE_ANDROID)
+   add_subdirectory(Android/jni)
+ endif()
+ 
+diff --git a/Source/Core/AudioCommon/AudioCommon.cpp b/Source/Core/AudioCommon/AudioCommon.cpp
+index 8ec653a..84ca7ec 100644
+--- a/Source/Core/AudioCommon/AudioCommon.cpp
++++ b/Source/Core/AudioCommon/AudioCommon.cpp
+@@ -28,8 +28,21 @@ namespace AudioCommon
+ constexpr int AUDIO_VOLUME_MIN = 0;
+ constexpr int AUDIO_VOLUME_MAX = 100;
+ 
++#ifdef TURBULENCE_ANDROID
++std::unique_ptr<SoundStream> CreateAAudioSoundStream();
++#endif
++#ifdef TURBULENCE_IOS
++std::unique_ptr<SoundStream> CreateIOSSoundStream();
++#endif
++
+ static std::unique_ptr<SoundStream> CreateSoundStreamForBackend(std::string_view backend)
+ {
++#ifdef TURBULENCE_ANDROID
++  if (backend == "AAudio") return CreateAAudioSoundStream();
++#endif
++#ifdef TURBULENCE_IOS
++  if (backend == "iOS") return CreateIOSSoundStream();
++#endif
+   if (backend == BACKEND_CUBEB && CubebStream::IsValid())
+     return std::make_unique<CubebStream>();
+   else if (backend == BACKEND_OPENAL && OpenALStream::IsValid())
+@@ -98,6 +111,12 @@ void ShutdownSoundStream(Core::System& system)
+ 
+ std::string GetDefaultSoundBackend()
+ {
++#ifdef TURBULENCE_ANDROID
++  return "AAudio";
++#endif
++#ifdef TURBULENCE_IOS
++  return "iOS";
++#endif
+ #if defined(ANDROID)
+   return BACKEND_OPENSLES;
+ #else
+@@ -121,6 +140,12 @@ DPL2Quality GetDefaultDPL2Quality()
+ std::vector<std::string> GetSoundBackends()
+ {
+   std::vector<std::string> backends;
++#ifdef TURBULENCE_ANDROID
++  backends.emplace_back("AAudio");
++#endif
++#ifdef TURBULENCE_IOS
++  backends.emplace_back("iOS");
++#endif
+ 
+   backends.emplace_back(BACKEND_NULLSOUND);
+   if (CubebStream::IsValid())
+diff --git a/Source/Core/AudioCommon/CMakeLists.txt b/Source/Core/AudioCommon/CMakeLists.txt
+index 2564448..514e370 100644
+--- a/Source/Core/AudioCommon/CMakeLists.txt
++++ b/Source/Core/AudioCommon/CMakeLists.txt
+@@ -23,7 +23,7 @@ if(ENABLE_CUBEB)
+   target_link_libraries(audiocommon PRIVATE cubeb)
+ endif()
+ 
+-if(ANDROID)
++if(ANDROID AND NOT TURBULENCE_ANDROID)
+   find_package(OpenSLES)
+   if(OPENSLES_FOUND)
+     message(STATUS "OpenSLES found, enabling OpenSLES sound backend")
+@@ -98,3 +98,8 @@ if(MSVC)
+   # Add precompiled header
+   target_link_libraries(audiocommon PRIVATE use_pch)
+ endif()
++
++if(IOS)
++  target_sources(audiocommon PRIVATE IOSSoundStream.mm)
++  target_link_libraries(audiocommon PRIVATE "-framework AudioToolbox")
++endif()
+diff --git a/Source/Core/Common/CMakeLists.txt b/Source/Core/Common/CMakeLists.txt
+index 807dca3..b181e63 100644
+--- a/Source/Core/Common/CMakeLists.txt
++++ b/Source/Core/Common/CMakeLists.txt
+@@ -327,7 +327,7 @@ if(WIN32)
+   if(MSVC)
+     target_sources(common PRIVATE CompatPatches.cpp)
+   endif()
+-elseif(APPLE)
++elseif(APPLE AND NOT IOS)
+   target_sources(common PRIVATE
+     GL/GLInterface/AGL.h
+     GL/GLInterface/AGL.mm
+diff --git a/Source/Core/Common/FileUtil.cpp b/Source/Core/Common/FileUtil.cpp
+index 6d2853b..3d1178f 100644
+--- a/Source/Core/Common/FileUtil.cpp
++++ b/Source/Core/Common/FileUtil.cpp
+@@ -692,6 +692,7 @@ std::string GetBundleDirectory()
+   //
+   // The headers can be found under "Security" on opensource.apple.com:
+   // Security/OSX/libsecurity_translocate/lib/SecTranslocate.h
++#ifndef TURBULENCE_IOS
+   if (!s_security_framework.IsOpen())
+   {
+     s_security_framework.Open("/System/Library/Frameworks/Security.framework/Security");
+@@ -709,6 +710,7 @@ std::string GetBundleDirectory()
+     bundle_ref = untranslocated_ref;
+   }
+ 
++#endif
+   char app_bundle_path[MAXPATHLEN];
+   CFStringRef bundle_path = CFURLCopyFileSystemPath(bundle_ref, kCFURLPOSIXPathStyle);
+   CFStringGetFileSystemRepresentation(bundle_path, app_bundle_path, sizeof(app_bundle_path));
+@@ -760,8 +762,16 @@ std::string GetExeDirectory()
+ 
+ static std::string CreateSysDirectoryPath()
+ {
++#ifdef ANDROID
++  // Turbulence Android also builds with LINUX_LOCAL_DEV, which would resolve
++  // Sys next to app_process (/system/bin/Sys) and silently skip GameSettings.
++  if (!s_android_sys_directory.empty())
++    return s_android_sys_directory + DIR_SEP;
++#endif
+ #if defined(_WIN32) || defined(LINUX_LOCAL_DEV)
+ #define SYSDATA_DIR "Sys"
++#elif defined(TURBULENCE_IOS)
++#define SYSDATA_DIR "Sys"
+ #elif defined __APPLE__
+ #define SYSDATA_DIR "Contents/Resources/Sys"
+ #else
+diff --git a/Source/Core/Common/GL/GLContext.cpp b/Source/Core/Common/GL/GLContext.cpp
+index eef6896..79883b8 100644
+--- a/Source/Core/Common/GL/GLContext.cpp
++++ b/Source/Core/Common/GL/GLContext.cpp
+@@ -5,7 +5,7 @@
+ 
+ #include "Common/GL/GLContext.h"
+ 
+-#if defined(__APPLE__)
++#if defined(__APPLE__) && !defined(TURBULENCE_IOS)
+ #include "Common/GL/GLInterface/AGL.h"
+ #endif
+ #if defined(_WIN32)
+@@ -79,7 +79,7 @@ std::unique_ptr<GLContext> GLContext::Create(const WindowSystemInfo& wsi, bool s
+                                              bool prefer_gles)
+ {
+   std::unique_ptr<GLContext> context;
+-#if defined(__APPLE__)
++#if defined(__APPLE__) && !defined(TURBULENCE_IOS)
+   if (wsi.type == WindowSystemType::MacOS || wsi.type == WindowSystemType::Headless)
+     context = std::make_unique<GLContextAGL>();
+ #endif
+diff --git a/Source/Core/Common/MemoryUtil.cpp b/Source/Core/Common/MemoryUtil.cpp
+index 0d66890..3d22d86 100644
+--- a/Source/Core/Common/MemoryUtil.cpp
++++ b/Source/Core/Common/MemoryUtil.cpp
+@@ -16,7 +16,7 @@
+ #else
+ #include <stdio.h>
+ #include <sys/mman.h>
+-#if defined(_M_ARM_64) && defined(__APPLE__)
++#if defined(_M_ARM_64) && defined(__APPLE__) && !defined(TURBULENCE_IOS)
+ #include <pthread.h>
+ #endif
+ #if defined __APPLE__ || defined __FreeBSD__ || defined __OpenBSD__ || defined __NetBSD__
+@@ -93,7 +93,7 @@ static int& JITPageWriteNestCounter()
+ // Allows a thread to write to executable memory, but not execute the data.
+ void JITPageWriteEnableExecuteDisable()
+ {
+-#if defined(_M_ARM_64) && defined(__APPLE__)
++#if defined(_M_ARM_64) && defined(__APPLE__) && !defined(TURBULENCE_IOS)
+   if (JITPageWriteNestCounter() == 0)
+   {
+     pthread_jit_write_protect_np(0);
+@@ -112,7 +112,7 @@ void JITPageWriteDisableExecuteEnable()
+   if (JITPageWriteNestCounter() < 0)
+     PanicAlertFmt("JITPageWriteNestCounter() underflowed");
+ 
+-#if defined(_M_ARM_64) && defined(__APPLE__)
++#if defined(_M_ARM_64) && defined(__APPLE__) && !defined(TURBULENCE_IOS)
+   if (JITPageWriteNestCounter() == 0)
+   {
+     pthread_jit_write_protect_np(1);
+diff --git a/Source/Core/Common/Thread.cpp b/Source/Core/Common/Thread.cpp
+index 3aeeec6..cdb2902 100644
+--- a/Source/Core/Common/Thread.cpp
++++ b/Source/Core/Common/Thread.cpp
+@@ -26,6 +26,13 @@
+ #pragma comment(lib, "libittnotify.lib")
+ #endif
+ 
++#if defined(ANDROID) && defined(TURBULENCE_ANDROID)
++#include <sched.h>
++#include <algorithm>
++#include <cstdio>
++#include <string>
++#endif
++
+ #include "Common/CommonTypes.h"
+ #ifdef _WIN32
+ #include "Common/StringUtil.h"
+@@ -117,6 +124,10 @@ static void SetCurrentThreadNameViaApi(const char* name)
+   }
+ }
+ 
++void PreferPerformanceCores(const char*)
++{
++}
++
+ void SetCurrentThreadName(const char* name)
+ {
+ #ifdef _MSC_VER
+@@ -174,6 +185,58 @@ void SwitchCurrentThread()
+   usleep(1000 * 1);
+ }
+ 
++#if defined(ANDROID) && defined(TURBULENCE_ANDROID)
++void PreferPerformanceCores(const char* role)
++{
++  // Rank cores by the scheduler's own capacity (efficiency cores are lowest).
++  cpu_set_t allowed;
++  CPU_ZERO(&allowed);
++  if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0)
++    return;
++  int capacity[CPU_SETSIZE] = {};
++  int lowest = 1 << 30, highest = 0;
++  const int count = std::min<int>(sysconf(_SC_NPROCESSORS_CONF), CPU_SETSIZE);
++  for (int cpu = 0; cpu < count; ++cpu)
++  {
++    char path[64];
++    std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpu_capacity", cpu);
++    if (FILE* file = std::fopen(path, "r"))
++    {
++      if (std::fscanf(file, "%d", &capacity[cpu]) != 1)
++        capacity[cpu] = 0;
++      std::fclose(file);
++    }
++    if (capacity[cpu] > 0)
++    {
++      lowest = std::min(lowest, capacity[cpu]);
++      highest = std::max(highest, capacity[cpu]);
++    }
++  }
++  if (highest <= lowest)
++    return;  // Unknown or uniform cores: leave scheduling alone.
++  cpu_set_t fast;
++  CPU_ZERO(&fast);
++  std::string list;
++  for (int cpu = 0; cpu < count; ++cpu)
++  {
++    if (CPU_ISSET(cpu, &allowed) && capacity[cpu] > lowest)
++    {
++      CPU_SET(cpu, &fast);
++      list += (list.empty() ? "" : ",") + std::to_string(cpu);
++    }
++  }
++  if (list.empty())
++    return;
++  const int result = sched_setaffinity(0, sizeof(fast), &fast);
++  std::fprintf(stderr, "[turbulence] %s thread (tid %d) on cores %s%s\n", role, int(gettid()),
++               list.c_str(), result == 0 ? "" : " (failed)");
++}
++#else
++void PreferPerformanceCores(const char*)
++{
++}
++#endif
++
+ void SetCurrentThreadName(const char* name)
+ {
+ #ifdef __APPLE__
+diff --git a/Source/Core/Common/Thread.h b/Source/Core/Common/Thread.h
+index fbba27a..8e28d90 100644
+--- a/Source/Core/Common/Thread.h
++++ b/Source/Core/Common/Thread.h
+@@ -39,6 +39,11 @@ inline void YieldCPU()
+ 
+ void SetCurrentThreadName(const char* name);
+ 
++// Turbulence Android: big.LITTLE phones otherwise leave the emulation threads
++// on efficiency cores (measured on a Snapdragon 8 Gen 2: 47 fps -> 60). Keeps
++// the calling thread on the faster cores; no-op elsewhere.
++void PreferPerformanceCores(const char* role);
++
+ #ifndef _WIN32
+ // Returns the lowest address of the stack and the size of the stack
+ std::tuple<void*, size_t> GetCurrentThreadStack();
+diff --git a/Source/Core/Common/WindowSystemInfo.h b/Source/Core/Common/WindowSystemInfo.h
+index 9d15477..a11d01e 100644
+--- a/Source/Core/Common/WindowSystemInfo.h
++++ b/Source/Core/Common/WindowSystemInfo.h
+@@ -13,6 +13,7 @@ enum class WindowSystemType
+   Wayland,
+   FBDev,
+   Haiku,
++  IOS,
+ };
+ 
+ struct WindowSystemInfo
+diff --git a/Source/Core/Core/CMakeLists.txt b/Source/Core/Core/CMakeLists.txt
+index f30654c..2621bd0 100644
+--- a/Source/Core/Core/CMakeLists.txt
++++ b/Source/Core/Core/CMakeLists.txt
+@@ -766,7 +766,7 @@ PUBLIC
+   pugixml
+   sfml-network
+   videonull
+-  videoogl
++  $<$<NOT:$<BOOL:${IOS}>>:videoogl>
+   videosoftware
+ 
+ PRIVATE
+@@ -782,7 +782,7 @@ if(LIBUDEV_FOUND)
+   target_link_libraries(core PRIVATE ${LIBUDEV_LIBRARY})
+ endif()
+ 
+-if (APPLE)
++if (APPLE AND NOT IOS)
+   target_link_libraries(core
+   PRIVATE
+     ${CORESERV_LIBRARY}
+@@ -790,6 +790,8 @@ if (APPLE)
+     ${IOK_LIBRARY}
+     resolv
+   )
++elseif(IOS)
++  target_link_libraries(core PRIVATE resolv)
+ elseif (ANDROID)
+   target_link_libraries(core
+   PRIVATE
+@@ -857,7 +859,7 @@ if(WIN32)
+     target_link_libraries(core PUBLIC videod3d12 videod3d)
+   endif()
+   target_compile_definitions(core PRIVATE "-D_WINSOCK_DEPRECATED_NO_WARNINGS")
+-elseif(APPLE)
++elseif(APPLE AND NOT IOS)
+   target_sources(core PRIVATE
+     HW/EXI/BBA/TAP_Apple.cpp
+   )
+@@ -866,7 +868,7 @@ elseif(UNIX)
+   target_sources(core PRIVATE
+     HW/EXI/BBA/TAP_Unix.cpp
+   )
+-  if(ANDROID)
++  if(ANDROID AND NOT TURBULENCE_ANDROID)
+     target_sources(core PRIVATE
+       HW/WiimoteReal/IOAndroid.cpp
+       HW/WiimoteReal/IOAndroid.h
 diff --git a/Source/Core/Core/Config/GraphicsSettings.cpp b/Source/Core/Core/Config/GraphicsSettings.cpp
-index fb7f6a8..6e30d09 100644
+index fb7f6a8..f17fbba 100644
 --- a/Source/Core/Core/Config/GraphicsSettings.cpp
 +++ b/Source/Core/Core/Config/GraphicsSettings.cpp
-@@ -123,6 +123,9 @@ const Info<TriState> GFX_MTL_MANUALLY_UPLOAD_BUFFERS{
+@@ -13,6 +13,7 @@ namespace Config
+ 
+ // Graphics.Hardware
+ 
++const Info<bool> GFX_METALFX_SPATIAL{{System::GFX, "Enhancements", "MetalFXSpatial"}, false};
+ const Info<bool> GFX_VSYNC{{System::GFX, "Hardware", "VSync"}, false};
+ const Info<int> GFX_ADAPTER{{System::GFX, "Hardware", "Adapter"}, 0};
+ 
+@@ -123,6 +124,9 @@ const Info<TriState> GFX_MTL_MANUALLY_UPLOAD_BUFFERS{
  const Info<TriState> GFX_MTL_USE_PRESENT_DRAWABLE{
      {System::GFX, "Settings", "MTLUsePresentDrawable"}, TriState::Auto};
  
@@ -31,10 +487,18 @@ index fb7f6a8..6e30d09 100644
  const Info<bool> GFX_SW_DUMP_TEV_STAGES{{System::GFX, "Settings", "SWDumpTevStages"}, false};
  const Info<bool> GFX_SW_DUMP_TEV_TEX_FETCHES{{System::GFX, "Settings", "SWDumpTevTexFetches"},
 diff --git a/Source/Core/Core/Config/GraphicsSettings.h b/Source/Core/Core/Config/GraphicsSettings.h
-index 831e044..42a0b4c 100644
+index 831e044..690546f 100644
 --- a/Source/Core/Core/Config/GraphicsSettings.h
 +++ b/Source/Core/Core/Config/GraphicsSettings.h
-@@ -106,6 +106,8 @@ extern const Info<bool> GFX_CPU_CULL;
+@@ -26,6 +26,7 @@ namespace Config
+ // Graphics.Hardware
+ 
+ extern const Info<bool> GFX_VSYNC;
++extern const Info<bool> GFX_METALFX_SPATIAL;
+ extern const Info<int> GFX_ADAPTER;
+ 
+ // Graphics.Settings
+@@ -106,6 +107,8 @@ extern const Info<bool> GFX_CPU_CULL;
  
  extern const Info<TriState> GFX_MTL_MANUALLY_UPLOAD_BUFFERS;
  extern const Info<TriState> GFX_MTL_USE_PRESENT_DRAWABLE;
@@ -44,10 +508,39 @@ index 831e044..42a0b4c 100644
  extern const Info<bool> GFX_SW_DUMP_OBJECTS;
  extern const Info<bool> GFX_SW_DUMP_TEV_STAGES;
 diff --git a/Source/Core/Core/Core.cpp b/Source/Core/Core/Core.cpp
-index e58579e..a72c271 100644
+index e58579e..da44963 100644
 --- a/Source/Core/Core/Core.cpp
 +++ b/Source/Core/Core/Core.cpp
-@@ -903,10 +903,9 @@ void DoFrameStep(Core::System& system)
+@@ -291,6 +291,7 @@ static void CpuThread(Core::System& system, const std::optional<std::string>& sa
+     Common::SetCurrentThreadName("CPU thread");
+   else
+     Common::SetCurrentThreadName("CPU-GPU thread");
++  Common::PreferPerformanceCores("CPU");
+ 
+   // This needs to be delayed until after the video backend is ready.
+   DolphinAnalytics::Instance().ReportGameStart();
+@@ -299,7 +300,12 @@ static void CpuThread(Core::System& system, const std::optional<std::string>& sa
+   system.GetPerfMetrics().Reset();
+ 
+   // The JIT need to be able to intercept faults, both for fastmem and for the BLR optimization.
++#ifdef TURBULENCE_IOS
++  // Static native code and interpreter fallback do not need JIT fault handlers.
++  const bool exception_handler = false;
++#else
+   const bool exception_handler = EMM::IsExceptionHandlerSupported();
++#endif
+   if (exception_handler)
+     EMM::InstallExceptionHandler();
+ 
+@@ -435,6 +441,7 @@ static void FifoPlayerThread(Core::System& system, const std::optional<std::stri
+     // Spawn the GPU thread.
+     std::thread gpu_thread{[&] {
+       Common::SetCurrentThreadName("Video thread");
++      Common::PreferPerformanceCores("Video");
+ 
+       const bool is_init = init_video();
+       init_from_thread.set_value(is_init);
+@@ -903,10 +910,9 @@ void DoFrameStep(Core::System& system)
  
  void UpdateInputGate(bool require_focus, bool require_full_focus)
  {
@@ -61,7 +554,21 @@ index e58579e..a72c271 100644
    // Ignore full focus if we don't require basic focus
    const bool full_focus_passes =
        !require_focus || !require_full_focus || (focus_passes && Host_RendererHasFullFocus());
+diff --git a/Source/Core/Core/HW/WiimoteReal/IOAndroid.h b/Source/Core/Core/HW/WiimoteReal/IOAndroid.h
+index 4a79b90..730c1af 100644
+--- a/Source/Core/Core/HW/WiimoteReal/IOAndroid.h
++++ b/Source/Core/Core/HW/WiimoteReal/IOAndroid.h
+@@ -3,7 +3,7 @@
+ 
+ #pragma once
+ 
+-#ifdef ANDROID
++#if defined(ANDROID) && !defined(TURBULENCE_ANDROID)
+ #include <jni.h>
+ #include <string>
+ 
 diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+index e3581cc..d0cc647 100644
 --- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
 +++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
 @@ -2,6 +2,7 @@
@@ -72,7 +579,7 @@ diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp b/Source
  
  #include <algorithm>
  #include <cstdio>
-@@ -145,6 +146,8 @@
+@@ -145,6 +146,8 @@ StaticRecompCore::~StaticRecompCore() = default;
  
  void StaticRecompCore::Init()
  {
@@ -81,7 +588,7 @@ diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp b/Source
    g_static_recomp_core = this;
    RefreshConfig();
    m_collect_dispatch_samples = std::getenv("STATICRECOMP_DISPATCH_SAMPLES") != nullptr;
-@@ -182,6 +185,8 @@
+@@ -182,12 +185,16 @@ void StaticRecompCore::Init()
  
    LoadModule();
    m_idle_pc = Config::Get(Config::MAIN_STATICRECOMP_IDLE_PC);
@@ -90,7 +597,17 @@ diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp b/Source
    m_lockstep_verifier = std::make_unique<StaticRecompLockstep::StaticRecompLockstepVerifier>(*this);
    m_lockstep_verifier->Init();
  
-@@ -200,6 +205,8 @@
+-#ifdef _M_ARM_64
++  // Code the module doesn't cover runs on the JIT. Sideloaded iOS can't map
++  // executable pages and uses the interpreter; Android can.
++#if defined(_M_ARM_64) && !defined(TURBULENCE_IOS)
+   m_fallback_jit = std::make_unique<JitArm64>(m_system);
+-#elif defined(_M_X86_64)
++#elif defined(_M_X86_64) && !defined(TURBULENCE_IOS) && !defined(TURBULENCE_ANDROID)
+   m_fallback_jit = std::make_unique<Jit64>(m_system);
+ #endif
+   if (m_fallback_jit)
+@@ -200,6 +207,8 @@ void StaticRecompCore::Init()
  
  void StaticRecompCore::Shutdown()
  {
@@ -99,7 +616,7 @@ diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp b/Source
    g_static_recomp_core = nullptr;
    std::fprintf(stderr,
                 "[staticrecomp] shutdown: native=%llu fallback=%llu native_exc=%llu hook_fb=%llu "
-@@ -328,6 +335,7 @@
+@@ -328,6 +337,7 @@ void StaticRecompCore::LoadModule()
    }
    m_active_rel_sections.clear();
    m_rel_mapping_generation = 0;
@@ -107,7 +624,7 @@ diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp b/Source
    m_failed_chunks = 0;
    m_lookup_ram_size = 0;
    m_lookup_exram_size = 0;
-@@ -356,6 +364,7 @@
+@@ -356,6 +366,7 @@ void StaticRecompCore::ClearCache()
    if (!m_module)
      return;
    std::fill(m_chunk_state.begin(), m_chunk_state.end(), u8{CHUNK_UNVERIFIED});
@@ -116,18 +633,19 @@ diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp b/Source
    ++m_reverify_events;
  }
 diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
+index d084fea..235ebaa 100644
 --- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
 +++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
-@@ -2,6 +2,8 @@
- // SPDX-License-Identifier: GPL-2.0-or-later
+@@ -3,6 +3,8 @@
  
  #pragma once
-+
-+#include <chrono>
  
++#include <chrono>
++
  #include <string>
  #include <unordered_map>
-@@ -194,6 +196,13 @@
+ #include <unordered_set>
+@@ -194,6 +196,13 @@ private:
    std::vector<int> m_chunk_rel_sections;
    std::vector<u64> m_effective_chunk_hashes;
    u64 m_rel_mapping_generation = 0;
@@ -141,7 +659,7 @@ diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h b/Source/C
    u32 m_failed_chunks = 0;    // chunks currently failing verification (real SMC)
    u64 m_verifications = 0;    // chunk hash checks performed
    u64 m_reverify_events = 0;  // invalidations that reset a chunk to Unverified
-@@ -212,6 +221,7 @@
+@@ -212,6 +221,7 @@ private:
    bool m_collect_dispatch_samples = false;
    bool m_has_rel_modules = false;
    u32 m_idle_pc = 0;
@@ -150,6 +668,7 @@ diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h b/Source/C
  
  extern StaticRecompCore* g_static_recomp_core;
 diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
+index d91ec2d..2505c1d 100644
 --- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
 +++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
 @@ -2,6 +2,16 @@
@@ -169,7 +688,7 @@ diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp b/So
  #include "Core/System.h"
  #include "Core/PowerPC/PowerPC.h"
  #include "Core/PowerPC/Interpreter/Interpreter.h"
-@@ -50,6 +60,11 @@
+@@ -50,6 +60,11 @@ FilePtr OpenDispatchTrace()
  
  void StaticRecompCore::Run()
  {
@@ -181,7 +700,7 @@ diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp b/So
    auto& core_timing = m_system.GetCoreTiming();
    auto& power_pc = m_system.GetPowerPC();
    auto& ppc = power_pc.GetPPCState();
-@@ -120,6 +135,17 @@
+@@ -120,6 +135,17 @@ void StaticRecompCore::Run()
    while (*state_ptr == CPU::State::Running)
    {
      core_timing.Advance();
@@ -199,7 +718,7 @@ diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp b/So
      const std::string current_game_id = SConfig::GetInstance().GetGameID();
      m_module_active = m_module && (current_game_id.empty() || current_game_id == m_module->game_id);
  
-@@ -155,6 +181,32 @@
+@@ -155,6 +181,32 @@ void StaticRecompCore::Run()
            if (m_has_rel_modules)
              ResolveNativeAddress(runtime_dispatch_address, &linked_dispatch_address, nullptr);
            m_guest.pc = linked_dispatch_address;
@@ -232,7 +751,7 @@ diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp b/So
            m_module->dispatch(&m_guest, linked_dispatch_address);
            if (m_has_rel_modules)
              m_guest.pc = TranslateRelAddress(m_guest.pc);
-@@ -184,7 +236,22 @@
+@@ -184,7 +236,22 @@ void StaticRecompCore::Run()
            // Idle loop skipping for configured target loops (e.g. Wii Menu OSIdleThread)
            if (m_guest.pc == m_idle_pc && m_idle_pc != 0)
            {
@@ -341,6 +860,7 @@ index 491c57e..6dc0944 100644
    ResolveNativeAddress(address, &linked_address, nullptr);
    address = linked_address;
 diff --git a/Source/Core/DolphinNoGUI/PlatformMacos.mm b/Source/Core/DolphinNoGUI/PlatformMacos.mm
+index e942282..e1094e6 100644
 --- a/Source/Core/DolphinNoGUI/PlatformMacos.mm
 +++ b/Source/Core/DolphinNoGUI/PlatformMacos.mm
 @@ -2,6 +2,7 @@
@@ -351,7 +871,7 @@ diff --git a/Source/Core/DolphinNoGUI/PlatformMacos.mm b/Source/Core/DolphinNoGU
  
  #include "Common/MsgHandler.h"
  #include "Core/Config/MainSettings.h"
-@@ -110,6 +111,7 @@
+@@ -110,6 +111,7 @@ @interface WindowDelegate : NSObject <NSWindowDelegate>
    BOOL m_cursor_hidden;
  }
  
@@ -359,16 +879,15 @@ diff --git a/Source/Core/DolphinNoGUI/PlatformMacos.mm b/Source/Core/DolphinNoGU
  - (void)windowDidResize:(NSNotification*)notification;
  - (void)mouseEntered:(NSEvent*)event;
  - (void)mouseExited:(NSEvent*)event;
-@@ -134,32 +136,21 @@
+@@ -134,32 +136,21 @@ - (void)windowDidResize:(NSNotification*)notification
      g_presenter->ResizeSurface();
  }
  
 -- (void)mouseEntered:(NSEvent*)event
--{
++- (void)setCursorHidden:(BOOL)hidden
+ {
 -  if (!m_cursor_hidden)
 -  {
-+- (void)setCursorHidden:(BOOL)hidden
-+{
 +  if (hidden == m_cursor_hidden)
 +    return;
 +  if (hidden)
@@ -385,8 +904,9 @@ diff --git a/Source/Core/DolphinNoGUI/PlatformMacos.mm b/Source/Core/DolphinNoGU
      [NSCursor unhide];
 -    m_cursor_hidden = NO;
 -  }
--}
--
++  m_cursor_hidden = hidden;
+ }
+ 
 -- (void)windowWillClose:(NSNotification*)notification
 -{
 -  if (m_cursor_hidden)
@@ -395,9 +915,6 @@ diff --git a/Source/Core/DolphinNoGUI/PlatformMacos.mm b/Source/Core/DolphinNoGU
 -    m_cursor_hidden = NO;
 -  }
 -}
-+  m_cursor_hidden = hidden;
-+}
-+
 +- (void)mouseEntered:(NSEvent*)event { [self setCursorHidden:NO]; }
 +- (void)mouseExited:(NSEvent*)event { [self setCursorHidden:NO]; }
 +- (void)windowWillClose:(NSNotification*)notification { [self setCursorHidden:NO]; }
@@ -405,7 +922,7 @@ diff --git a/Source/Core/DolphinNoGUI/PlatformMacos.mm b/Source/Core/DolphinNoGU
  @end
  
  namespace
-@@ -182,6 +173,8 @@
+@@ -182,6 +173,8 @@ - (void)windowWillClose:(NSNotification*)notification
    void HandleSaveStates(NSUInteger key, NSUInteger flags);
    void SetupMenu();
  
@@ -414,7 +931,7 @@ diff --git a/Source/Core/DolphinNoGUI/PlatformMacos.mm b/Source/Core/DolphinNoGU
    NSRect m_window_rect;
    NSWindow* m_window;
    NSMenu* menuBar;
-@@ -247,8 +240,7 @@
+@@ -247,8 +240,7 @@ - (void)windowWillClose:(NSNotification*)notification
      return false;
    }
  
@@ -424,7 +941,7 @@ diff --git a/Source/Core/DolphinNoGUI/PlatformMacos.mm b/Source/Core/DolphinNoGU
  
    if (Config::Get(Config::MAIN_FULLSCREEN))
    {
-@@ -256,9 +248,19 @@
+@@ -256,9 +248,19 @@ - (void)windowWillClose:(NSNotification*)notification
      [m_window toggleFullScreen:m_window];
    }
  
@@ -447,7 +964,7 @@ diff --git a/Source/Core/DolphinNoGUI/PlatformMacos.mm b/Source/Core/DolphinNoGU
    [m_window setTitle:@"Dolphin-emu-nogui"];
  
    SetupMenu();
-@@ -305,32 +307,52 @@
+@@ -305,32 +307,52 @@ - (void)windowWillClose:(NSNotification*)notification
  {
    @autoreleasepool
    {
@@ -459,6 +976,11 @@ diff --git a/Source/Core/DolphinNoGUI/PlatformMacos.mm b/Source/Core/DolphinNoGU
                                            dequeue:YES];
  
 -    [NSApp sendEvent:event];
+-
+-    // Need to update if m_window becomes fullscreen
+-    m_window_fullscreen = [m_window styleMask] & NSWindowStyleMaskFullScreen;
+-
+-    if ([m_window isMainWindow])
 +    // Game input reads the keyboard state directly. Plain key events have no
 +    // responder in the render view, so AppKit would beep on every key press;
 +    // only forward keys that carry Command, for menu shortcuts such as Cmd-Q.
@@ -470,33 +992,28 @@ diff --git a/Source/Core/DolphinNoGUI/PlatformMacos.mm b/Source/Core/DolphinNoGU
 +                                (event.modifierFlags & NSEventModifierFlagCommand) &&
 +                                (event.keyCode == 36 || event.keyCode == 76);
 +    if (fullscreen_key)
-+    {
-+      if (!event.isARepeat)
-+        [m_window toggleFullScreen:nil];
-+    }
-+    else if (!plain_key)
-+    {
-+      [NSApp sendEvent:event];
-+    }
- 
-     // Need to update if m_window becomes fullscreen
-     m_window_fullscreen = [m_window styleMask] & NSWindowStyleMaskFullScreen;
- 
--    if ([m_window isMainWindow])
--    {
+     {
 -      m_window_focus = true;
 -      if (Config::Get(Config::MAIN_SHOW_CURSOR) == Config::ShowCursor::Never &&
 -          Core::GetState(Core::System::GetInstance()) != Core::State::Paused)
 -      {
 -        [NSCursor unhide];
 -      }
--    }
++      if (!event.isARepeat)
++        [m_window toggleFullScreen:nil];
+     }
 -    else
--    {
++    else if (!plain_key)
+     {
 -      m_window_focus = false;
 -      if (Config::Get(Config::MAIN_SHOW_CURSOR) == Config::ShowCursor::Never)
 -        [NSCursor hide];
--    }
++      [NSApp sendEvent:event];
+     }
++
++    // Need to update if m_window becomes fullscreen
++    m_window_fullscreen = [m_window styleMask] & NSWindowStyleMaskFullScreen;
++
 +    // A window stays "main" while another app's panel (Spotlight, Raycast,
 +    // notification banners) takes the keyboard, and Quartz reads global key
 +    // state. Only treat the game as focused while this app is active too.
@@ -516,6 +1033,365 @@ diff --git a/Source/Core/DolphinNoGUI/PlatformMacos.mm b/Source/Core/DolphinNoGU
 +    [m_window_delegate setCursorHidden:hide];
    }
  }
+ 
+diff --git a/Source/Core/DolphinNoGUI/PlatformWayland.cpp b/Source/Core/DolphinNoGUI/PlatformWayland.cpp
+index f7e1ca2..875c81f 100644
+--- a/Source/Core/DolphinNoGUI/PlatformWayland.cpp
++++ b/Source/Core/DolphinNoGUI/PlatformWayland.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "DolphinNoGUI/Platform.h"
++#include "Common/CursorAutoHide.h"
+ 
+ #include <algorithm>
+ #include <cerrno>
+@@ -72,9 +73,24 @@ public:
+   static void PointerEnter(void* data, wl_pointer*, uint32_t serial, wl_surface* surface,
+                            wl_fixed_t, wl_fixed_t);
+   static void PointerLeave(void* data, wl_pointer*, uint32_t, wl_surface* surface);
+-  static void PointerMotion(void*, wl_pointer*, uint32_t, wl_fixed_t, wl_fixed_t) {}
+-  static void PointerButton(void*, wl_pointer*, uint32_t, uint32_t, uint32_t, uint32_t) {}
+-  static void PointerAxis(void*, wl_pointer*, uint32_t, uint32_t, wl_fixed_t) {}
++  static void PointerMotion(void* data, wl_pointer*, uint32_t, wl_fixed_t, wl_fixed_t)
++  {
++    auto* platform = static_cast<PlatformWayland*>(data);
++    platform->m_mouse_activity = true;
++    platform->UpdateCursor();
++  }
++  static void PointerButton(void* data, wl_pointer*, uint32_t, uint32_t, uint32_t, uint32_t)
++  {
++    auto* platform = static_cast<PlatformWayland*>(data);
++    platform->m_mouse_activity = true;
++    platform->UpdateCursor();
++  }
++  static void PointerAxis(void* data, wl_pointer*, uint32_t, uint32_t, wl_fixed_t)
++  {
++    auto* platform = static_cast<PlatformWayland*>(data);
++    platform->m_mouse_activity = true;
++    platform->UpdateCursor();
++  }
+   static void PointerFrame(void*, wl_pointer*) {}
+   static void PointerAxisSource(void*, wl_pointer*, uint32_t) {}
+   static void PointerAxisStop(void*, wl_pointer*, uint32_t, uint32_t) {}
+@@ -115,6 +131,10 @@ private:
+   wl_surface* m_cursor_surface = nullptr;
+   uint32_t m_pointer_serial = 0;
+   bool m_pointer_inside = false;
++  Common::CursorAutoHide m_cursor_timer;
++  bool m_mouse_activity = false;
++  bool m_cursor_dirty = true;
++  std::optional<bool> m_cursor_hidden;
+ 
+   std::thread::id m_owner_thread;
+   std::mutex m_title_mutex;
+@@ -319,6 +339,7 @@ void PlatformWayland::MainLoop()
+     UpdateRunningFlag();
+     Core::HostDispatchJobs(Core::System::GetInstance());
+     ApplyPendingTitle();
++    UpdateCursor();
+     if (!DispatchEvents())
+       break;
+   }
+@@ -529,6 +550,9 @@ void PlatformWayland::DestroyPointer()
+     m_pointer = nullptr;
+   }
+   m_pointer_inside = false;
++  m_cursor_hidden.reset();
++  m_cursor_dirty = true;
++  m_cursor_timer.Update(Common::CursorAutoHide::Clock::now(), false, false);
+ }
+ 
+ void PlatformWayland::KeyboardKeymap(void* data, wl_keyboard*, uint32_t format, int32_t fd,
+@@ -669,6 +693,8 @@ void PlatformWayland::PointerEnter(void* data, wl_pointer*, uint32_t serial, wl_
+   {
+     platform->m_pointer_inside = true;
+     platform->m_pointer_serial = serial;
++    platform->m_mouse_activity = true;
++    platform->m_cursor_dirty = true;
+     platform->UpdateCursor();
+   }
+ }
+@@ -677,17 +703,25 @@ void PlatformWayland::PointerLeave(void* data, wl_pointer*, uint32_t, wl_surface
+ {
+   auto* platform = static_cast<PlatformWayland*>(data);
+   if (surface == platform->m_surface)
++  {
+     platform->m_pointer_inside = false;
++    platform->UpdateCursor();
++  }
+ }
+ 
+ void PlatformWayland::UpdateCursor()
+ {
++  const bool hide = m_cursor_timer.Update(Common::CursorAutoHide::Clock::now(),
++      m_pointer_inside && m_window_focus &&
++          Core::GetState(Core::System::GetInstance()) != Core::State::Paused,
++      m_mouse_activity);
++  m_mouse_activity = false;
+   if (!m_pointer || !m_pointer_inside)
+     return;
+-
+-  const bool hide = m_window_focus &&
+-                    Config::Get(Config::MAIN_SHOW_CURSOR) == Config::ShowCursor::Never &&
+-                    Core::GetState(Core::System::GetInstance()) != Core::State::Paused;
++  if (!m_cursor_dirty && m_cursor_hidden == hide)
++    return;
++  m_cursor_dirty = false;
++  m_cursor_hidden = hide;
+   if (hide || !m_cursor_surface || !m_default_cursor || m_default_cursor->image_count == 0)
+   {
+     wl_pointer_set_cursor(m_pointer, m_pointer_serial, nullptr, 0, 0);
+diff --git a/Source/Core/DolphinNoGUI/PlatformWin32.cpp b/Source/Core/DolphinNoGUI/PlatformWin32.cpp
+index 3402fda..dce571c 100644
+--- a/Source/Core/DolphinNoGUI/PlatformWin32.cpp
++++ b/Source/Core/DolphinNoGUI/PlatformWin32.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "DolphinNoGUI/Platform.h"
++#include "Common/CursorAutoHide.h"
+ 
+ #include "Core/Config/MainSettings.h"
+ #include "Core/Config/ConfigManager.h"
+@@ -68,6 +69,10 @@ private:
+   void UpdateWindowPosition();
+   void ProcessEvents();
+ 
++  Common::CursorAutoHide m_cursor_timer;
++  POINT m_last_mouse{LONG_MIN, LONG_MIN};
++  bool m_cursor_hidden = false;
++  bool m_mouse_activity = false;
+   HWND m_hwnd{};
+   HMENU m_menu{};
+   HMENU m_file_menu{};
+@@ -329,6 +334,26 @@ void PlatformWin32::ProcessEvents()
+     TranslateMessage(&msg);
+     DispatchMessage(&msg);
+   }
++  POINT mouse{};
++  if (!GetCursorPos(&mouse))
++    return;
++  const bool moved = mouse.x != m_last_mouse.x || mouse.y != m_last_mouse.y;
++  m_last_mouse = mouse;
++  POINT client = mouse;
++  ScreenToClient(m_hwnd, &client);
++  RECT bounds{};
++  GetClientRect(m_hwnd, &bounds);
++  const bool inside = PtInRect(&bounds, client) && WindowFromPoint(mouse) == m_hwnd;
++  m_window_focus = GetForegroundWindow() == m_hwnd;
++  const bool hide = m_cursor_timer.Update(Common::CursorAutoHide::Clock::now(),
++      inside && m_window_focus && Core::GetState(Core::System::GetInstance()) != Core::State::Paused,
++      moved || m_mouse_activity);
++  m_mouse_activity = false;
++  if (m_cursor_hidden != hide)
++  {
++    m_cursor_hidden = hide;
++    SetCursor(hide ? nullptr : LoadCursor(nullptr, IDC_ARROW));
++  }
+ }
+ 
+ LRESULT PlatformWin32::WndProc(const HWND hwnd, const UINT msg, const WPARAM wParam,
+@@ -356,6 +381,22 @@ LRESULT PlatformWin32::WndProc(const HWND hwnd, const UINT msg, const WPARAM wPa
+   }
+   break;
+ 
++  case WM_SETCURSOR:
++    if (platform && LOWORD(lParam) == HTCLIENT)
++    {
++      SetCursor(platform->m_cursor_hidden ? nullptr : LoadCursor(nullptr, IDC_ARROW));
++      return TRUE;
++    }
++    break;
++
++  case WM_LBUTTONDOWN:
++  case WM_RBUTTONDOWN:
++  case WM_MBUTTONDOWN:
++  case WM_MOUSEWHEEL:
++    if (platform)
++      platform->m_mouse_activity = true;
++    break;
++
+   case WM_SIZE:
+   {
+     if (g_presenter)
+diff --git a/Source/Core/DolphinNoGUI/PlatformX11.cpp b/Source/Core/DolphinNoGUI/PlatformX11.cpp
+index 8d0ae0c..e4a6f89 100644
+--- a/Source/Core/DolphinNoGUI/PlatformX11.cpp
++++ b/Source/Core/DolphinNoGUI/PlatformX11.cpp
+@@ -10,6 +10,7 @@
+ static constexpr auto X_None = None;
+ 
+ #include "DolphinNoGUI/Platform.h"
++#include "Common/CursorAutoHide.h"
+ 
+ #include "Common/MsgHandler.h"
+ #include "Core/Config/MainSettings.h"
+@@ -49,10 +50,15 @@ private:
+   void CloseDisplay();
+   void UpdateWindowPosition();
+   void ProcessEvents();
++  void UpdateCursor();
+ 
+   Display* m_display = nullptr;
+   Window m_window = {};
+   Cursor m_blank_cursor = X_None;
++  Common::CursorAutoHide m_cursor_timer;
++  bool m_pointer_inside = false;
++  bool m_mouse_activity = false;
++  bool m_cursor_hidden = false;
+ #ifdef HAVE_XRANDR
+   X11Utils::XRRConfiguration* m_xrr_config = nullptr;
+ #endif
+@@ -70,7 +76,7 @@ PlatformX11::~PlatformX11()
+ 
+   if (m_display)
+   {
+-    if (Config::Get(Config::MAIN_SHOW_CURSOR) == Config::ShowCursor::Never)
++    if (m_blank_cursor != X_None)
+       XFreeCursor(m_display, m_blank_cursor);
+ 
+     XCloseDisplay(m_display);
+@@ -89,7 +95,8 @@ bool PlatformX11::Init()
+ 
+   m_window = XCreateSimpleWindow(m_display, DefaultRootWindow(m_display), m_window_x, m_window_y,
+                                  m_window_width, m_window_height, 0, 0, BlackPixel(m_display, 0));
+-  XSelectInput(m_display, m_window, StructureNotifyMask | KeyPressMask | FocusChangeMask);
++  XSelectInput(m_display, m_window, StructureNotifyMask | KeyPressMask | FocusChangeMask |
++      PointerMotionMask | EnterWindowMask | LeaveWindowMask | ButtonPressMask);
+   Atom wmProtocols[1];
+   wmProtocols[0] = XInternAtom(m_display, "WM_DELETE_WINDOW", True);
+   XSetWMProtocols(m_display, m_window, wmProtocols, 1);
+@@ -115,16 +122,14 @@ bool PlatformX11::Init()
+   m_xrr_config = new X11Utils::XRRConfiguration(m_display, m_window);
+ #endif
+ 
+-  if (Config::Get(Config::MAIN_SHOW_CURSOR) == Config::ShowCursor::Never)
+   {
+-    // make a blank cursor
++    // Allocate once; only select the blank cursor after inactivity.
+     Pixmap Blank;
+     XColor DummyColor;
+     char ZeroData[1] = {0};
+     Blank = XCreateBitmapFromData(m_display, m_window, ZeroData, 1, 1);
+     m_blank_cursor = XCreatePixmapCursor(m_display, Blank, Blank, &DummyColor, &DummyColor, 0, 0);
+     XFreePixmap(m_display, Blank);
+-    XDefineCursor(m_display, m_window, m_blank_cursor);
+   }
+ 
+   // Enter fullscreen if enabled.
+@@ -153,6 +158,7 @@ void PlatformX11::MainLoop()
+     UpdateRunningFlag();
+     Core::HostDispatchJobs(Core::System::GetInstance());
+     ProcessEvents();
++    UpdateCursor();
+     UpdateWindowPosition();
+ 
+     // TODO: Is this sleep appropriate?
+@@ -200,14 +206,10 @@ void PlatformX11::ProcessEvents()
+       {
+         if (Core::GetState(Core::System::GetInstance()) == Core::State::Running)
+         {
+-          if (Config::Get(Config::MAIN_SHOW_CURSOR) == Config::ShowCursor::Never)
+-            XUndefineCursor(m_display, m_window);
+           Core::SetState(Core::System::GetInstance(), Core::State::Paused);
+         }
+         else
+         {
+-          if (Config::Get(Config::MAIN_SHOW_CURSOR) == Config::ShowCursor::Never)
+-            XDefineCursor(m_display, m_window, m_blank_cursor);
+           Core::SetState(Core::System::GetInstance(), Core::State::Running);
+         }
+       }
+@@ -243,20 +245,23 @@ void PlatformX11::ProcessEvents()
+     case FocusIn:
+     {
+       m_window_focus = true;
+-      if (Config::Get(Config::MAIN_SHOW_CURSOR) == Config::ShowCursor::Never &&
+-          Core::GetState(Core::System::GetInstance()) != Core::State::Paused)
+-      {
+-        XDefineCursor(m_display, m_window, m_blank_cursor);
+-      }
++      m_mouse_activity = true;
+     }
+     break;
+     case FocusOut:
+-    {
+       m_window_focus = false;
+-      if (Config::Get(Config::MAIN_SHOW_CURSOR) == Config::ShowCursor::Never)
+-        XUndefineCursor(m_display, m_window);
+-    }
+-    break;
++      break;
++    case EnterNotify:
++      m_pointer_inside = true;
++      m_mouse_activity = true;
++      break;
++    case LeaveNotify:
++      m_pointer_inside = false;
++      break;
++    case MotionNotify:
++    case ButtonPress:
++      m_mouse_activity = true;
++      break;
+     case ClientMessage:
+     {
+       if ((unsigned long)event.xclient.data.l[0] ==
+@@ -273,6 +278,24 @@ void PlatformX11::ProcessEvents()
+     }
+   }
+ }
++
++void PlatformX11::UpdateCursor()
++{
++  const bool hide = m_cursor_timer.Update(Common::CursorAutoHide::Clock::now(),
++      m_window_focus && m_pointer_inside &&
++          Core::GetState(Core::System::GetInstance()) != Core::State::Paused,
++      m_mouse_activity);
++  m_mouse_activity = false;
++  if (hide == m_cursor_hidden)
++    return;
++  m_cursor_hidden = hide;
++  if (hide)
++    XDefineCursor(m_display, m_window, m_blank_cursor);
++  else
++    XUndefineCursor(m_display, m_window);
++  XFlush(m_display);
++}
++
+ }  // namespace
+ 
+ std::unique_ptr<Platform> Platform::CreateX11Platform()
+diff --git a/Source/Core/InputCommon/CMakeLists.txt b/Source/Core/InputCommon/CMakeLists.txt
+index ddf8c30..724acc7 100644
+--- a/Source/Core/InputCommon/CMakeLists.txt
++++ b/Source/Core/InputCommon/CMakeLists.txt
+@@ -113,7 +113,7 @@ if(WIN32)
+     )
+   endif()
+   target_link_libraries(inputcommon PRIVATE cfgmgr32.lib dinput8.lib dxguid.lib)
+-elseif(APPLE)
++elseif(APPLE AND NOT IOS)
+   target_sources(inputcommon PRIVATE
+     ControllerInterface/Quartz/Quartz.h
+     ControllerInterface/Quartz/Quartz.mm
+@@ -136,7 +136,7 @@ elseif(X11_FOUND)
+     ControllerInterface/Xlib/XInput2.h
+   )
+   target_link_libraries(inputcommon PRIVATE PkgConfig::X11_INPUT)
+-elseif(ANDROID)
++elseif(ANDROID AND NOT TURBULENCE_ANDROID)
+   target_compile_definitions(inputcommon PRIVATE -DCIFACE_USE_ANDROID)
+   target_sources(inputcommon PRIVATE
+     ControllerInterface/Android/Android.cpp
+@@ -149,7 +149,7 @@ elseif(ANDROID)
+   )
+ endif()
+ 
+-if(NOT ANDROID)
++if(TARGET LibUSB::LibUSB)
+   target_link_libraries(inputcommon PUBLIC LibUSB::LibUSB)
+ endif()
  
 diff --git a/Source/Core/InputCommon/ControlReference/ExpressionParser.cpp b/Source/Core/InputCommon/ControlReference/ExpressionParser.cpp
 index ee2e78d..4858516 100644
@@ -543,6 +1419,19 @@ index ee2e78d..4858516 100644
  }
  
  std::shared_ptr<ControlState> ControlEnvironment::GetVariablePtr(const std::string& name)
+diff --git a/Source/Core/InputCommon/ControllerInterface/ControllerInterface.h b/Source/Core/InputCommon/ControllerInterface/ControllerInterface.h
+index 8f7f4ba..9b31170 100644
+--- a/Source/Core/InputCommon/ControllerInterface/ControllerInterface.h
++++ b/Source/Core/InputCommon/ControllerInterface/ControllerInterface.h
+@@ -22,7 +22,7 @@
+ #ifdef HAVE_X11
+ #define CIFACE_USE_XLIB
+ #endif
+-#if defined(__APPLE__)
++#if defined(__APPLE__) && !defined(TURBULENCE_IOS)
+ #define CIFACE_USE_OSX
+ #endif
+ #if defined(HAVE_LIBEVDEV) && defined(HAVE_LIBUDEV)
 diff --git a/Source/Core/InputCommon/ControllerInterface/CoreDevice.cpp b/Source/Core/InputCommon/ControllerInterface/CoreDevice.cpp
 index a10edd1..351ea8e 100644
 --- a/Source/Core/InputCommon/ControllerInterface/CoreDevice.cpp
@@ -627,7 +1516,83 @@ index 0945759..a401ae7 100644
      const auto properties = SDL_GetGamepadProperties(m_gamepad);
  
      // Rumble
+diff --git a/Source/Core/InputCommon/GCAdapter.cpp b/Source/Core/InputCommon/GCAdapter.cpp
+index 2b4f9bd..af8b5c3 100644
+--- a/Source/Core/InputCommon/GCAdapter.cpp
++++ b/Source/Core/InputCommon/GCAdapter.cpp
+@@ -3,7 +3,10 @@
+ 
+ #include "InputCommon/GCAdapter.h"
+ 
+-#ifndef ANDROID
++#if defined(TURBULENCE_IOS) || defined(TURBULENCE_ANDROID)
++#define GCADAPTER_USE_LIBUSB_IMPLEMENTATION false
++#define GCADAPTER_USE_ANDROID_IMPLEMENTATION false
++#elif !defined(ANDROID)
+ #define GCADAPTER_USE_LIBUSB_IMPLEMENTATION true
+ #define GCADAPTER_USE_ANDROID_IMPLEMENTATION false
+ #else
+diff --git a/Source/Core/UICommon/UICommon.cpp b/Source/Core/UICommon/UICommon.cpp
+index 01dc87b..52f4e5a 100644
+--- a/Source/Core/UICommon/UICommon.cpp
++++ b/Source/Core/UICommon/UICommon.cpp
+@@ -55,7 +55,7 @@
+ #include "UICommon/DBusUtils.h"
+ #endif
+ 
+-#ifdef __APPLE__
++#if defined(__APPLE__) && !defined(TURBULENCE_IOS)
+ #include <IOKit/pwr_mgt/IOPMLib.h>
+ #endif
+ 
+@@ -517,7 +517,7 @@ void InhibitScreenSaver(bool inhibit)
+                           (inhibit ? (ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED) : 0));
+ #endif
+ 
+-#ifdef __APPLE__
++#if defined(__APPLE__) && !defined(TURBULENCE_IOS)
+   static IOPMAssertionID s_power_assertion = kIOPMNullAssertionID;
+   if (inhibit)
+   {
+diff --git a/Source/Core/VideoBackends/CMakeLists.txt b/Source/Core/VideoBackends/CMakeLists.txt
+index e56dd03..f9ccf8f 100644
+--- a/Source/Core/VideoBackends/CMakeLists.txt
++++ b/Source/Core/VideoBackends/CMakeLists.txt
+@@ -1,4 +1,6 @@
+-add_subdirectory(OGL)
++if(NOT IOS)
++  add_subdirectory(OGL)
++endif()
+ add_subdirectory(Null)
+ add_subdirectory(Software)
+ 
+diff --git a/Source/Core/VideoBackends/Metal/CMakeLists.txt b/Source/Core/VideoBackends/Metal/CMakeLists.txt
+index db633a0..b224d8b 100644
+--- a/Source/Core/VideoBackends/Metal/CMakeLists.txt
++++ b/Source/Core/VideoBackends/Metal/CMakeLists.txt
+@@ -41,3 +41,8 @@ PRIVATE
+ )
+ 
+ target_compile_options(videometal PRIVATE -fno-objc-arc)
++
++if(APPLE)
++  target_sources(videometal PRIVATE MTLFXScaler.mm MTLSpatialUpscaler.mm)
++  target_link_libraries(videometal PRIVATE "$<LINK_LIBRARY:WEAK_FRAMEWORK,MetalFX>")
++endif()
+diff --git a/Source/Core/VideoBackends/Metal/MTLGfx.h b/Source/Core/VideoBackends/Metal/MTLGfx.h
+index fc9fca0..c9b87a6 100644
+--- a/Source/Core/VideoBackends/Metal/MTLGfx.h
++++ b/Source/Core/VideoBackends/Metal/MTLGfx.h
+@@ -47,6 +47,7 @@ public:
+                                                    size_t cache_data_length = 0) override;
+ 
+   void Flush() override;
++  void FlushBeforePresentationWait() override;
+   void WaitForGPUIdle() override;
+   void OnConfigChanged(u32 bits) override;
+ 
 diff --git a/Source/Core/VideoBackends/Metal/MTLGfx.mm b/Source/Core/VideoBackends/Metal/MTLGfx.mm
+index 4b744fe..9ab0bce 100644
 --- a/Source/Core/VideoBackends/Metal/MTLGfx.mm
 +++ b/Source/Core/VideoBackends/Metal/MTLGfx.mm
 @@ -2,6 +2,9 @@
@@ -640,7 +1605,33 @@ diff --git a/Source/Core/VideoBackends/Metal/MTLGfx.mm b/Source/Core/VideoBacken
  
  #include "VideoBackends/Metal/MTLBoundingBox.h"
  #include "VideoBackends/Metal/MTLObjectCache.h"
-@@ -454,7 +457,19 @@
+@@ -17,11 +20,14 @@
+ #include "VideoCommon/VideoBackendBase.h"
+ 
+ #include <fstream>
++#include <cstdlib>
+ 
+ Metal::Gfx::Gfx(MRCOwned<CAMetalLayer*> layer) : m_layer(std::move(layer))
+ {
+   UpdateActiveConfig();
++#if TARGET_OS_OSX
+   [m_layer setDisplaySyncEnabled:g_ActiveConfig.bVSyncActive];
++#endif
+ 
+   SetupSurface();
+   g_state_tracker->FlushEncoders();
+@@ -288,8 +294,10 @@ static MTLTextureType FromAbstract(AbstractTextureType type, bool multisample)
+ {
+   AbstractGfx::OnConfigChanged(bits);
+ 
++#if TARGET_OS_OSX
+   if (bits & CONFIG_CHANGE_BIT_VSYNC)
+     [m_layer setDisplaySyncEnabled:g_ActiveConfig.bVSyncActive];
++#endif
+ 
+   if (bits & CONFIG_CHANGE_BIT_ANISOTROPY)
+   {
+@@ -454,13 +462,41 @@ static MTLTextureType FromAbstract(AbstractTextureType type, bool multisample)
    {
      CheckForSurfaceChange();
      CheckForSurfaceResize();
@@ -660,14 +1651,42 @@ diff --git a/Source/Core/VideoBackends/Metal/MTLGfx.mm b/Source/Core/VideoBacken
      m_backbuffer->UpdateBackbufferTexture([m_drawable texture]);
      SetAndClearFramebuffer(m_backbuffer.get(), clear_color);
      return m_drawable != nullptr;
-@@ -473,7 +488,14 @@
+   }
+ }
+ 
++void Metal::Gfx::FlushBeforePresentationWait()
++{
++  // Keep GPU execution ahead of the host deadline instead of submitting the
++  // entire frame after the timer wakes. Presentation is queued separately on
++  // the same command queue, so it still follows all rendering of this drawable.
++  static const bool enabled = [] {
++    const char* value = std::getenv("TURBULENCE_EARLY_SUBMIT");
++    return !value || *value != '0';
++  }();
++  if (enabled && m_drawable)
++  {
++    Flush();
++    TurbulencePresentTimes::Get().early_render_submits.fetch_add(1, std::memory_order_relaxed);
++  }
++}
++
+ void Metal::Gfx::PresentBackbuffer()
+ {
+   @autoreleasepool
+@@ -473,7 +509,20 @@ static MTLTextureType FromAbstract(AbstractTextureType type, bool multisample)
        // On the other hand, it helps Xcode's GPU captures start and stop on frame boundaries
        // which is convenient.  Put it here as a default-off config, which we can override in Xcode.
        // It also seems to improve frame pacing, so enable it by default with vsync
 -      if (g_ActiveConfig.iUsePresentDrawable == TriState::On ||
 +      // Record when each frame actually reaches the display (0 if dropped).
 +      [m_drawable addPresentedHandler:^(id<MTLDrawable> drawable) {
-+        TurbulencePresentTimes::Push(drawable.presentedTime);
++        const double native_time = drawable.presentedTime;
++        const double host_now = std::chrono::duration<double>(Clock::now().time_since_epoch()).count();
++        // Keep native display timestamps intact. The recorder takes one epoch
++        // calibration per capture, avoiding callback scheduling noise in intervals.
++        TurbulencePresentTimes::Get().clock_offset_seconds.store(
++            host_now - CACurrentMediaTime(), std::memory_order_relaxed);
++        TurbulencePresentTimes::Push(native_time);
 +      }];
 +      const double minimum_duration = Config::Get(Config::GFX_MTL_MINIMUM_PRESENT_DURATION);
 +      if (g_ActiveConfig.bVSyncActive && minimum_duration > 0.0)
@@ -676,7 +1695,7 @@ diff --git a/Source/Core/VideoBackends/Metal/MTLGfx.mm b/Source/Core/VideoBacken
            (g_ActiveConfig.iUsePresentDrawable == TriState::Auto && g_ActiveConfig.bVSyncActive))
          [g_state_tracker->GetRenderCmdBuf() presentDrawable:m_drawable];
        else
-@@ -482,7 +504,11 @@
+@@ -482,7 +531,11 @@ static MTLTextureType FromAbstract(AbstractTextureType type, bool multisample)
        m_backbuffer->UpdateBackbufferTexture(nullptr);
        m_drawable = nullptr;
      }
@@ -688,7 +1707,7 @@ diff --git a/Source/Core/VideoBackends/Metal/MTLGfx.mm b/Source/Core/VideoBacken
    }
  }
  
-@@ -503,6 +529,11 @@
+@@ -503,6 +556,11 @@ static MTLTextureType FromAbstract(AbstractTextureType type, bool multisample)
  
  void Metal::Gfx::SetupSurface()
  {
@@ -701,10 +1720,20 @@ diff --git a/Source/Core/VideoBackends/Metal/MTLGfx.mm b/Source/Core/VideoBacken
  
    [m_layer setDrawableSize:{static_cast<double>(info.width), static_cast<double>(info.height)}];
 diff --git a/Source/Core/VideoBackends/Metal/MTLMain.mm b/Source/Core/VideoBackends/Metal/MTLMain.mm
-index ff8480e..28bac1a 100644
+index ff8480e..f5235f9 100644
 --- a/Source/Core/VideoBackends/Metal/MTLMain.mm
 +++ b/Source/Core/VideoBackends/Metal/MTLMain.mm
-@@ -11,9 +11,12 @@
+@@ -2,6 +2,9 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "VideoBackends/Metal/VideoBackend.h"
++#ifdef __APPLE__
++#include "VideoCommon/TurbulenceMetalFX.h"
++#endif
+ 
+ // This must be included before we use any TARGET_OS_* macros.
+ #include <TargetConditionals.h>
+@@ -11,9 +14,12 @@
  #endif
  
  #include <Metal/Metal.h>
@@ -717,7 +1746,35 @@ index ff8480e..28bac1a 100644
  #include "Common/MsgHandler.h"
  
  #include "VideoBackends/Metal/MTLBoundingBox.h"
-@@ -164,6 +167,17 @@ void Metal::VideoBackend::PrepareWindow(WindowSystemInfo& wsi)
+@@ -56,6 +62,7 @@ static bool WindowSystemTypeSupportsMetal(WindowSystemType type)
+   switch (type)
+   {
+   case WindowSystemType::MacOS:
++  case WindowSystemType::IOS:
+   case WindowSystemType::Headless:
+     return true;
+   default:
+@@ -123,6 +130,9 @@ static bool WindowSystemTypeSupportsMetal(WindowSystemType type)
+       [layer setPixelFormat:MTLPixelFormatBGRA8Unorm];
+ 
+     ObjectCache::Initialize(std::move(adapter));
++#ifdef __APPLE__
++    TurbulenceMetalFX::Initialize();
++#endif
+     g_state_tracker = std::make_unique<StateTracker>();
+ 
+     return InitializeShared(
+@@ -135,6 +145,9 @@ static bool WindowSystemTypeSupportsMetal(WindowSystemType type)
+ {
+   ShutdownShared();
+ 
++#ifdef __APPLE__
++  TurbulenceMetalFX::Shutdown();
++#endif
+   g_state_tracker.reset();
+   ObjectCache::Shutdown();
+ }
+@@ -164,6 +177,17 @@ static bool WindowSystemTypeSupportsMetal(WindowSystemType type)
      return;
    NSView* view = static_cast<NSView*>(wsi.render_surface);
    CAMetalLayer* layer = [CAMetalLayer layer];
@@ -735,6 +1792,54 @@ index ff8480e..28bac1a 100644
  
    Util::PopulateBackendInfo(&g_backend_info);
  
+diff --git a/Source/Core/VideoBackends/Metal/MTLUtil.h b/Source/Core/VideoBackends/Metal/MTLUtil.h
+index 1752c82..935475f 100644
+--- a/Source/Core/VideoBackends/Metal/MTLUtil.h
++++ b/Source/Core/VideoBackends/Metal/MTLUtil.h
+@@ -3,7 +3,10 @@
+ 
+ #pragma once
+ 
++#include <TargetConditionals.h>
++#if TARGET_OS_OSX
+ #include <AppKit/NSScreen.h>
++#endif
+ #include <Metal/Metal.h>
+ 
+ #include <vector>
+diff --git a/Source/Core/VideoBackends/Metal/MTLUtil.mm b/Source/Core/VideoBackends/Metal/MTLUtil.mm
+index 9298c5b..ff958e1 100644
+--- a/Source/Core/VideoBackends/Metal/MTLUtil.mm
++++ b/Source/Core/VideoBackends/Metal/MTLUtil.mm
+@@ -76,10 +76,14 @@
+   backend_info->bSupportsSettingObjectNames = true;
+   // Metal requires multisample resolve to be done on a render pass
+   backend_info->bSupportsPartialMultisampleResolve = false;
+-  backend_info->bSupportsDynamicVertexLoader = true;
++  backend_info->bSupportsDynamicVertexLoader = !TARGET_OS_IOS;
+   backend_info->bSupportsVSLinePointExpand = true;
++#if TARGET_OS_OSX
+   backend_info->bSupportsHDROutput =
+       1.0 < [[NSScreen deepestScreen] maximumPotentialExtendedDynamicRangeColorComponentValue];
++#else
++  backend_info->bSupportsHDROutput = false;
++#endif
+ }
+ 
+ void Metal::Util::PopulateBackendInfoAdapters(BackendInfo* backend_info,
+diff --git a/Source/Core/VideoCommon/AbstractGfx.h b/Source/Core/VideoCommon/AbstractGfx.h
+index 3a3c72c..724b377 100644
+--- a/Source/Core/VideoCommon/AbstractGfx.h
++++ b/Source/Core/VideoCommon/AbstractGfx.h
+@@ -160,6 +160,8 @@ public:
+                               const AbstractFramebuffer* framebuffer) const;
+ 
+   virtual void Flush() {}
++  // Submit pending render work before the host waits for its presentation deadline.
++  virtual void FlushBeforePresentationWait() {}
+   virtual void WaitForGPUIdle() {}
+ 
+   // For opengl's glDrawBuffer
 diff --git a/Source/Core/VideoCommon/CMakeLists.txt b/Source/Core/VideoCommon/CMakeLists.txt
 index 69a0968..00b4ecf 100644
 --- a/Source/Core/VideoCommon/CMakeLists.txt
@@ -769,17 +1874,22 @@ index 451109b..cd89b2c 100644
  
    // Check for font changes
 diff --git a/Source/Core/VideoCommon/Present.cpp b/Source/Core/VideoCommon/Present.cpp
+index 7c62730..51925c7 100644
 --- a/Source/Core/VideoCommon/Present.cpp
 +++ b/Source/Core/VideoCommon/Present.cpp
-@@ -2,6 +2,7 @@
+@@ -2,6 +2,11 @@
  // SPDX-License-Identifier: GPL-2.0-or-later
  
  #include "VideoCommon/Present.h"
++#include <cstdlib>
++#ifdef __APPLE__
++#include "VideoCommon/TurbulenceMetalFX.h"
++#endif
 +#include "VideoCommon/TurbulenceViewport.h"
  
  #include "Common/ChunkFile.h"
  #include "Core/Config/GraphicsSettings.h"
-@@ -738,6 +739,8 @@
+@@ -738,6 +743,8 @@ void Presenter::UpdateDrawRectangle()
      g_Config.fAspectRatioHackH = 1;
    }
  
@@ -788,7 +1898,30 @@ diff --git a/Source/Core/VideoCommon/Present.cpp b/Source/Core/VideoCommon/Prese
    // The rendering window size
    const float win_width = static_cast<float>(m_backbuffer_width);
    const float win_height = static_cast<float>(m_backbuffer_height);
-@@ -906,6 +909,10 @@
+@@ -871,6 +878,17 @@ void Presenter::RenderXFBToScreen(const MathUtil::Rectangle<int>& target_rc,
+                                   const AbstractTexture* source_texture,
+                                   const MathUtil::Rectangle<int>& source_rc)
+ {
++#ifdef __APPLE__
++  if (g_backend_info.api_type == APIType::Metal && g_ActiveConfig.stereo_mode == StereoMode::Off) {
++    const auto width = target_rc.GetWidth(), height = target_rc.GetHeight();
++    if (width > 0 && height > 0) {
++      if (const auto* upscaled = TurbulenceMetalFX::Upscale(source_texture, source_rc, width, height)) {
++        m_post_processor->BlitFromTexture(target_rc, {0,0,width,height}, upscaled);
++        return;
++      }
++    }
++  }
++#endif
+   if (g_ActiveConfig.stereo_mode == StereoMode::QuadBuffer &&
+       g_backend_info.bUsesExplictQuadBuffering)
+   {
+@@ -901,11 +919,14 @@ void Presenter::RenderXFBToScreen(const MathUtil::Rectangle<int>& target_rc,
+ 
+ void Presenter::Present(PresentInfo* present_info)
+ {
+-  m_present_count++;
+ 
    if (g_gfx->IsHeadless() || (!m_onscreen_ui && !m_xfb_entry))
      return;
  
@@ -799,7 +1932,35 @@ diff --git a/Source/Core/VideoCommon/Present.cpp b/Source/Core/VideoCommon/Prese
    if (!g_gfx->SupportsUtilityDrawing())
    {
      // Video Software doesn't support drawing a UI or doing post-processing
+@@ -958,6 +979,14 @@ void Presenter::Present(PresentInfo* present_info)
+     {
+       const auto present_time = GetUpdatedPresentationTime(present_info->intended_present_time);
+ 
++      // Mode 2 exercises the split render/present command buffers in automated
++      // validation even when the current frame has no time left to wait.
++      static const bool force_early_submit = [] {
++        const char* value = std::getenv("TURBULENCE_EARLY_SUBMIT");
++        return value && *value == '2';
++      }();
++      if (force_early_submit || present_time - Clock::now() > std::chrono::milliseconds(1))
++        g_gfx->FlushBeforePresentationWait();
+       Core::System::GetInstance().GetCoreTiming().SleepUntil(present_time);
+ 
+       // Perhaps in the future a more accurate time can be acquired from the various backends.
+diff --git a/Source/Core/VideoCommon/Present.h b/Source/Core/VideoCommon/Present.h
+index 91ba870..3eecaa6 100644
+--- a/Source/Core/VideoCommon/Present.h
++++ b/Source/Core/VideoCommon/Present.h
+@@ -187,6 +187,7 @@ private:
+   // Used by the SmoothEarlyPresentation setting.
+   DT m_presentation_time_offset{};
+ 
++
+   // Calculated from the previous swap time and current refresh rate.
+   // Can be used for presentation of ImmediateXFB swaps which don't have timing information.
+   u64 m_next_swap_estimated_ticks = 0;
 diff --git a/Source/Core/VideoCommon/TextureCacheBase.cpp b/Source/Core/VideoCommon/TextureCacheBase.cpp
+index c5d6096..dca6e0e 100644
 --- a/Source/Core/VideoCommon/TextureCacheBase.cpp
 +++ b/Source/Core/VideoCommon/TextureCacheBase.cpp
 @@ -7,6 +7,7 @@
@@ -826,7 +1987,7 @@ diff --git a/Source/Core/VideoCommon/TextureCacheBase.cpp b/Source/Core/VideoCom
  
  static const u64 TEXHASH_INVALID = 0;
  // Sonic the Fighters (inside Sonic Gems Collection) loops a 64 frames animation
-@@ -1233,6 +1236,30 @@
+@@ -1233,6 +1236,30 @@ private:
  
  TCacheEntry* TextureCacheBase::Load(u32 stage)
  {
@@ -857,7 +2018,7 @@ diff --git a/Source/Core/VideoCommon/TextureCacheBase.cpp b/Source/Core/VideoCom
    if (auto entry = LoadImpl(stage, false))
    {
      if (!DidLinkedAssetsChange(*entry))
-@@ -1262,14 +1289,15 @@
+@@ -1262,14 +1289,15 @@ TCacheEntry* TextureCacheBase::LoadImpl(u32 stage, bool force_reload)
      //
      // Spyro: A Hero's Tail is known for (deliberately?) using such overwritten textures
      // in it's bloom effect, which breaks without giving it the invalidated texture.
@@ -875,7 +2036,7 @@ diff --git a/Source/Core/VideoCommon/TextureCacheBase.cpp b/Source/Core/VideoCom
      {
        return entry;
      }
-@@ -1463,11 +1491,14 @@
+@@ -1463,11 +1491,14 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
      else
      {
        // For normal textures, all texture parameters need to match
@@ -891,7 +2052,7 @@ diff --git a/Source/Core/VideoCommon/TextureCacheBase.cpp b/Source/Core/VideoCom
          entry = DoPartialTextureUpdates(iter->second, texture_info.GetTlutAddress(),
                                          texture_info.GetTlutFormat());
          if (entry)
-@@ -1583,6 +1614,16 @@
+@@ -1583,6 +1614,16 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
      }
    }
  
@@ -908,7 +2069,7 @@ diff --git a/Source/Core/VideoCommon/TextureCacheBase.cpp b/Source/Core/VideoCom
    std::string texture_name = "";
  
    if (g_ActiveConfig.bGraphicMods)
-@@ -1602,6 +1643,18 @@
+@@ -1602,6 +1643,18 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
        CreateTextureEntry(TextureCreationInfo{base_hash, full_hash, bytes_per_block, palette_size},
                           texture_info, textureCacheSafetyColorSampleSize, custom_texture_data.get(),
                           has_arbitrary_mipmaps, skip_texture_dump);
@@ -927,7 +2088,7 @@ diff --git a/Source/Core/VideoCommon/TextureCacheBase.cpp b/Source/Core/VideoCom
    entry->hires_texture = std::move(hires_texture);
    entry->last_load_time = load_time;
    entry->texture_info_name = std::move(texture_name);
-@@ -1759,7 +1812,14 @@
+@@ -1759,7 +1812,14 @@ RcTcacheEntry TextureCacheBase::CreateTextureEntry(
  
      entry->has_arbitrary_mips = arbitrary_mip_detector.HasArbitraryMipmaps(dst_buffer);
  
@@ -943,7 +2104,7 @@ diff --git a/Source/Core/VideoCommon/TextureCacheBase.cpp b/Source/Core/VideoCom
      {
        const std::string basename = texture_info.CalculateTextureName().GetFullName();
        if (g_ActiveConfig.bDumpBaseTextures)
-@@ -2209,8 +2269,8 @@
+@@ -2209,8 +2269,8 @@ void TextureCacheBase::CopyRenderTargetToTexture(
    {
      tex_w /= 2;
      tex_h /= 2;
@@ -954,31 +2115,56 @@ diff --git a/Source/Core/VideoCommon/TextureCacheBase.cpp b/Source/Core/VideoCom
    }
  
    if (!is_xfb_copy && !g_ActiveConfig.bCopyEFBScaled)
+diff --git a/Source/Core/VideoCommon/TextureCacheBase.h b/Source/Core/VideoCommon/TextureCacheBase.h
+index d596f84..f85eabd 100644
+--- a/Source/Core/VideoCommon/TextureCacheBase.h
++++ b/Source/Core/VideoCommon/TextureCacheBase.h
+@@ -131,6 +131,7 @@ struct TCacheEntry
+   u32 memory_stride = 0;
+   bool is_efb_copy = false;
+   bool is_custom_tex = false;
++  bool turbulence_aspect_locked_art = false;
+   bool may_have_overlapping_textures = true;
+   // indicates that the mips in this texture are arbitrary content, aren't just downscaled
+   bool has_arbitrary_mips = false;
+@@ -180,6 +181,7 @@ struct TCacheEntry
+   void SetGeneralParameters(u32 _addr, u32 _size, TextureAndTLUTFormat _format,
+                             bool force_safe_hashing)
+   {
++    turbulence_aspect_locked_art = false;
+     addr = _addr;
+     size_in_bytes = _size;
+     format = _format;
 diff --git a/Source/Core/VideoCommon/TurbulencePresentTimes.h b/Source/Core/VideoCommon/TurbulencePresentTimes.h
 new file mode 100644
+index 0000000..1c6b83d
 --- /dev/null
 +++ b/Source/Core/VideoCommon/TurbulencePresentTimes.h
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,42 @@
 +// Turbulence diagnostic (from ReFare): on-glass present times reported by the
 +// video backend (Metal: MTLDrawable.presentedTime, host-clock seconds; 0 when
-+// a frame was dropped). Lock-free ring written by the presentation callback,
++// a frame was dropped). Ring published by presentation callbacks,
 +// read by the frame pacing recorder.
 +#pragma once
 +
 +#include <array>
 +#include <atomic>
 +#include <cstdint>
++#include <mutex>
 +
 +namespace TurbulencePresentTimes
 +{
 +struct Ring
 +{
++  std::mutex producers;
 +  std::array<std::atomic<double>, 512> seconds{};
 +  std::atomic<uint64_t> head{0};
 +  std::atomic<double> drawable_wait_ms{0};
 +  std::atomic<double> submit_ms{0};
 +  std::atomic<uint64_t> drawable_requests{0};
 +  std::atomic<uint64_t> drawable_failures{0};
++  std::atomic<uint64_t> early_render_submits{0};
++  std::atomic<double> clock_offset_seconds{0};
 +};
 +
 +inline Ring& Get()
@@ -990,6 +2176,8 @@ new file mode 100644
 +inline void Push(double presented_seconds)
 +{
 +  Ring& ring = Get();
++  // Drawable callbacks may be delivered from different driver threads.
++  std::lock_guard lock(ring.producers);
 +  const uint64_t index = ring.head.load(std::memory_order_relaxed);
 +  ring.seconds[index % ring.seconds.size()].store(presented_seconds, std::memory_order_relaxed);
 +  ring.head.store(index + 1, std::memory_order_release);
@@ -997,6 +2185,7 @@ new file mode 100644
 +}  // namespace TurbulencePresentTimes
 diff --git a/Source/Core/VideoCommon/TurbulencePromptTextures.cpp b/Source/Core/VideoCommon/TurbulencePromptTextures.cpp
 new file mode 100644
+index 0000000..828b395
 --- /dev/null
 +++ b/Source/Core/VideoCommon/TurbulencePromptTextures.cpp
 @@ -0,0 +1,141 @@
@@ -1143,6 +2332,7 @@ new file mode 100644
 +}  // namespace TurbulencePromptTextures
 diff --git a/Source/Core/VideoCommon/TurbulencePromptTextures.h b/Source/Core/VideoCommon/TurbulencePromptTextures.h
 new file mode 100644
+index 0000000..978b191
 --- /dev/null
 +++ b/Source/Core/VideoCommon/TurbulencePromptTextures.h
 @@ -0,0 +1,70 @@
@@ -1216,7 +2406,24 @@ new file mode 100644
 +// Whether a texture of this size/format could be a registered prompt.
 +bool MayMatch(u32 width, u32 height, u32 gx_format);
 +}  // namespace TurbulencePromptTextures
+diff --git a/Source/Core/VideoCommon/VertexLoaderBase.cpp b/Source/Core/VideoCommon/VertexLoaderBase.cpp
+index 98eb651..41e7102 100644
+--- a/Source/Core/VideoCommon/VertexLoaderBase.cpp
++++ b/Source/Core/VideoCommon/VertexLoaderBase.cpp
+@@ -235,6 +235,11 @@ u32 VertexLoaderBase::GetVertexComponents(const TVtxDesc& vtx_desc, const VAT& v
+ std::unique_ptr<VertexLoaderBase> VertexLoaderBase::CreateVertexLoader(const TVtxDesc& vtx_desc,
+                                                                        const VAT& vtx_attr)
+ {
++#if defined(TURBULENCE_IOS)
++  // CPU vertex conversion must not allocate executable pages on sideloaded iOS.
++  // (Android may: it uses the ARM64 vertex loader like desktop.)
++  return std::make_unique<VertexLoader>(vtx_desc, vtx_attr);
++#endif
+   const VertexLoaderType loader_type = g_ActiveConfig.vertex_loader_type;
+ 
+   if (loader_type == VertexLoaderType::Software)
 diff --git a/Source/Core/VideoCommon/VertexManagerBase.cpp b/Source/Core/VideoCommon/VertexManagerBase.cpp
+index 2bc6d58..df99704 100644
 --- a/Source/Core/VideoCommon/VertexManagerBase.cpp
 +++ b/Source/Core/VideoCommon/VertexManagerBase.cpp
 @@ -2,9 +2,15 @@
@@ -1243,7 +2450,7 @@ diff --git a/Source/Core/VideoCommon/VertexManagerBase.cpp b/Source/Core/VideoCo
  #include "VideoCommon/VertexLoaderManager.h"
  #include "VideoCommon/VertexShaderManager.h"
  #include "VideoCommon/VideoBackendBase.h"
-@@ -432,6 +439,59 @@
+@@ -432,6 +439,59 @@ BitSet32 VertexManagerBase::UsedTextures() const
    return usedtextures;
  }
  
@@ -1303,7 +2510,7 @@ diff --git a/Source/Core/VideoCommon/VertexManagerBase.cpp b/Source/Core/VideoCo
  void VertexManagerBase::Flush()
  {
    if (m_is_flushed)
-@@ -562,6 +622,13 @@
+@@ -562,6 +622,13 @@ void VertexManagerBase::Flush()
    std::vector<std::string> texture_names;
    Common::SmallVector<u32, 8> texture_units;
    std::array<SamplerState, 8> samplers;
@@ -1317,7 +2524,7 @@ diff --git a/Source/Core/VideoCommon/VertexManagerBase.cpp b/Source/Core/VideoCo
    if (!m_cull_all)
    {
      if (!g_ActiveConfig.bGraphicMods)
-@@ -571,6 +638,8 @@
+@@ -571,6 +638,8 @@ void VertexManagerBase::Flush()
          const auto cache_entry = g_texture_cache->Load(i);
          if (!cache_entry)
            continue;
@@ -1326,7 +2533,7 @@ diff --git a/Source/Core/VideoCommon/VertexManagerBase.cpp b/Source/Core/VideoCo
          const float custom_tex_scale = cache_entry->GetWidth() / float(cache_entry->native_width);
          samplers[i] = TextureCacheBase::GetSamplerState(
              i, custom_tex_scale, cache_entry->is_custom_tex, cache_entry->has_arbitrary_mips);
-@@ -583,6 +652,8 @@
+@@ -583,6 +652,8 @@ void VertexManagerBase::Flush()
          const auto cache_entry = g_texture_cache->Load(i);
          if (cache_entry)
          {
@@ -1335,11 +2542,10 @@ diff --git a/Source/Core/VideoCommon/VertexManagerBase.cpp b/Source/Core/VideoCo
            if (!Common::Contains(texture_names, cache_entry->texture_info_name))
            {
              texture_names.push_back(cache_entry->texture_info_name);
-@@ -595,6 +666,63 @@
-         }
+@@ -596,6 +667,63 @@ void VertexManagerBase::Flush()
        }
      }
-+  }
+   }
 +  static const bool trace_textures = [] {
 +    const char* value = std::getenv("TURBULENCE_WS_TRACE");
 +    return value && *value == '1';
@@ -1396,13 +2602,15 @@ diff --git a/Source/Core/VideoCommon/VertexManagerBase.cpp b/Source/Core/VideoCo
 +        }))
 +      draw.mode = TurbulenceDraw2D::AspectLockedArt;
 +    g_turbulence_draw_2d = draw;
-   }
++  }
    vertex_shader_manager.SetConstants(texture_names, xf_state_manager);
    if (!bpmem.genMode.zfreeze)
+   {
 diff --git a/Source/Core/VideoCommon/VertexManagerBase.h b/Source/Core/VideoCommon/VertexManagerBase.h
+index 715dbee..d8bbbd4 100644
 --- a/Source/Core/VideoCommon/VertexManagerBase.h
 +++ b/Source/Core/VideoCommon/VertexManagerBase.h
-@@ -20,6 +20,17 @@
+@@ -20,6 +20,17 @@ class CustomShaderCache;
  class DataReader;
  class GeometryShaderManager;
  class NativeVertexFormat;
@@ -1420,7 +2628,7 @@ diff --git a/Source/Core/VideoCommon/VertexManagerBase.h b/Source/Core/VideoComm
  class PixelShaderManager;
  class PointerWrap;
  struct PortableVertexDeclaration;
-@@ -192,6 +203,9 @@
+@@ -192,6 +203,9 @@ protected:
    u32 GetRemainingIndices(OpcodeDecoder::Primitive primitive) const;
  
    void CalculateZSlope(NativeVertexFormat* format);
@@ -1431,6 +2639,7 @@ diff --git a/Source/Core/VideoCommon/VertexManagerBase.h b/Source/Core/VideoComm
  
    BitSet32 UsedTextures() const;
 diff --git a/Source/Core/VideoCommon/VertexShaderManager.cpp b/Source/Core/VideoCommon/VertexShaderManager.cpp
+index 6d69803..b4a6922 100644
 --- a/Source/Core/VideoCommon/VertexShaderManager.cpp
 +++ b/Source/Core/VideoCommon/VertexShaderManager.cpp
 @@ -2,11 +2,13 @@
@@ -1447,7 +2656,7 @@ diff --git a/Source/Core/VideoCommon/VertexShaderManager.cpp b/Source/Core/Video
  
  #include "Common/ChunkFile.h"
  #include "Common/CommonTypes.h"
-@@ -38,6 +40,56 @@
+@@ -38,6 +40,56 @@ void VertexShaderManager::Init()
    dirty = true;
  }
  
@@ -1504,7 +2713,7 @@ diff --git a/Source/Core/VideoCommon/VertexShaderManager.cpp b/Source/Core/Video
  Common::Matrix44 VertexShaderManager::LoadProjectionMatrix()
  {
    const auto& rawProjection = xfmem.projection.rawProjection;
-@@ -49,14 +101,20 @@
+@@ -49,14 +101,20 @@ Common::Matrix44 VertexShaderManager::LoadProjectionMatrix()
      const Common::Vec2 fov_multiplier = g_freelook_camera.IsActive() ?
                                              g_freelook_camera.GetFieldOfViewMultiplier() :
                                              Common::Vec2{1, 1};
@@ -1529,7 +2738,7 @@ diff --git a/Source/Core/VideoCommon/VertexShaderManager.cpp b/Source/Core/Video
      m_projection_matrix[7] = 0.0f;
  
      m_projection_matrix[8] = 0.0f;
-@@ -76,15 +134,19 @@
+@@ -76,15 +134,19 @@ Common::Matrix44 VertexShaderManager::LoadProjectionMatrix()
  
    case ProjectionType::Orthographic:
    {
@@ -1553,7 +2762,7 @@ diff --git a/Source/Core/VideoCommon/VertexShaderManager.cpp b/Source/Core/Video
  
      m_projection_matrix[8] = 0.0f;
      m_projection_matrix[9] = 0.0f;
-@@ -121,11 +183,13 @@
+@@ -121,11 +183,13 @@ Common::Matrix44 VertexShaderManager::LoadProjectionMatrix()
  
  void VertexShaderManager::SetProjectionMatrix(XFStateManager& xf_state_manager)
  {
@@ -1568,7 +2777,7 @@ diff --git a/Source/Core/VideoCommon/VertexShaderManager.cpp b/Source/Core/Video
    }
  }
  
-@@ -411,8 +475,10 @@
+@@ -411,8 +475,10 @@ void VertexShaderManager::SetConstants(std::span<const std::string> textures,
      }
    }
  
@@ -1596,10 +2805,10 @@ index fe30aa2..e3da818 100644
    Common::HookableEvent<u32> config_changed_event;
  
 diff --git a/module-template/CMakeLists.txt b/module-template/CMakeLists.txt
-index dac92e8..75e21f5 100644
+index dac92e8..4a94c8d 100644
 --- a/module-template/CMakeLists.txt
 +++ b/module-template/CMakeLists.txt
-@@ -39,15 +39,30 @@ set(MODULE_NAME "g${GAME_ID}_recomp")
+@@ -39,16 +39,32 @@ set(MODULE_NAME "g${GAME_ID}_recomp")
  
  find_package(Python3 REQUIRED COMPONENTS Interpreter)
  
@@ -1628,11 +2837,32 @@ index dac92e8..75e21f5 100644
    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/gen_module_tables.py"
            "${GENERATED_DIR}/generated.h" "${GENERATED_DIR}/generated_smc.txt"
 -          "${GENERATED_DIR}/main.dol"
+-  COMMENT "Generating module_tables.inc")
 +          "${GENERATED_DIR}/main.dol" ${REL_TABLE_DEPENDS}
-   COMMENT "Generating module_tables.inc")
++  COMMENT "Generating module_tables.inc"
++  VERBATIM)
  
  file(READ "${GENERATED_DIR}/generated.h" GENERATED_HEADER_TEXT)
-@@ -116,6 +131,33 @@ target_include_directories(${MODULE_NAME} PRIVATE
+ if(GENERATED_HEADER_TEXT MATCHES "DOLRECOMP_BACKEND_LLVM")
+@@ -84,7 +100,16 @@ if(NOT CHUNK_INPUTS)
+   message(FATAL_ERROR "DolRecomp output has no generated chunks in ${GENERATED_DIR}/chunks")
+ endif()
+ 
+-add_library(${MODULE_NAME} SHARED
++option(RECOMPCORE_MODULE_STATIC "Link the generated module into a signed application" OFF)
++if(RECOMPCORE_MODULE_STATIC)
++  set(RECOMPCORE_MODULE_LIBRARY_TYPE STATIC)
++else()
++  set(RECOMPCORE_MODULE_LIBRARY_TYPE SHARED)
++endif()
++if(CMAKE_SYSTEM_NAME STREQUAL "iOS" AND NOT RECOMPCORE_MODULE_STATIC)
++  message(FATAL_ERROR "iOS modules must be linked into the signed app: set RECOMPCORE_MODULE_STATIC=ON")
++endif()
++add_library(${MODULE_NAME} ${RECOMPCORE_MODULE_LIBRARY_TYPE}
+   module_export.c
+   "${MODULE_TABLES}"
+   "${GXRUNTIME_DIR}/src/core/cpu.c"
+@@ -116,6 +141,33 @@ target_include_directories(${MODULE_NAME} PRIVATE
    "${CHASSIS_ABI_DIR}"
    "${CMAKE_CURRENT_BINARY_DIR}")
  
@@ -1666,7 +2896,7 @@ index dac92e8..75e21f5 100644
  if(NOT WIN32)
    target_link_libraries(${MODULE_NAME} PRIVATE m)
  endif()
-@@ -172,3 +214,14 @@ elseif(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+@@ -172,3 +224,14 @@ elseif(CMAKE_C_COMPILER_ID STREQUAL "GNU")
    target_compile_options(${MODULE_NAME} PRIVATE
      -O${RECOMPCORE_MODULE_OPT_LEVEL} -ffp-contract=off -fno-fast-math)
  endif()
@@ -1945,19 +3175,93 @@ index 0000000..0fb1a8a
 +{
 +    return DOLRECOMP_ENTRY_POINT;
 +}
-diff --git a/Source/Core/VideoCommon/Present.h b/Source/Core/VideoCommon/Present.h
---- a/Source/Core/VideoCommon/Present.h
-+++ b/Source/Core/VideoCommon/Present.h
-@@ -187,6 +187,7 @@
-   // Used by the SmoothEarlyPresentation setting.
-   DT m_presentation_time_offset{};
- 
+diff --git a/GXRuntime/include/core/psq_scale.h b/GXRuntime/include/core/psq_scale.h
+new file mode 100644
+index 0000000..8341fa5
+--- /dev/null
++++ b/GXRuntime/include/core/psq_scale.h
+@@ -0,0 +1,14 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++/* Exact GQR power-of-two factors. GQR scales are signed six-bit values;
++ * dequantization negates them, giving the inclusive range [-32, 32]. */
++#ifndef GXRUNTIME_PSQ_SCALE_H
++#define GXRUNTIME_PSQ_SCALE_H
++#include <stdint.h>
++#include <string.h>
++static inline float psq_scale_factor(int scale) {
++    const uint32_t bits = (uint32_t)(127 + scale) << 23;
++    float factor;
++    memcpy(&factor, &bits, sizeof(factor));
++    return factor;
++}
++#endif
+diff --git a/Source/Core/AudioCommon/IOSSoundStream.mm b/Source/Core/AudioCommon/IOSSoundStream.mm
+new file mode 100644
+index 0000000..2f75521
+--- /dev/null
++++ b/Source/Core/AudioCommon/IOSSoundStream.mm
+@@ -0,0 +1,58 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++#include "AudioCommon/SoundStream.h"
++#include <AudioToolbox/AudioToolbox.h>
++#include <algorithm>
++#include <atomic>
++#include <cstring>
 +
-   // Calculated from the previous swap time and current refresh rate.
-   // Can be used for presentation of ImmediateXFB swaps which don't have timing information.
-   u64 m_next_swap_estimated_ticks = 0;
++namespace AudioCommon {
++namespace {
++class IOSSoundStream final : public SoundStream {
++  AudioUnit unit = nullptr;
++  std::atomic<float> volume{1.0f};
++  static OSStatus Render(void* context, AudioUnitRenderActionFlags*,
++                         const AudioTimeStamp*, UInt32, UInt32 frames,
++                         AudioBufferList* output) {
++    auto& self = *static_cast<IOSSoundStream*>(context);
++    if (!output || output->mNumberBuffers != 1 || !output->mBuffers[0].mData ||
++        output->mBuffers[0].mDataByteSize < frames * 4) return kAudio_ParamError;
++    auto* samples = static_cast<short*>(output->mBuffers[0].mData);
++    self.m_mixer->Mix(samples, frames);
++    const float gain = self.volume.load(std::memory_order_relaxed);
++    for (UInt32 i = 0; i < frames * 2; ++i) samples[i] = static_cast<short>(samples[i] * gain);
++    return noErr;
++  }
++public:
++  ~IOSSoundStream() override {
++    if (unit) { AudioOutputUnitStop(unit); AudioUnitUninitialize(unit); AudioComponentInstanceDispose(unit); }
++  }
++  bool Init() override {
++    AudioComponentDescription description{};
++    description.componentType = kAudioUnitType_Output;
++    description.componentSubType = kAudioUnitSubType_RemoteIO;
++    description.componentManufacturer = kAudioUnitManufacturer_Apple;
++    auto component = AudioComponentFindNext(nullptr, &description);
++    if (!component || AudioComponentInstanceNew(component, &unit) != noErr) return false;
++    AudioStreamBasicDescription format{};
++    format.mSampleRate = 48000;
++    format.mFormatID = kAudioFormatLinearPCM;
++    format.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
++    format.mFramesPerPacket = 1;
++    format.mChannelsPerFrame = 2;
++    format.mBitsPerChannel = 16;
++    format.mBytesPerPacket = format.mBytesPerFrame = 4;
++    if (AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input,
++                             0, &format, sizeof(format)) != noErr) return false;
++    AURenderCallbackStruct callback{Render, this};
++    if (AudioUnitSetProperty(unit, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input,
++                             0, &callback, sizeof(callback)) != noErr) return false;
++    return AudioUnitInitialize(unit) == noErr;
++  }
++  bool SetRunning(bool running) override {
++    return unit && (running ? AudioOutputUnitStart(unit) : AudioOutputUnitStop(unit)) == noErr;
++  }
++  void SetVolume(int value) override { volume.store(std::clamp(value, 0, 100) / 100.0f); }
++};
++}
++std::unique_ptr<SoundStream> CreateIOSSoundStream() { return std::make_unique<IOSSoundStream>(); }
++}
 diff --git a/Source/Core/Common/CursorAutoHide.h b/Source/Core/Common/CursorAutoHide.h
 new file mode 100644
+index 0000000..a0253c1
 --- /dev/null
 +++ b/Source/Core/Common/CursorAutoHide.h
 @@ -0,0 +1,33 @@
@@ -1994,405 +3298,222 @@ new file mode 100644
 +  bool m_active = false;
 +};
 +}  // namespace Common
-diff --git a/Source/Core/DolphinNoGUI/PlatformWin32.cpp b/Source/Core/DolphinNoGUI/PlatformWin32.cpp
---- a/Source/Core/DolphinNoGUI/PlatformWin32.cpp
-+++ b/Source/Core/DolphinNoGUI/PlatformWin32.cpp
-@@ -2,6 +2,7 @@
- // SPDX-License-Identifier: GPL-2.0-or-later
- 
- #include "DolphinNoGUI/Platform.h"
-+#include "Common/CursorAutoHide.h"
- 
- #include "Core/Config/MainSettings.h"
- #include "Core/Config/ConfigManager.h"
-@@ -68,6 +69,10 @@
-   void UpdateWindowPosition();
-   void ProcessEvents();
- 
-+  Common::CursorAutoHide m_cursor_timer;
-+  POINT m_last_mouse{LONG_MIN, LONG_MIN};
-+  bool m_cursor_hidden = false;
-+  bool m_mouse_activity = false;
-   HWND m_hwnd{};
-   HMENU m_menu{};
-   HMENU m_file_menu{};
-@@ -329,6 +334,26 @@
-     TranslateMessage(&msg);
-     DispatchMessage(&msg);
-   }
-+  POINT mouse{};
-+  if (!GetCursorPos(&mouse))
-+    return;
-+  const bool moved = mouse.x != m_last_mouse.x || mouse.y != m_last_mouse.y;
-+  m_last_mouse = mouse;
-+  POINT client = mouse;
-+  ScreenToClient(m_hwnd, &client);
-+  RECT bounds{};
-+  GetClientRect(m_hwnd, &bounds);
-+  const bool inside = PtInRect(&bounds, client) && WindowFromPoint(mouse) == m_hwnd;
-+  m_window_focus = GetForegroundWindow() == m_hwnd;
-+  const bool hide = m_cursor_timer.Update(Common::CursorAutoHide::Clock::now(),
-+      inside && m_window_focus && Core::GetState(Core::System::GetInstance()) != Core::State::Paused,
-+      moved || m_mouse_activity);
-+  m_mouse_activity = false;
-+  if (m_cursor_hidden != hide)
-+  {
-+    m_cursor_hidden = hide;
-+    SetCursor(hide ? nullptr : LoadCursor(nullptr, IDC_ARROW));
-+  }
- }
- 
- LRESULT PlatformWin32::WndProc(const HWND hwnd, const UINT msg, const WPARAM wParam,
-@@ -355,6 +380,22 @@
-     }
-   }
-   break;
-+
-+  case WM_SETCURSOR:
-+    if (platform && LOWORD(lParam) == HTCLIENT)
-+    {
-+      SetCursor(platform->m_cursor_hidden ? nullptr : LoadCursor(nullptr, IDC_ARROW));
-+      return TRUE;
-+    }
-+    break;
-+
-+  case WM_LBUTTONDOWN:
-+  case WM_RBUTTONDOWN:
-+  case WM_MBUTTONDOWN:
-+  case WM_MOUSEWHEEL:
-+    if (platform)
-+      platform->m_mouse_activity = true;
-+    break;
- 
-   case WM_SIZE:
-   {
-diff --git a/Source/Core/DolphinNoGUI/PlatformX11.cpp b/Source/Core/DolphinNoGUI/PlatformX11.cpp
---- a/Source/Core/DolphinNoGUI/PlatformX11.cpp
-+++ b/Source/Core/DolphinNoGUI/PlatformX11.cpp
-@@ -10,6 +10,7 @@
- static constexpr auto X_None = None;
- 
- #include "DolphinNoGUI/Platform.h"
-+#include "Common/CursorAutoHide.h"
- 
- #include "Common/MsgHandler.h"
- #include "Core/Config/MainSettings.h"
-@@ -49,10 +50,15 @@
-   void CloseDisplay();
-   void UpdateWindowPosition();
-   void ProcessEvents();
-+  void UpdateCursor();
- 
-   Display* m_display = nullptr;
-   Window m_window = {};
-   Cursor m_blank_cursor = X_None;
-+  Common::CursorAutoHide m_cursor_timer;
-+  bool m_pointer_inside = false;
-+  bool m_mouse_activity = false;
-+  bool m_cursor_hidden = false;
- #ifdef HAVE_XRANDR
-   X11Utils::XRRConfiguration* m_xrr_config = nullptr;
- #endif
-@@ -70,7 +76,7 @@
- 
-   if (m_display)
-   {
--    if (Config::Get(Config::MAIN_SHOW_CURSOR) == Config::ShowCursor::Never)
-+    if (m_blank_cursor != X_None)
-       XFreeCursor(m_display, m_blank_cursor);
- 
-     XCloseDisplay(m_display);
-@@ -89,7 +95,8 @@
- 
-   m_window = XCreateSimpleWindow(m_display, DefaultRootWindow(m_display), m_window_x, m_window_y,
-                                  m_window_width, m_window_height, 0, 0, BlackPixel(m_display, 0));
--  XSelectInput(m_display, m_window, StructureNotifyMask | KeyPressMask | FocusChangeMask);
-+  XSelectInput(m_display, m_window, StructureNotifyMask | KeyPressMask | FocusChangeMask |
-+      PointerMotionMask | EnterWindowMask | LeaveWindowMask | ButtonPressMask);
-   Atom wmProtocols[1];
-   wmProtocols[0] = XInternAtom(m_display, "WM_DELETE_WINDOW", True);
-   XSetWMProtocols(m_display, m_window, wmProtocols, 1);
-@@ -115,16 +122,14 @@
-   m_xrr_config = new X11Utils::XRRConfiguration(m_display, m_window);
- #endif
- 
--  if (Config::Get(Config::MAIN_SHOW_CURSOR) == Config::ShowCursor::Never)
--  {
--    // make a blank cursor
-+  {
-+    // Allocate once; only select the blank cursor after inactivity.
-     Pixmap Blank;
-     XColor DummyColor;
-     char ZeroData[1] = {0};
-     Blank = XCreateBitmapFromData(m_display, m_window, ZeroData, 1, 1);
-     m_blank_cursor = XCreatePixmapCursor(m_display, Blank, Blank, &DummyColor, &DummyColor, 0, 0);
-     XFreePixmap(m_display, Blank);
--    XDefineCursor(m_display, m_window, m_blank_cursor);
-   }
- 
-   // Enter fullscreen if enabled.
-@@ -153,6 +158,7 @@
-     UpdateRunningFlag();
-     Core::HostDispatchJobs(Core::System::GetInstance());
-     ProcessEvents();
-+    UpdateCursor();
-     UpdateWindowPosition();
- 
-     // TODO: Is this sleep appropriate?
-@@ -200,14 +206,10 @@
-       {
-         if (Core::GetState(Core::System::GetInstance()) == Core::State::Running)
-         {
--          if (Config::Get(Config::MAIN_SHOW_CURSOR) == Config::ShowCursor::Never)
--            XUndefineCursor(m_display, m_window);
-           Core::SetState(Core::System::GetInstance(), Core::State::Paused);
-         }
-         else
-         {
--          if (Config::Get(Config::MAIN_SHOW_CURSOR) == Config::ShowCursor::Never)
--            XDefineCursor(m_display, m_window, m_blank_cursor);
-           Core::SetState(Core::System::GetInstance(), Core::State::Running);
-         }
-       }
-@@ -243,20 +245,23 @@
-     case FocusIn:
-     {
-       m_window_focus = true;
--      if (Config::Get(Config::MAIN_SHOW_CURSOR) == Config::ShowCursor::Never &&
--          Core::GetState(Core::System::GetInstance()) != Core::State::Paused)
--      {
--        XDefineCursor(m_display, m_window, m_blank_cursor);
--      }
-+      m_mouse_activity = true;
-     }
-     break;
-     case FocusOut:
--    {
-       m_window_focus = false;
--      if (Config::Get(Config::MAIN_SHOW_CURSOR) == Config::ShowCursor::Never)
--        XUndefineCursor(m_display, m_window);
--    }
--    break;
-+      break;
-+    case EnterNotify:
-+      m_pointer_inside = true;
-+      m_mouse_activity = true;
-+      break;
-+    case LeaveNotify:
-+      m_pointer_inside = false;
-+      break;
-+    case MotionNotify:
-+    case ButtonPress:
-+      m_mouse_activity = true;
-+      break;
-     case ClientMessage:
-     {
-       if ((unsigned long)event.xclient.data.l[0] ==
-@@ -273,6 +278,24 @@
-     }
-   }
- }
-+
-+void PlatformX11::UpdateCursor()
-+{
-+  const bool hide = m_cursor_timer.Update(Common::CursorAutoHide::Clock::now(),
-+      m_window_focus && m_pointer_inside &&
-+          Core::GetState(Core::System::GetInstance()) != Core::State::Paused,
-+      m_mouse_activity);
-+  m_mouse_activity = false;
-+  if (hide == m_cursor_hidden)
-+    return;
-+  m_cursor_hidden = hide;
-+  if (hide)
-+    XDefineCursor(m_display, m_window, m_blank_cursor);
-+  else
-+    XUndefineCursor(m_display, m_window);
-+  XFlush(m_display);
-+}
-+
- }  // namespace
- 
- std::unique_ptr<Platform> Platform::CreateX11Platform()
-diff --git a/Source/Core/DolphinNoGUI/PlatformWayland.cpp b/Source/Core/DolphinNoGUI/PlatformWayland.cpp
---- a/Source/Core/DolphinNoGUI/PlatformWayland.cpp
-+++ b/Source/Core/DolphinNoGUI/PlatformWayland.cpp
-@@ -2,6 +2,7 @@
- // SPDX-License-Identifier: GPL-2.0-or-later
- 
- #include "DolphinNoGUI/Platform.h"
-+#include "Common/CursorAutoHide.h"
- 
- #include <algorithm>
- #include <cerrno>
-@@ -72,9 +73,24 @@
-   static void PointerEnter(void* data, wl_pointer*, uint32_t serial, wl_surface* surface,
-                            wl_fixed_t, wl_fixed_t);
-   static void PointerLeave(void* data, wl_pointer*, uint32_t, wl_surface* surface);
--  static void PointerMotion(void*, wl_pointer*, uint32_t, wl_fixed_t, wl_fixed_t) {}
--  static void PointerButton(void*, wl_pointer*, uint32_t, uint32_t, uint32_t, uint32_t) {}
--  static void PointerAxis(void*, wl_pointer*, uint32_t, uint32_t, wl_fixed_t) {}
-+  static void PointerMotion(void* data, wl_pointer*, uint32_t, wl_fixed_t, wl_fixed_t)
-+  {
-+    auto* platform = static_cast<PlatformWayland*>(data);
-+    platform->m_mouse_activity = true;
-+    platform->UpdateCursor();
-+  }
-+  static void PointerButton(void* data, wl_pointer*, uint32_t, uint32_t, uint32_t, uint32_t)
-+  {
-+    auto* platform = static_cast<PlatformWayland*>(data);
-+    platform->m_mouse_activity = true;
-+    platform->UpdateCursor();
-+  }
-+  static void PointerAxis(void* data, wl_pointer*, uint32_t, uint32_t, wl_fixed_t)
-+  {
-+    auto* platform = static_cast<PlatformWayland*>(data);
-+    platform->m_mouse_activity = true;
-+    platform->UpdateCursor();
-+  }
-   static void PointerFrame(void*, wl_pointer*) {}
-   static void PointerAxisSource(void*, wl_pointer*, uint32_t) {}
-   static void PointerAxisStop(void*, wl_pointer*, uint32_t, uint32_t) {}
-@@ -115,6 +131,10 @@
-   wl_surface* m_cursor_surface = nullptr;
-   uint32_t m_pointer_serial = 0;
-   bool m_pointer_inside = false;
-+  Common::CursorAutoHide m_cursor_timer;
-+  bool m_mouse_activity = false;
-+  bool m_cursor_dirty = true;
-+  std::optional<bool> m_cursor_hidden;
- 
-   std::thread::id m_owner_thread;
-   std::mutex m_title_mutex;
-@@ -319,6 +339,7 @@
-     UpdateRunningFlag();
-     Core::HostDispatchJobs(Core::System::GetInstance());
-     ApplyPendingTitle();
-+    UpdateCursor();
-     if (!DispatchEvents())
-       break;
-   }
-@@ -529,6 +550,9 @@
-     m_pointer = nullptr;
-   }
-   m_pointer_inside = false;
-+  m_cursor_hidden.reset();
-+  m_cursor_dirty = true;
-+  m_cursor_timer.Update(Common::CursorAutoHide::Clock::now(), false, false);
- }
- 
- void PlatformWayland::KeyboardKeymap(void* data, wl_keyboard*, uint32_t format, int32_t fd,
-@@ -669,6 +693,8 @@
-   {
-     platform->m_pointer_inside = true;
-     platform->m_pointer_serial = serial;
-+    platform->m_mouse_activity = true;
-+    platform->m_cursor_dirty = true;
-     platform->UpdateCursor();
-   }
- }
-@@ -677,17 +703,25 @@
- {
-   auto* platform = static_cast<PlatformWayland*>(data);
-   if (surface == platform->m_surface)
-+  {
-     platform->m_pointer_inside = false;
-+    platform->UpdateCursor();
-+  }
- }
- 
- void PlatformWayland::UpdateCursor()
- {
-+  const bool hide = m_cursor_timer.Update(Common::CursorAutoHide::Clock::now(),
-+      m_pointer_inside && m_window_focus &&
-+          Core::GetState(Core::System::GetInstance()) != Core::State::Paused,
-+      m_mouse_activity);
-+  m_mouse_activity = false;
-   if (!m_pointer || !m_pointer_inside)
-     return;
--
--  const bool hide = m_window_focus &&
--                    Config::Get(Config::MAIN_SHOW_CURSOR) == Config::ShowCursor::Never &&
--                    Core::GetState(Core::System::GetInstance()) != Core::State::Paused;
-+  if (!m_cursor_dirty && m_cursor_hidden == hide)
-+    return;
-+  m_cursor_dirty = false;
-+  m_cursor_hidden = hide;
-   if (hide || !m_cursor_surface || !m_default_cursor || m_default_cursor->image_count == 0)
-   {
-     wl_pointer_set_cursor(m_pointer, m_pointer_serial, nullptr, 0, 0);
-diff --git a/Source/Core/VideoCommon/TurbulenceViewport.h b/Source/Core/VideoCommon/TurbulenceViewport.h
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/TurbulenceIdleWait.h b/Source/Core/Core/PowerPC/StaticRecomp/TurbulenceIdleWait.h
 new file mode 100644
+index 0000000..5479573
 --- /dev/null
-+++ b/Source/Core/VideoCommon/TurbulenceViewport.h
-@@ -0,0 +1,66 @@
++++ b/Source/Core/Core/PowerPC/StaticRecomp/TurbulenceIdleWait.h
+@@ -0,0 +1,23 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +#pragma once
-+
-+#include <atomic>
-+#include <bit>
-+#include <cmath>
++#include <array>
 +#include <cstdint>
++#include <string_view>
 +
-+namespace TurbulenceViewport
++namespace TurbulenceIdleWait
 +{
-+constexpr double OriginalAspect = 4.0 / 3.0;
-+constexpr double Pi = 3.14159265358979323846;
-+struct Scale
++constexpr std::uint32_t Address = 0x80010574;
++constexpr std::uint32_t QueueOffset = 0xffff8438; // -31688(r13), SDK ready queue bitmap
++constexpr std::array<std::uint32_t, 3> Instructions{0x800d8438, 0x28000000, 0x4182fff8};
++
++// Skip only an unchanged, interruptible scheduler idle poll with no runnable
++// threads and no exception already waiting for delivery. CoreTiming::Idle
++// advances to the next event, which can make a thread runnable again.
++inline bool CanAdvance(std::string_view game, std::uint32_t pc, std::uint32_t msr,
++                       std::uint32_t pending, std::uint32_t ready,
++                       const std::array<std::uint32_t, 3>& instructions)
 +{
-+  float width = 1.0f;
-+  float height = 1.0f;
++  return game == "GXEE8P" && pc == Address && (msr & 0x8000) != 0 &&
++         pending == 0 && ready == 0 && instructions == Instructions;
++}
++}  // namespace TurbulenceIdleWait
+diff --git a/Source/Core/VideoBackends/Metal/MTLFXScaler.h b/Source/Core/VideoBackends/Metal/MTLFXScaler.h
+new file mode 100644
+index 0000000..e39bb54
+--- /dev/null
++++ b/Source/Core/VideoBackends/Metal/MTLFXScaler.h
+@@ -0,0 +1,22 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++#pragma once
++#include <Metal/Metal.h>
++#include <memory>
++namespace Metal {
++// Render-thread-only owner. Encodes crop + spatial upscale on the caller's
++// command buffer, preserving ordering with game drawing and presentation.
++class FXSpatialScaler {
++public:
++  FXSpatialScaler();
++  ~FXSpatialScaler();
++  static bool Supported(id<MTLDevice> device);
++  id<MTLTexture> Encode(id<MTLDevice> device, id<MTLCommandBuffer> command,
++                       id<MTLTexture> source, unsigned x, unsigned y,
++                       unsigned width, unsigned height, unsigned output_width,
++                       unsigned output_height);
++  void Reset();
++private:
++  struct Impl;
++  std::unique_ptr<Impl> m_impl;
 +};
-+inline std::atomic<std::uint64_t> scale_bits{std::bit_cast<std::uint64_t>(Scale{})};
-+inline std::atomic<bool> camera_adjusted{false};
-+
-+inline void PublishScale(float width, float height)
-+{
-+  scale_bits.store(std::bit_cast<std::uint64_t>(Scale{width, height}), std::memory_order_relaxed);
 +}
-+inline Scale ReadScale()
-+{
-+  return std::bit_cast<Scale>(scale_bits.load(std::memory_order_relaxed));
+diff --git a/Source/Core/VideoBackends/Metal/MTLFXScaler.mm b/Source/Core/VideoBackends/Metal/MTLFXScaler.mm
+new file mode 100644
+index 0000000..70f30d3
+--- /dev/null
++++ b/Source/Core/VideoBackends/Metal/MTLFXScaler.mm
+@@ -0,0 +1,78 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++#include "MTLFXScaler.h"
++#include "MRCHelpers.h"
++#import <MetalFX/MetalFX.h>
++namespace Metal {
++struct FXSpatialScaler::Impl {
++  MRCOwned<id> scaler;
++  MRCOwned<id<MTLTexture>> input, output, array_view;
++  id<MTLDevice> device = nil;
++  unsigned width = 0, height = 0, out_width = 0, out_height = 0;
++  MTLPixelFormat format = MTLPixelFormatInvalid;
++};
++FXSpatialScaler::FXSpatialScaler() : m_impl(std::make_unique<Impl>()) {}
++FXSpatialScaler::~FXSpatialScaler() = default;
++void FXSpatialScaler::Reset() { m_impl = std::make_unique<Impl>(); }
++bool FXSpatialScaler::Supported(id<MTLDevice> device) {
++  if (@available(iOS 16.0, macOS 13.0, *))
++    return device && [MTLFXSpatialScalerDescriptor supportsDevice:device];
++  return false;
 +}
-+
-+inline bool IsFullscreenBackground(float left, float right, float top, float bottom,
-+                                   std::uint32_t vertices)
-+{
-+  constexpr float edge = 0.05f;
-+  return vertices == 4 && left <= -1.0f + edge && right >= 1.0f - edge &&
-+         top <= -1.0f + edge && bottom >= 1.0f - edge;
-+}
-+
-+// The game's perspective wrapper takes aspect in f1 and vertical FOV in
-+// 65536 units per turn in r4. Use the SAME Hor+/Vert+ view as the renderer,
-+// but construct it in guest RAM so the game's frustum tests see it too.
-+inline bool AdjustCamera(double& aspect, std::uint32_t& fov, Scale scale)
-+{
-+  if (!std::isfinite(aspect) || std::abs(aspect - OriginalAspect) > 0.01 ||
-+      !std::isfinite(scale.width) || !std::isfinite(scale.height) ||
-+      scale.width <= 0 || scale.height <= 0 || fov == 0 || fov >= 32768 ||
-+      (scale.width == 1.0f && scale.height == 1.0f))
-+    return false;
-+  aspect *= scale.height / scale.width;
-+  if (scale.height != 1.0f)
-+  {
-+    const double half_angle = fov * Pi / 65536.0;
-+    fov = static_cast<std::uint32_t>(std::lround(std::atan(std::tan(half_angle) / scale.height) *
-+                                               65536.0 / Pi));
++id<MTLTexture> FXSpatialScaler::Encode(id<MTLDevice> device, id<MTLCommandBuffer> command,
++                                     id<MTLTexture> source, unsigned x, unsigned y,
++                                     unsigned width, unsigned height,
++                                     unsigned output_width, unsigned output_height) {
++  if (!Supported(device) || !command || !source || !width || !height ||
++      !output_width || !output_height || x > source.width || y > source.height ||
++      width > source.width-x || height > source.height-y || source.sampleCount != 1 ||
++      output_width < width || output_height < height) return nil;
++  if (@available(iOS 16.0, macOS 13.0, *)) {
++    auto& state = *m_impl;
++    const auto format = source.pixelFormat;
++    if (!state.scaler || state.device != device || state.width != width || state.height != height ||
++        state.out_width != output_width || state.out_height != output_height || state.format != format) {
++      Reset();
++      auto descriptor = MRCTransfer([MTLFXSpatialScalerDescriptor new]);
++      descriptor.Get().inputWidth = width; descriptor.Get().inputHeight = height;
++      descriptor.Get().outputWidth = output_width; descriptor.Get().outputHeight = output_height;
++      descriptor.Get().colorTextureFormat = format; descriptor.Get().outputTextureFormat = format;
++      descriptor.Get().colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
++      auto scaler = MRCTransfer([descriptor newSpatialScalerWithDevice:device]);
++      if (!scaler) return nil;
++      auto texture = MRCTransfer([MTLTextureDescriptor new]);
++      texture.Get().textureType = MTLTextureType2D;
++      texture.Get().pixelFormat = format;
++      texture.Get().storageMode = MTLStorageModePrivate;
++      texture.Get().width = width; texture.Get().height = height;
++      texture.Get().usage = scaler.Get().colorTextureUsage | MTLTextureUsageShaderRead;
++      auto input = MRCTransfer([device newTextureWithDescriptor:texture]);
++      texture.Get().width = output_width; texture.Get().height = output_height;
++      texture.Get().usage = scaler.Get().outputTextureUsage | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
++      auto output = MRCTransfer([device newTextureWithDescriptor:texture]);
++      if (!input || !output) return nil;
++      auto view = MRCTransfer([output newTextureViewWithPixelFormat:format
++          textureType:MTLTextureType2DArray levels:NSMakeRange(0,1) slices:NSMakeRange(0,1)]);
++      if (!view) return nil;
++      input.Get().label = @"ReFare MetalFX cropped input";
++      output.Get().label = @"ReFare MetalFX spatial output";
++      m_impl->scaler = MRCRetain((id)scaler.Get());
++      m_impl->input = std::move(input); m_impl->output = std::move(output);
++      m_impl->array_view = std::move(view); m_impl->device = device;
++      m_impl->width = width; m_impl->height = height;
++      m_impl->out_width = output_width; m_impl->out_height = output_height; m_impl->format = format;
++    }
++    auto blit = [command blitCommandEncoder];
++    if (!blit) return nil;
++    [blit copyFromTexture:source sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(x,y,0)
++               sourceSize:MTLSizeMake(width,height,1) toTexture:m_impl->input
++         destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
++    [blit endEncoding];
++    id<MTLFXSpatialScaler> scaler = m_impl->scaler.Get();
++    scaler.colorTexture = m_impl->input; scaler.outputTexture = m_impl->output;
++    scaler.inputContentWidth = width; scaler.inputContentHeight = height;
++    [scaler encodeToCommandBuffer:command];
++    return m_impl->array_view;
 +  }
-+  return true;
++  return nil;
 +}
-+
-+inline bool ProjectionAlreadyAdjusted(float x_scale, float y_scale, Scale scale)
-+{
-+  if (!camera_adjusted.load(std::memory_order_relaxed) || x_scale == 0.0f)
-+    return false;
-+  const double expected = OriginalAspect * scale.height / scale.width;
-+  return std::isfinite(expected) &&
-+         std::abs(std::abs(y_scale / x_scale) - expected) < expected * 0.005;
 +}
-+}  // namespace TurbulenceViewport
+diff --git a/Source/Core/VideoBackends/Metal/MTLSpatialUpscaler.mm b/Source/Core/VideoBackends/Metal/MTLSpatialUpscaler.mm
+new file mode 100644
+index 0000000..95d4388
+--- /dev/null
++++ b/Source/Core/VideoBackends/Metal/MTLSpatialUpscaler.mm
+@@ -0,0 +1,48 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++#include "VideoCommon/TurbulenceMetalFX.h"
++#include "VideoBackends/Metal/MTLFXScaler.h"
++#include "VideoBackends/Metal/MTLTexture.h"
++#include "VideoBackends/Metal/MTLObjectCache.h"
++#include "VideoBackends/Metal/MTLStateTracker.h"
++#include "Common/Config/Config.h"
++#include "Core/Config/GraphicsSettings.h"
++#include <atomic>
++#include <cstdio>
++namespace TurbulenceMetalFX {
++namespace {
++std::atomic<Support> support{Support::NotReady};
++std::unique_ptr<Metal::FXSpatialScaler> scaler;
++std::unique_ptr<Metal::Texture> result;
++}
++Support GetSupport() { return support.load(); }
++void Initialize() {
++  result.reset(); scaler.reset();
++  support = Metal::FXSpatialScaler::Supported(Metal::g_device) ? Support::Available : Support::Unavailable;
++  std::fprintf(stderr,"[MetalFX] spatial upscaling %s\n",GetSupport() == Support::Available ? "available" : "unavailable on this OS/GPU");
++}
++void Shutdown() { result.reset(); scaler.reset(); support = Support::NotReady; }
++const AbstractTexture* Upscale(const AbstractTexture* source, const MathUtil::Rectangle<int>& region,
++                              unsigned width, unsigned height) {
++  if (!Config::Get(Config::GFX_METALFX_SPATIAL)) { result.reset(); scaler.reset(); return nullptr; }
++  if (GetSupport() != Support::Available || !source || source->GetLayers() != 1 ||
++      region.left < 0 || region.top < 0 || region.GetWidth() <= 0 || region.GetHeight() <= 0 ||
++      width < static_cast<unsigned>(region.GetWidth()) || height < static_cast<unsigned>(region.GetHeight()) ||
++      (width == static_cast<unsigned>(region.GetWidth()) && height == static_cast<unsigned>(region.GetHeight()))) return nullptr;
++  const auto* texture = static_cast<const Metal::Texture*>(source);
++  if (!scaler) scaler = std::make_unique<Metal::FXSpatialScaler>();
++  Metal::g_state_tracker->EndRenderPass();
++  auto output = scaler->Encode(Metal::g_device, Metal::g_state_tracker->GetRenderCmdBuf(), texture->GetMTLTexture(),
++                              region.left, region.top, region.GetWidth(), region.GetHeight(), width, height);
++  if (!output) {
++    support = Support::Failed;
++    result.reset(); scaler.reset();
++    std::fprintf(stderr,"[MetalFX] scaler initialization failed; using normal presentation\n");
++    return nullptr;
++  }
++  if (!result || result->GetMTLTexture() != output) {
++    TextureConfig config(width,height,1,1,1,source->GetFormat(),0,AbstractTextureType::Texture_2DArray);
++    result = std::make_unique<Metal::Texture>(MRCRetain(output),config);
++  }
++  return result.get();
++}
++}
+diff --git a/Source/Core/VideoCommon/TurbulenceMetalFX.h b/Source/Core/VideoCommon/TurbulenceMetalFX.h
+new file mode 100644
+index 0000000..ecf456d
+--- /dev/null
++++ b/Source/Core/VideoCommon/TurbulenceMetalFX.h
+@@ -0,0 +1,12 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++#pragma once
++#include "Common/MathUtil.h"
++class AbstractTexture;
++namespace TurbulenceMetalFX {
++enum class Support { NotReady, Unavailable, Available, Failed };
++Support GetSupport();
++void Initialize();
++void Shutdown();
++const AbstractTexture* Upscale(const AbstractTexture* source, const MathUtil::Rectangle<int>& region,
++                              unsigned width, unsigned height);
++}
 diff --git a/Source/Core/VideoCommon/TurbulenceTriggerCaption.h b/Source/Core/VideoCommon/TurbulenceTriggerCaption.h
 new file mode 100644
+index 0000000..0691896
 --- /dev/null
 +++ b/Source/Core/VideoCommon/TurbulenceTriggerCaption.h
 @@ -0,0 +1,79 @@
@@ -2475,114 +3596,75 @@ new file mode 100644
 +  }
 +}
 +}  // namespace TurbulencePromptTextures::Detail
-diff --git a/Source/Core/VideoCommon/TextureCacheBase.h b/Source/Core/VideoCommon/TextureCacheBase.h
---- a/Source/Core/VideoCommon/TextureCacheBase.h
-+++ b/Source/Core/VideoCommon/TextureCacheBase.h
-@@ -131,6 +131,7 @@
-   u32 memory_stride = 0;
-   bool is_efb_copy = false;
-   bool is_custom_tex = false;
-+  bool turbulence_aspect_locked_art = false;
-   bool may_have_overlapping_textures = true;
-   // indicates that the mips in this texture are arbitrary content, aren't just downscaled
-   bool has_arbitrary_mips = false;
-@@ -180,6 +181,7 @@
-   void SetGeneralParameters(u32 _addr, u32 _size, TextureAndTLUTFormat _format,
-                             bool force_safe_hashing)
-   {
-+    turbulence_aspect_locked_art = false;
-     addr = _addr;
-     size_in_bytes = _size;
-     format = _format;
-diff --git a/Source/Core/Core/PowerPC/StaticRecomp/TurbulenceIdleWait.h b/Source/Core/Core/PowerPC/StaticRecomp/TurbulenceIdleWait.h
+diff --git a/Source/Core/VideoCommon/TurbulenceViewport.h b/Source/Core/VideoCommon/TurbulenceViewport.h
 new file mode 100644
+index 0000000..d6e84c0
 --- /dev/null
-+++ b/Source/Core/Core/PowerPC/StaticRecomp/TurbulenceIdleWait.h
-@@ -0,0 +1,23 @@
++++ b/Source/Core/VideoCommon/TurbulenceViewport.h
+@@ -0,0 +1,66 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +#pragma once
-+#include <array>
++
++#include <atomic>
++#include <bit>
++#include <cmath>
 +#include <cstdint>
-+#include <string_view>
 +
-+namespace TurbulenceIdleWait
++namespace TurbulenceViewport
 +{
-+constexpr std::uint32_t Address = 0x80010574;
-+constexpr std::uint32_t QueueOffset = 0xffff8438; // -31688(r13), SDK ready queue bitmap
-+constexpr std::array<std::uint32_t, 3> Instructions{0x800d8438, 0x28000000, 0x4182fff8};
-+
-+// Skip only an unchanged, interruptible scheduler idle poll with no runnable
-+// threads and no exception already waiting for delivery. CoreTiming::Idle
-+// advances to the next event, which can make a thread runnable again.
-+inline bool CanAdvance(std::string_view game, std::uint32_t pc, std::uint32_t msr,
-+                       std::uint32_t pending, std::uint32_t ready,
-+                       const std::array<std::uint32_t, 3>& instructions)
++constexpr double OriginalAspect = 4.0 / 3.0;
++constexpr double Pi = 3.14159265358979323846;
++struct Scale
 +{
-+  return game == "GXEE8P" && pc == Address && (msr & 0x8000) != 0 &&
-+         pending == 0 && ready == 0 && instructions == Instructions;
-+}
-+}  // namespace TurbulenceIdleWait
-diff --git a/GXRuntime/src/core/cpu.c b/GXRuntime/src/core/cpu.c
---- a/GXRuntime/src/core/cpu.c
-+++ b/GXRuntime/src/core/cpu.c
-@@ -1,5 +1,6 @@
- // SPDX-License-Identifier: GPL-3.0-or-later
- #include "core/cpu.h"
-+#include "core/psq_scale.h"
- #include <stdio.h>
- #include <stdlib.h>
- #include <string.h>
-@@ -194,7 +195,7 @@
- static f64 psq_dequant(f64 value, s32 scale) {
-     if (scale == 0)
-         return (f64)(f32)value;
--    return (f64)(f32)ldexp(value, -scale);
-+    return (f64)((f32)value * psq_scale_factor(-scale));
- }
- 
- static f64 psq_load_value(CPUState* cpu, u32 ea, u8 type, s32 scale) {
-@@ -215,7 +216,7 @@
- }
- 
- static s64 psq_quantize_int(f64 value, s64 min_value, s64 max_value, s32 scale) {
--    f32 conv = (f32)value * ldexpf(1.0f, scale);
-+    f32 conv = (f32)value * psq_scale_factor(scale);
-     if (isnan(conv))
-         return 0;
-     if (conv <= (f32)min_value)
-@@ -283,6 +284,16 @@
-     if (size == 0) /* invalid GQR type: nothing is stored */
-         return true;
- 
-+    // MPEG pixel output is a pair of quantized unsigned bytes. Dispatch once
-+    // for the pair, rather than entering the general type switch per lane.
-+    // Keep normal byte writes so MMIO, reservations and journals still work.
-+    if (type == 4) {
-+        mem_write8(cpu, ea, (u8)psq_quantize_int(cpu->fpr[frS], 0, 255, scale));
-+        if (!w)
-+            mem_write8(cpu, ea + 1u, (u8)psq_quantize_int(cpu->ps1[frS], 0, 255, scale));
-+        return true;
-+    }
++  float width = 1.0f;
++  float height = 1.0f;
++};
++inline std::atomic<std::uint64_t> scale_bits{std::bit_cast<std::uint64_t>(Scale{})};
++inline std::atomic<bool> camera_adjusted{false};
 +
-     psq_store_value(cpu, ea, type, scale, cpu->fpr[frS]);
-     if (!w)
-         psq_store_value(cpu, ea + size, type, scale, cpu->ps1[frS]);
-diff --git a/GXRuntime/include/core/psq_scale.h b/GXRuntime/include/core/psq_scale.h
-new file mode 100644
---- /dev/null
-+++ b/GXRuntime/include/core/psq_scale.h
-@@ -0,0 +1,14 @@
-+// SPDX-License-Identifier: GPL-3.0-or-later
-+/* Exact GQR power-of-two factors. GQR scales are signed six-bit values;
-+ * dequantization negates them, giving the inclusive range [-32, 32]. */
-+#ifndef GXRUNTIME_PSQ_SCALE_H
-+#define GXRUNTIME_PSQ_SCALE_H
-+#include <stdint.h>
-+#include <string.h>
-+static inline float psq_scale_factor(int scale) {
-+    const uint32_t bits = (uint32_t)(127 + scale) << 23;
-+    float factor;
-+    memcpy(&factor, &bits, sizeof(factor));
-+    return factor;
++inline void PublishScale(float width, float height)
++{
++  scale_bits.store(std::bit_cast<std::uint64_t>(Scale{width, height}), std::memory_order_relaxed);
 +}
-+#endif
++inline Scale ReadScale()
++{
++  return std::bit_cast<Scale>(scale_bits.load(std::memory_order_relaxed));
++}
++
++inline bool IsFullscreenBackground(float left, float right, float top, float bottom,
++                                   std::uint32_t vertices)
++{
++  constexpr float edge = 0.05f;
++  return vertices == 4 && left <= -1.0f + edge && right >= 1.0f - edge &&
++         top <= -1.0f + edge && bottom >= 1.0f - edge;
++}
++
++// The game's perspective wrapper takes aspect in f1 and vertical FOV in
++// 65536 units per turn in r4. Use the SAME Hor+/Vert+ view as the renderer,
++// but construct it in guest RAM so the game's frustum tests see it too.
++inline bool AdjustCamera(double& aspect, std::uint32_t& fov, Scale scale)
++{
++  if (!std::isfinite(aspect) || std::abs(aspect - OriginalAspect) > 0.01 ||
++      !std::isfinite(scale.width) || !std::isfinite(scale.height) ||
++      scale.width <= 0 || scale.height <= 0 || fov == 0 || fov >= 32768 ||
++      (scale.width == 1.0f && scale.height == 1.0f))
++    return false;
++  aspect *= scale.height / scale.width;
++  if (scale.height != 1.0f)
++  {
++    const double half_angle = fov * Pi / 65536.0;
++    fov = static_cast<std::uint32_t>(std::lround(std::atan(std::tan(half_angle) / scale.height) *
++                                               65536.0 / Pi));
++  }
++  return true;
++}
++
++inline bool ProjectionAlreadyAdjusted(float x_scale, float y_scale, Scale scale)
++{
++  if (!camera_adjusted.load(std::memory_order_relaxed) || x_scale == 0.0f)
++    return false;
++  const double expected = OriginalAspect * scale.height / scale.width;
++  return std::isfinite(expected) &&
++         std::abs(std::abs(y_scale / x_scale) - expected) < expected * 0.005;
++}
++}  // namespace TurbulenceViewport

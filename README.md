@@ -193,3 +193,19 @@ make clean-tools     # DolRecomp/ModernGekko build trees only
 ## License
 
 DolRecomp and ModernGekko are each distributed under their own upstream licenses (see `lib/DolRecomp/LICENSE` and `lib/ModernGekko/LICENSE`, the latter GPL-3.0-or-later due to its Dolphin-derived runtime). No Nintendo disc image, extracted game data, keys, or copyrighted assets are part of this repository, bring your own legally-owned dump.
+
+## Android and iOS
+
+Turbulence now has mobile test hosts adapted from Crazy Taxi ReFare. Both
+statically link personal Sonic Riders USA main.dol and REL output and import
+disc assets on the device. They include touch controls and gamepad support.
+
+```sh
+python3 scripts/android.py --sdk "$ANDROID_HOME"
+python3 scripts/ios.py gameplay-app --ipa
+```
+
+Generated main/REL sources are found automatically in the local build outputs,
+or can be supplied explicitly. Packages are written to `build/release`.
+The iOS IPA requires personal signing. See [mobile build instructions](ports/README.md)
+for toolchain requirements, supported import formats and validation limits.

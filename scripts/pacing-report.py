@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Summarise a pacing-N.csv from the frame pacing recorder.
 
-On-glass intervals are what you see; submit latency is how late Dolphin
-presented each frame against its intended time (input lag + stutter source).
+On-glass intervals measure displayed pacing. Submission lateness compares
+the host deadline with submission time; it does not alone measure input lag
+or prove that rendered frames are queued.
 """
+from pathlib import Path
 import statistics
 import sys
 
@@ -11,8 +13,9 @@ import sys
 def main(path):
     glass, late, submissions, waits, flushes = [], [], [], [], []
     counters = []
+    early = []
     skipped = skip_run = longest_skip_run = 0
-    for line in open(path):
+    for line in Path(path).read_text().splitlines():
         parts = line.strip().split(",")
         if parts[0] == "glass":
             glass.append(float(parts[1]))
@@ -20,7 +23,7 @@ def main(path):
             intended, actual = float(parts[4]), float(parts[5])
             # Recovery skips and other early returns have no actual timestamp.
             # These never reach Metal, so its dropped count cannot see them.
-            if actual == -1.0:
+            if actual == -1.0 and parts[7] == "3":
                 skipped += 1
                 skip_run += 1
                 longest_skip_run = max(longest_skip_run, skip_run)
@@ -31,6 +34,8 @@ def main(path):
                 waits.append(float(parts[8]))
                 flushes.append(float(parts[9]))
                 counters.append(tuple(int(p) for p in parts[10:13]))
+            if len(parts) >= 14:
+                early.append(int(parts[13]))
             if intended >= 0 and actual >= 0:
                 late.append(actual - intended)
     # -1 marks a dropped frame; other values may be offset (display clock).
@@ -49,6 +54,8 @@ def main(path):
             delta = tuple(b - a for a, b in zip(counters[0], counters[-1]))
             print(f"  backend deltas: drawable requests {delta[0]}, unavailable {delta[1]}, "
                   f"display callbacks {delta[2]}")
+    if len(early) > 1:
+        print(f"  early render submissions: {early[-1] - early[0]}")
     if not iv:
         print(path, f"no on-glass intervals ({len(glass)} callbacks; "
               f"{dropped} reported not displayed)")

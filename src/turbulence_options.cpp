@@ -93,7 +93,11 @@ const std::vector<Row>& Rows() {
 #ifdef __APPLE__
     Row::MetalHUD,
 #endif
-    Row::Prompts, Row::MenuButton, Row::Exit};
+    Row::Prompts,
+#if !defined(TURBULENCE_IOS) && !defined(TURBULENCE_ANDROID)
+    Row::MenuButton,
+#endif
+    Row::Exit};
   return rows;
 }
 const char* RowLabel(Row row) {

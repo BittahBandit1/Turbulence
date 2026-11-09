@@ -260,3 +260,106 @@ First optimized module playback comparison: source frame positions were 3.9 / 33
 Final validation and launch selection: restored Metal's three-image drawable pool, retaining the existing minimum-duration presentation and normal emulation speed limit. Compared with two images, it improves sustained movie throughput while preserving cadence. Final source-image matches at elapsed 10 / 40 / 70 / 100 seconds were 3.875 / 33.750 / 63.083 / 92.792 source seconds. Between elapsed 40 and 100, source playback advanced at 98.4% real time versus 91.7% for the baseline. The final 600-frame samples measured 95.5% and 97.2% on cadence; the later sample had no >=2-frame hitch and no dropped frames. The source comparison identifies the actual movie frames, independent of the emulator FPS display. Small pacing dips remain; do not describe it as perfectly locked.
 
 The complete movie finished and returned to the title screen. The paired-byte module also ran into the attract race: zero interpreter fallback steps and zero SMC failures; the modern turbulence stick appeared in the demo. Final artifacts are `build/fmv-validation/final/`, including report.json and runtime.log. `active-module.txt` now selects the new, separately stored native module; the previous selection is retained in `active-module-before-fmv.txt`. Normal sound remains at volume 100; all validation runs used session-only mute. The unsigned-byte PSQ pair sanitizer test also checks every GQR scale, single/pair writes, NaN/infinities, saturation and disabled-LSQE rejection. GXRuntime's existing test suite passes.
+
+## Mobile ports and pacing polish — November 8, 2026
+
+Adapted Crazy Taxi ReFare's local Android/iOS hosts and mobile runtime patches
+into Turbulence. The source reference was the neighboring Crazy Taxi
+Recompilation (ReFare) workspace; that project was not edited. Mobile source,
+GPL attribution and build instructions live in `ports/README.md` and
+`ports/COPYING`.
+
+Both personal gameplay apps statically link the matching GXEE8P main.dol and
+_Main.rel generated code. Runtime compilation/dynamic game-module loading is
+disabled. iOS disables executable JIT fallback and uses interpreter fallback,
+Metal, native AVAudioEngine audio and retained UIKit surfaces. Android uses
+Vulkan, AAudio, JNI and its activity lifecycle. Both have ISO/GCM/GameCube CISO
+importers with DOL/REL revision checks, touch/controller input, automatic
+PlayStation/Xbox prompts respecting manual preferences, pause/resume and the
+existing options menu. Touch input is Sonic Riders specific: A jump, B boost,
+independent L/R drift, analog movement (Android) or direction pad (iOS), Start.
+R1 opens options. Mobile hides the unsupported desktop button-rebinding row.
+
+Built and validated:
+
+- `build/release/Turbulence-Android-arm64-test.apk`: debug signed, signatures
+  verified by apksigner; ARM64 native libraries have verified 16 KiB ELF segment alignment.
+- `build/release/Turbulence-Gameplay-0.1.0-iOS15-arm64-unsigned.ipa`: physical
+  ARM64 iPhone/iPad target, iOS 15 minimum, executable/load-command checks pass.
+  Requires personal signing before installation.
+- Both contain system resources and native code, with no raw main.dol,
+  _Main.rel or extracted game assets. Import a personal matching USA revision 0
+  disc on the device. No physical-device gameplay, audio, thermal or pacing
+  performance has been verified in this session.
+
+Android SDK/NDK tools were reused read-only from ReFare's build/android-sdk;
+all Turbulence outputs and signing keys are in this workspace's ignored build
+folder. iOS uses installed Xcode. SwiftUI macro compilation requires its own
+protected compiler subprocess, so the final iOS build ran outside the restricted
+execution environment. Normal desktop playback remains audible.
+
+Validation: Android importer tests pass with synthetic ISO/CISO data; Swift
+importer tests pass including file coordination; Swift touch-layout/input
+checks pass for landscape phones, portrait and tablets; generated-source
+selection rejects missing/wrong game output. Both device targets compile and
+package. `scripts/validate-mobile.py` checks architecture, iOS deployment,
+Android ELF page alignment, resources and absence of raw game executables.
+Vendor patches reverse-apply cleanly, including the separate watcher iOS shim.
+Patch export no longer stages vendor files and now includes new files.
+
+Pacing changes:
+
+- Bound GXEE8P's obsolete host-deadline allowance to 20 ms (previous default
+  100 ms) instead of dropping rendered frames after a stall.
+- Metal can commit rendering before a host presentation wait longer than
+  1 ms, keeping GPU work out of the timer's critical path. Normal submission is
+  unchanged when there is no useful wait. `TURBULENCE_EARLY_SUBMIT=0` disables
+  this path; `2` forces it solely for command-buffer validation.
+- Convert Core Animation presentation timestamps to the recorder's Clock
+  epoch. Serialize callback writers, bound overwritten-ring reads, and fix the
+  duplicate presentation-counter increment. Reports distinguish valid negative
+  submission offsets from unknown timestamps and count early submissions.
+
+A/B validation uses the same saved attract-race state in
+`build/pacing-polish-20261108`, with mobile compilers paused for measurement.
+Both baseline and candidate ran around 59.9 FPS with 16.683 ms mean CPU
+submission intervals, no unsubmitted frames, no native code verification
+failures and zero interpreter fallback steps. The normal race samples had no
+host waits over 1 ms, so the early-commit hook did not activate there. Forced
+validation exercised 599 early submissions in a 600-frame sample and exited
+normally with zero SMC failures.
+
+All automated Metal callbacks were reported not displayed in this session.
+These results establish submission stability and regression coverage, not
+improved visible pacing. A user foreground capture was requested; displayed
+frame cadence and the effect after actual display stalls remain pending.
+Do not describe pacing as perfect or assert an on-glass gain from these tests.
+
+Presentation timestamp conversion now takes a fixed epoch calibration at the
+first valid display callback in each capture. Native timestamps remain intact,
+so callback scheduling delays cannot introduce artificial interval jitter.
+
+## RP Nova Android handoff — 2026-11-08
+
+Installed the debug-signed Android APK on Retroid Pocket Nova (ADB serial
+28c0cb0f), Android 13/API 33, QCS8550, landscape 1280x960. The fresh install
+opened successfully. Reconstructed a private test ISO from the existing
+extracted USA revision 0 assets and exercised the on-device importer: 1669
+files imported and verified. Imported assets remain in the app sandbox.
+The temporary device ISO was removed and the app force-stopped for handoff.
+
+Native ARM64 runtime and Vulkan booted; AAudio opened at 48 kHz stereo and
+reported non-silent output. Screenshots show the intro playing. Intro frame
+counters were around 43–50 FPS after startup, below full speed. Actual
+SurfaceFlinger timestamps were available (display period 8,333,333 ns), but
+no sustained gameplay/pacing measurement was completed. Do not claim full
+speed or complete feature parity from this test.
+
+Investigate next: gameplay.log reports `idle wait PC=0x00000000` although
+files/Sys/GameSettings/GXEE8P.ini includes StaticRecompIdlePC=0x80010574.
+Determine why that game configuration is not effective at core initialization.
+Start events reached the native pad (1000 pressed, 0000 released), but the
+intro remained visible; racing, physical controls, prompts, options, audio
+quality, suspend/resume and thermals still need device verification. Local
+screenshots and private reconstructed disc are under ignored build/rp-nova.
+Android work was stopped at the user's request for Claude to continue.
