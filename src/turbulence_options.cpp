@@ -9,13 +9,20 @@
 #include "Common/IniFile.h"
 #include "Core/Config/GraphicsSettings.h"
 #include "Core/Host.h"
+#include "Core/System.h"
 #include "InputCommon/ControllerInterface/ControllerInterface.h"
+#include "VideoCommon/PerformanceMetrics.h"
+#include "VideoCommon/Present.h"
 #include "VideoCommon/VideoConfig.h"
 #include "VideoCommon/VideoEvents.h"
 #include "imgui.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <mutex>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -86,13 +93,14 @@ constexpr const char* kPromptLabels[] = {"Automatic", "GameCube", "Xbox", "PlayS
 // Dolphin post-processing shader shipped in Sys/Shaders/FXAA.glsl.
 constexpr const char* kFXAAShader = "FXAA";
 
-enum class Row { Scale, Aspect, HudLayout, FXAA, VSync, MetalHUD, Prompts, MenuButton, Exit };
+enum class Row { Scale, Aspect, HudLayout, FXAA, VSync, MetalHUD, PerfOverlay, Prompts, MenuButton, Exit };
 const std::vector<Row>& Rows() {
   static const std::vector<Row> rows = {Row::Scale, Row::Aspect, Row::HudLayout, Row::FXAA,
     Row::VSync,
 #ifdef __APPLE__
     Row::MetalHUD,
 #endif
+    Row::PerfOverlay,
     Row::Prompts,
 #if !defined(TURBULENCE_IOS) && !defined(TURBULENCE_ANDROID)
     Row::MenuButton,
@@ -108,6 +116,7 @@ const char* RowLabel(Row row) {
   case Row::FXAA: return "FXAA";
   case Row::VSync: return "V-Sync";
   case Row::MetalHUD: return "Metal HUD";
+  case Row::PerfOverlay: return "FPS counter";
   case Row::Prompts: return "Button prompts";
   case Row::MenuButton: return "Options menu button";
   case Row::Exit: return "Exit The Game";
@@ -214,6 +223,85 @@ bool SaveTurbulenceIni(const std::filesystem::path& directory,
   std::filesystem::create_directories(directory / "Config", ec);
   return !ec && ini.Save(file);
 }
+// FPS counter: frame rate plus the interval between new game frames, as the
+// renderer presented them (duplicate presents of an unchanged frame are folded
+// into the next interval, so a dropped frame shows as a ~33 ms spike).
+constexpr const char* kPerfLabels[] = {"Off", "On", "On + frame times"};
+class FrameIntervals {
+public:
+  static constexpr int kSize = 240;  // 4 seconds at 60 fps
+  void Record(const PresentInfo& info) {
+    if (info.reason == PresentInfo::PresentReason::VideoInterfaceDuplicate) return;
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard guard(m_lock);
+    if (m_have_last) {
+      const float ms = std::chrono::duration<float, std::milli>(now - m_last).count();
+      // A pause or load screen gap is not a frame interval.
+      if (ms < 250.0f) { m_ring[m_next] = ms; m_next = (m_next + 1) % kSize; m_count = std::min(m_count + 1, kSize); }
+    }
+    m_last = now; m_have_last = true;
+  }
+  // Oldest first.
+  int Copy(std::array<float, kSize>& out) const {
+    std::lock_guard guard(m_lock);
+    for (int i = 0; i < m_count; ++i) out[i] = m_ring[(m_next - m_count + i + kSize) % kSize];
+    return m_count;
+  }
+private:
+  mutable std::mutex m_lock;
+  std::array<float, kSize> m_ring{};
+  int m_next = 0, m_count = 0;
+  bool m_have_last = false;
+  std::chrono::steady_clock::time_point m_last{};
+};
+
+void DrawPerfOverlay(const FrameIntervals& intervals, int mode) {
+  const Palette& p = kPalette;
+  std::array<float, FrameIntervals::kSize> data{};
+  const int n = intervals.Copy(data);
+  // Last second of intervals for the numbers; the graph shows all of them.
+  float sum = 0, low = 1e9f, high = 0;
+  const int recent = std::min(n, 60);
+  for (int i = n - recent; i < n; ++i) { sum += data[i]; low = std::min(low, data[i]); high = std::max(high, data[i]); }
+  const float avg = recent ? sum / recent : 0.0f;
+  int over = 0;  // intervals longer than 1.5 frames (visible hitches) in the window
+  for (int i = 0; i < n; ++i) if (data[i] > 25.0f) ++over;
+  const auto& metrics = Core::System::GetInstance().GetPerfMetrics();
+  const double fps = metrics.GetFPS(), vps = metrics.GetVPS(), speed = metrics.GetSpeed();
+  const float scale = std::max(1.0f, ImGui::GetIO().DisplaySize.y / 900.0f);
+  ImGui::SetNextWindowPos(ImVec2(8 * scale, 8 * scale), ImGuiCond_Always);
+  ImGui::SetNextWindowBgAlpha(0.72f);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * scale, 8 * scale));
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1);
+  ImGui::PushStyleColor(ImGuiCol_WindowBg, p.window);
+  ImGui::PushStyleColor(ImGuiCol_Border, p.separator);
+  ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0, 0, 0, 0.35f));
+  ImGui::PushStyleColor(ImGuiCol_PlotLines, p.accent);
+  ImGui::Begin("Turbulence FPS", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+               ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoFocusOnAppearing |
+               ImGuiWindowFlags_NoNav);
+  ImGui::SetWindowFontScale(scale);
+  const ImVec4 fps_color = fps >= 59.0 ? ImVec4(0.45f, 0.95f, 0.45f, 1) : fps >= 50.0 ? p.title : p.danger;
+  ImGui::TextColored(fps_color, "%.1f FPS", fps);
+  ImGui::SameLine(); ImGui::TextColored(p.text_dim, "%.0f%% speed", speed * 100.0);
+  if (mode >= 2) {
+    ImGui::TextColored(p.text, "Frame %.2f ms  (min %.2f / max %.2f)", avg, recent ? low : 0.0f, high);
+    ImGui::TextColored(over ? p.title : p.text_dim, "VPS %.1f   hitches >25 ms: %d / %ds", vps, over, FrameIntervals::kSize / 60);
+    char label[32];
+    std::snprintf(label, sizeof(label), "%.1f ms", n ? data[n - 1] : 0.0f);
+    const ImVec2 size(std::max(240 * scale, ImGui::GetContentRegionAvail().x), 48 * scale);
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    ImGui::PlotLines("##intervals", data.data(), n, 0, label, 0.0f, 50.0f, size);
+    // 16.7 ms reference line (the plot's range is 0-50 ms, drawn bottom up).
+    const float y = origin.y + size.y * (1.0f - 16.667f / 50.0f);
+    ImGui::GetWindowDrawList()->AddLine(ImVec2(origin.x, y), ImVec2(origin.x + size.x, y),
+                                        ImGui::GetColorU32(ImVec4(1, 1, 1, 0.25f)));
+  }
+  ImGui::End();
+  ImGui::PopStyleColor(4);
+  ImGui::PopStyleVar(3);
+}
 }  // namespace
 
 struct OptionsMenu::Impl {
@@ -237,6 +325,9 @@ struct OptionsMenu::Impl {
   bool fxaa = false;
   bool vsync = true;
   bool metal_hud = true;
+  int perf_overlay = 0;  // 0 off, 1 FPS, 2 FPS + frame times
+  FrameIntervals intervals;
+  Common::EventHook present_hook;
   bool confirm_exit = false;
   int exit_choice = 0;  // 0 = No (left, default), 1 = Yes (right)
   bool exiting = false;
@@ -253,6 +344,9 @@ struct OptionsMenu::Impl {
     s_menu_binding = LoadMenuButtonBinding(directory);
     binding = s_menu_binding;
     metal_hud = LoadMetalHUDPreference(directory);
+    perf_overlay = LoadPerfOverlayPreference(directory);
+    present_hook = GetVideoEvents().after_present_event.Register(
+        [this](const PresentInfo& info) { intervals.Record(info); });
     draw_hook = GetVideoEvents().imgui_draw_event.Register([this] { Draw(); });
     // Unattended tests (scripts/turbulence_agent.sh) can't press the real menu
     // button: automation input drives the emulated GameCube pad.
@@ -260,7 +354,7 @@ struct OptionsMenu::Impl {
       open_on_first_draw = true;
   }
   bool open_on_first_draw = false;
-  ~Impl() { draw_hook.reset(); s_blocks_input = false; }
+  ~Impl() { draw_hook.reset(); present_hook.reset(); s_blocks_input = false; }
   Row CurrentRow() const { return Rows()[selected]; }
   void ReadSettings() {
     stretch_hud = g_turbulence_hud_stretched;
@@ -380,6 +474,12 @@ struct OptionsMenu::Impl {
     case Row::FXAA: fxaa = !fxaa; ApplyFXAA(); break;
     case Row::VSync: vsync = !vsync; ApplyVSync(); break;
     case Row::MetalHUD: metal_hud = !metal_hud; ApplyMetalHUD(); break;
+    case Row::PerfOverlay:
+      perf_overlay = (perf_overlay + (delta > 0 ? 1 : 2)) % 3;
+      save_error = SaveTurbulenceIni(directory, [&](Common::IniFile& ini) {
+        ini.GetOrCreateSection("Video")->Set("FPSCounter", perf_overlay);
+      }) ? "" : "Could not save the FPS counter; change applies this session.";
+      break;
     case Row::Prompts: {
       const int next = (static_cast<int>(GetPromptPreference()) + delta + 4) % 4;
       SetPromptPreference(static_cast<PromptPreference>(next));
@@ -400,7 +500,7 @@ struct OptionsMenu::Impl {
     switch (CurrentRow()) {
     case Row::Exit: confirm_exit = true; exit_choice = 0; break;
     case Row::MenuButton: StartCapture(); break;
-    case Row::HudLayout: case Row::FXAA: case Row::VSync: case Row::MetalHUD: case Row::Prompts: Step(1); break;
+    case Row::HudLayout: case Row::FXAA: case Row::VSync: case Row::MetalHUD: case Row::PerfOverlay: case Row::Prompts: Step(1); break;
     default: break;
     }
   }
@@ -418,6 +518,7 @@ struct OptionsMenu::Impl {
     case Row::FXAA: return fxaa ? "On" : "Off";
     case Row::VSync: return vsync ? "On" : "Off";
     case Row::MetalHUD: return metal_hud ? "On" : "Off";
+    case Row::PerfOverlay: return kPerfLabels[perf_overlay];
     case Row::Prompts: {
       static constexpr const char* styles[] = {"GameCube", "Xbox", "PlayStation"};
       if (GetPromptPreference() != PromptPreference::Automatic)
@@ -504,6 +605,7 @@ struct OptionsMenu::Impl {
     else if (open) HandleInput(pressed);
     if (drain && std::none_of(down.begin(), down.end(), [](bool b){return b;})) drain = false;
     s_blocks_input = open || drain;
+    if (perf_overlay) DrawPerfOverlay(intervals, perf_overlay);
     if (!open) return;
     const Palette& p = kPalette;
     const auto& io = ImGui::GetIO();
@@ -595,6 +697,15 @@ void PrepareOptions(const std::filesystem::path& directory) {
   ini.GetOrCreateSection("Controls")->Get("ButtonPrompts", &prompts, "auto");
   for (int i = 0; i < 4; ++i)
     if (prompts == kPromptNames[i]) SetPromptPreference(static_cast<PromptPreference>(i));
+}
+
+int LoadPerfOverlayPreference(const std::filesystem::path& directory) {
+  Common::IniFile ini;
+  ini.Load(TurbulenceIni(directory));
+  int mode = 0;
+  ini.GetOrCreateSection("Video")->Get("FPSCounter", &mode, 0);
+  if (const char* forced = std::getenv("TURBULENCE_FPS_COUNTER"); forced && *forced) mode = std::atoi(forced);
+  return std::clamp(mode, 0, 2);
 }
 
 bool LoadMetalHUDPreference(const std::filesystem::path& directory) {

@@ -363,3 +363,51 @@ intro remained visible; racing, physical controls, prompts, options, audio
 quality, suspend/resume and thermals still need device verification. Local
 screenshots and private reconstructed disc are under ignored build/rp-nova.
 Android work was stopped at the user's request for Claude to continue.
+
+## Android performance and FPS counter — November 8-9, 2026 (Claude)
+
+Measured on a Retroid Pocket Nova (Snapdragon 8 Gen 2, Android 13, 120 Hz
+panel) over the same attract loop (title, intro movie, demo race), with
+`adb logcat -s Turbulence` "Perf" lines (5 s FPS/VPS samples) and simpleperf.
+
+Causes found, in order of impact:
+
+1. Sys resolved to `/system/bin/Sys/`: Android builds also set LINUX_LOCAL_DEV,
+   whose branch in `CreateSysDirectoryPath` won over the Android one, so
+   GameSettings/GXEE8P.ini never loaded (no idle-loop skip, MaxFallback 100).
+   `File::CreateSysDirectoryPath` now prefers the directory set by
+   `SetSysDirectory`. Log line: `[turbulence] Sys directory: ...`.
+2. The CPU thread was scheduled on Cortex-A510 efficiency cores (47 -> 60 fps
+   on the title when moved). `Common::PreferPerformanceCores` (Android only)
+   keeps the CPU and Video threads on cores above the lowest `cpu_capacity`.
+3. Paired-single helpers were ~45% of the CPU thread. Android modules now build
+   with thin LTO (as desktop does), and cpu.h has exact inline fast paths for
+   ps_add/ps_sub/ps_mul (finite results, NI flush included) and quantized
+   psq_l/psq_st (types 4-7). Equivalence: 3M randomized/edge cases against the
+   out-of-line ops, 0 mismatches (NaN, inf, denormal, NI, LSQE, all GQRs).
+4. 120 Hz FIFO alternated 1/3 refreshes per frame. The activity requests a
+   60 Hz display mode and `Surface.setFrameRate(60)` while playing.
+
+Also: Android uses the ARM64 vertex loader (iOS keeps the software one); the
+fallback JIT stays off on Android (zero guest blocks, only invalidation cost).
+The thread labelled "GC Adapter Scan" in top/simpleperf is the CPU thread
+(cosmetic).
+
+FPS counter: Options -> "FPS counter": Off / On / On + frame times
+([Video] FPSCounter in Turbulence.ini; `TURBULENCE_FPS_COUNTER=0|1|2` forces
+it). Shows FPS, emulation speed, VPS, mean/min/max new-frame interval over the
+last second, intervals over 25 ms in the last 4 s, and a 4 s interval graph
+with a 16.7 ms line. All platforms.
+
+Attract-loop VPS through the movie and demo race (title is 60 throughout):
+before ~44-48; after Sys + cores ~46-49; + LTO ~50; + PS fast paths ~57
+(dips 50-54). See the end of this section for the latest numbers.
+
+Latest (Nov 10): heavy-stretch average 56.8 VPS (repeat runs agree within
+0.1); title/menus a locked 60. Remaining dips: ~50 at the busiest point of the
+intro movie, 52-58 in the demo race. Tried and dropped (no gain): -O3 for the
+module, forced inlining of the fast paths (-2 fps: code growth), pinning the
+CPU thread to the prime core (the scheduler already keeps it there at
+3.19 GHz). Top remaining costs (simpleperf, CPU thread): the game's own
+generated code (~45%), quantized stores/loads (~18%), dispatcher and cache-
+flush bookkeeping (~10%).

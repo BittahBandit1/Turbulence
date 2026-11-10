@@ -43,5 +43,7 @@ void PrepareMetalHUD();
 void PrepareOptions(const std::filesystem::path& user_directory);
 MenuButtonBinding LoadMenuButtonBinding(const std::filesystem::path& user_directory);
 bool LoadMetalHUDPreference(const std::filesystem::path& user_directory);
+// FPS counter: 0 off, 1 FPS, 2 FPS + frame-interval graph ([Video] FPSCounter).
+int LoadPerfOverlayPreference(const std::filesystem::path& user_directory);
 bool SaveMenuButtonBinding(const std::filesystem::path& user_directory, const MenuButtonBinding& binding);
 }  // namespace turbulence

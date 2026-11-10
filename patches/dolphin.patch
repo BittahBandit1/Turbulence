@@ -63,6 +63,203 @@ index 3a81fe3..037d4b1 100644
 +# Keep obsolete host deadlines from carrying a six-frame backlog after a stall.
 +# Small timing errors still recover naturally; no rendered frames are skipped.
 +MaxFallback = 20
+diff --git a/GXRuntime/include/core/cpu.h b/GXRuntime/include/core/cpu.h
+index e242b00..aff2c98 100644
+--- a/GXRuntime/include/core/cpu.h
++++ b/GXRuntime/include/core/cpu.h
+@@ -3,6 +3,9 @@
+ #define DOLRECOMP_CPU_H
+ 
+ #include "types.h"
++#include "psq_scale.h"
++#include <math.h>
++#include <string.h>
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+@@ -447,6 +450,182 @@ static inline bool ppc_psq_store_inline(CPUState* cpu, u8 frS, u32 ea, bool w,
+     }
+     return ppc_psq_store(cpu, frS, ea, w, gqr_index, indexed, cia);
+ }
++/* Quantized fast paths (Turbulence, from an Android profile of Sonic Riders'
++ * movie decoder and races, where these calls were ~20% of the CPU thread).
++ * Same arithmetic as psq_dequant / psq_quantize_int in cpu.c; anything else
++ * (types 1-3, the LSQE illegal-instruction check) takes the out-of-line path. */
++static inline f64 ppc_psq_dequant_inline(s32 value, s32 scale) {
++    if (scale == 0)
++        return (f64)(f32)value;
++    return (f64)((f32)value * psq_scale_factor(-scale));
++}
++
++static inline s32 ppc_psq_quantize_inline(f64 value, s32 min_value, s32 max_value, s32 scale) {
++    const f32 conv = (f32)value * psq_scale_factor(scale);
++    if (isnan(conv))
++        return 0;
++    if (conv <= (f32)min_value)
++        return min_value;
++    if (conv >= (f32)max_value)
++        return max_value;
++    return (s32)conv;
++}
++
++static inline bool ppc_psq_load_quantized_inline(CPUState* cpu, u8 frD, u32 ea, bool w,
++                                                 u8 gqr_index, bool indexed, u32 cia) {
++    const u32 gqr = cpu->gqr[gqr_index & 7u];
++    const u32 type = (gqr >> 16) & 7u;
++    if (type < 4u || !(indexed || (cpu->hid2 & PPC_HID2_LSQE) != 0u))
++        return ppc_psq_load_inline(cpu, frD, ea, w, gqr_index, indexed, cia);
++    const s32 scale = ((s32)(((gqr >> 24) & 0x3Fu) << 26)) >> 26;
++    s32 v0, v1 = 0;
++    switch (type) {
++    case 4: v0 = mem_read8(cpu, ea); if (!w) v1 = mem_read8(cpu, ea + 1u); break;
++    case 5: v0 = mem_read16(cpu, ea); if (!w) v1 = mem_read16(cpu, ea + 2u); break;
++    case 6: v0 = (s8)mem_read8(cpu, ea); if (!w) v1 = (s8)mem_read8(cpu, ea + 1u); break;
++    default: v0 = (s16)mem_read16(cpu, ea); if (!w) v1 = (s16)mem_read16(cpu, ea + 2u); break;
++    }
++    cpu->fpr[frD] = ppc_psq_dequant_inline(v0, scale);
++    cpu->ps1[frD] = w ? 1.0 : ppc_psq_dequant_inline(v1, scale);
++    return true;
++}
++
++static inline bool ppc_psq_store_quantized_inline(CPUState* cpu, u8 frS, u32 ea, bool w,
++                                                  u8 gqr_index, bool indexed, u32 cia) {
++    const u32 gqr = cpu->gqr[gqr_index & 7u];
++    const u32 type = gqr & 7u;
++    if (type < 4u || !(indexed || (cpu->hid2 & PPC_HID2_LSQE) != 0u))
++        return ppc_psq_store_inline(cpu, frS, ea, w, gqr_index, indexed, cia);
++    const s32 scale = ((s32)(((gqr >> 8) & 0x3Fu) << 26)) >> 26;
++    const f64 lane0 = cpu->fpr[frS], lane1 = cpu->ps1[frS];
++    switch (type) {
++    case 4: {
++        /* Movie pixel output: an unsigned byte pair. With no write journal
++         * (normal play) and both bytes in MEM1, one range check covers the
++         * pair; reservation clearing is unchanged. */
++        const u8 q0 = (u8)ppc_psq_quantize_inline(lane0, 0, 255, scale);
++        const u8 q1 = w ? 0u : (u8)ppc_psq_quantize_inline(lane1, 0, 255, scale);
++        u8* ptr;
++        if (!g_mem_write_journal && !cpu->exram &&
++            (ptr = get_ram_ptr(cpu, ea, w ? 1u : 2u, NULL)) != NULL) {
++            clear_matching_reservation(cpu, ea);
++            ptr[0] = q0;
++            if (!w) {
++                clear_matching_reservation(cpu, ea + 1u);
++                ptr[1] = q1;
++            }
++        } else {
++            mem_write8(cpu, ea, q0);
++            if (!w) mem_write8(cpu, ea + 1u, q1);
++        }
++        break;
++    }
++    case 5:
++        mem_write16(cpu, ea, (u16)ppc_psq_quantize_inline(lane0, 0, 65535, scale));
++        if (!w) mem_write16(cpu, ea + 2u, (u16)ppc_psq_quantize_inline(lane1, 0, 65535, scale));
++        break;
++    case 6:
++        mem_write8(cpu, ea, (u8)(s8)ppc_psq_quantize_inline(lane0, -128, 127, scale));
++        if (!w) mem_write8(cpu, ea + 1u, (u8)(s8)ppc_psq_quantize_inline(lane1, -128, 127, scale));
++        break;
++    default:
++        mem_write16(cpu, ea, (u16)(s16)ppc_psq_quantize_inline(lane0, -32768, 32767, scale));
++        if (!w) mem_write16(cpu, ea + 2u, (u16)(s16)ppc_psq_quantize_inline(lane1, -32768, 32767, scale));
++        break;
++    }
++    return true;
++}
++
++/* Paired-single add/sub/mul fast path. When both lanes' results are finite
++ * the inputs were finite too, so none of the NaN, infinity or exception
++ * bookkeeping in ni_add/ni_sub/ni_mul applies: the result is each lane rounded
++ * to single (flushed under FPSCR[NI], as force_single does), and FPSCR only
++ * takes the new FPRF.
++ * Everything else re-runs the out-of-line op, which has done nothing yet. */
++static inline u32 ppc_classify_f32_inline(f32 value) {
++    u32 bits;
++    memcpy(&bits, &value, sizeof(bits));
++    const u32 sign = bits >> 31, exponent = bits & 0x7F800000u, fraction = bits & 0x007FFFFFu;
++    if (exponent == 0x7F800000u)
++        return fraction ? 0x11u : (sign ? 0x09u : 0x05u);
++    if (exponent == 0)
++        return fraction ? (sign ? 0x18u : 0x14u) : (sign ? 0x12u : 0x02u);
++    return sign ? 0x08u : 0x04u;
++}
++
++/* force_single: with FPSCR[NI] set, magnitudes below the smallest normal
++ * single flush to a signed zero. */
++static inline f32 ppc_force_single_inline(u32 fpscr, f64 value) {
++    if (fpscr & 0x4u) {
++        u64 bits;
++        memcpy(&bits, &value, sizeof(bits));
++        if ((bits & 0x7FFFFFFFFFFFFFFFull) < 0x3810000000000000ull) {
++            const u32 flushed = (u32)((bits & 0x8000000000000000ull) >> 32);
++            f32 zero;
++            memcpy(&zero, &flushed, sizeof(zero));
++            return zero;
++        }
++    }
++    return (f32)value;
++}
++
++static inline bool ppc_ps_write_fast(CPUState* cpu, u8 d, f64 r0, f64 r1) {
++    if (!isfinite(r0) || !isfinite(r1))
++        return false;
++    const f32 s0 = ppc_force_single_inline(cpu->fpscr, r0), s1 = ppc_force_single_inline(cpu->fpscr, r1);
++    cpu->fpr[d] = (f64)s0;
++    cpu->ps1[d] = (f64)s1;
++    cpu->fpscr = (cpu->fpscr & ~(0x1Fu << 12)) | (ppc_classify_f32_inline(s0) << 12);
++    return true;
++}
++
++/* Gekko's 25-bit multiplier operand (force_25bit_c in cpu_interpreter_float.c). */
++static inline f64 ppc_force_25bit_c_inline(f64 d) {
++    u64 integral;
++    memcpy(&integral, &d, sizeof(integral));
++    const u64 exponent = integral & 0x7FF0000000000000ull;
++    const u64 fraction = integral & 0x000FFFFFFFFFFFFFull;
++    if (exponent == 0 && fraction != 0) {
++        s64 keep_mask = (s64)0xFFFFFFFFF8000000ll;
++        u64 round = 0x8000000u;
++        const unsigned shift = (unsigned)__builtin_clzll(fraction) - 11u;
++        keep_mask >>= shift;
++        round >>= shift;
++        integral = (integral & (u64)keep_mask) + (integral & round);
++    } else {
++        integral = (integral & 0xFFFFFFFFF8000000ull) + (integral & 0x8000000ull);
++    }
++    f64 result;
++    memcpy(&result, &integral, sizeof(result));
++    return result;
++}
++
++static inline void ppc_ps_add_op_inline(CPUState* cpu, u8 d, u8 a, u8 b) {
++    if (!ppc_ps_write_fast(cpu, d, cpu->fpr[a] + cpu->fpr[b], cpu->ps1[a] + cpu->ps1[b]))
++        ppc_ps_add_op(cpu, d, a, b);
++}
++
++static inline void ppc_ps_sub_op_inline(CPUState* cpu, u8 d, u8 a, u8 b) {
++    if (!ppc_ps_write_fast(cpu, d, cpu->fpr[a] - cpu->fpr[b], cpu->ps1[a] - cpu->ps1[b]))
++        ppc_ps_sub_op(cpu, d, a, b);
++}
++
++static inline void ppc_ps_mul_op_inline(CPUState* cpu, u8 d, u8 a, u8 c) {
++    if (!ppc_ps_write_fast(cpu, d, cpu->fpr[a] * ppc_force_25bit_c_inline(cpu->fpr[c]),
++                           cpu->ps1[a] * ppc_force_25bit_c_inline(cpu->ps1[c])))
++        ppc_ps_mul_op(cpu, d, a, c);
++}
++
++/* Generated code (and the interpreter) call these by their usual names; the
++ * file that defines the out-of-line versions opts out. */
++#ifndef GXRUNTIME_DEFINES_FAST_PATH_OPS
++#define ppc_ps_add_op ppc_ps_add_op_inline
++#define ppc_ps_sub_op ppc_ps_sub_op_inline
++#define ppc_ps_mul_op ppc_ps_mul_op_inline
++#define ppc_psq_load_inline ppc_psq_load_quantized_inline
++#define ppc_psq_store_inline ppc_psq_store_quantized_inline
++#endif
++
+ u32 ppc_eciwx(CPUState* cpu, u32 ea, u32 cia);
+ void ppc_ecowx(CPUState* cpu, u32 ea, u32 value, u32 cia);
+ void ppc_tlbie(CPUState* cpu, u32 ea, u32 cia);
 diff --git a/GXRuntime/src/core/cpu.c b/GXRuntime/src/core/cpu.c
 index 345b960..b85f7fa 100644
 --- a/GXRuntime/src/core/cpu.c
@@ -109,6 +306,16 @@ index 345b960..b85f7fa 100644
      psq_store_value(cpu, ea, type, scale, cpu->fpr[frS]);
      if (!w)
          psq_store_value(cpu, ea + size, type, scale, cpu->ps1[frS]);
+diff --git a/GXRuntime/src/core/cpu_interpreter_float.c b/GXRuntime/src/core/cpu_interpreter_float.c
+index a73f961..e7177df 100644
+--- a/GXRuntime/src/core/cpu_interpreter_float.c
++++ b/GXRuntime/src/core/cpu_interpreter_float.c
+@@ -1,3 +1,5 @@
++/* Defines the out-of-line ppc_ps_* ops that cpu.h's inline fast paths fall back to. */
++#define GXRUNTIME_DEFINES_FAST_PATH_OPS 1
+ #include "cpu_interpreter_private.h"
+ #include <string.h>
+ 
 diff --git a/Source/CMakeLists.txt b/Source/CMakeLists.txt
 index 7871083..d0e56cc 100644
 --- a/Source/CMakeLists.txt
@@ -568,7 +775,7 @@ index 4a79b90..730c1af 100644
  #include <string>
  
 diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
-index e3581cc..d0cc647 100644
+index e3581cc..354bb70 100644
 --- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
 +++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
 @@ -2,6 +2,7 @@
@@ -588,7 +795,7 @@ index e3581cc..d0cc647 100644
    g_static_recomp_core = this;
    RefreshConfig();
    m_collect_dispatch_samples = std::getenv("STATICRECOMP_DISPATCH_SAMPLES") != nullptr;
-@@ -182,12 +185,16 @@ void StaticRecompCore::Init()
+@@ -182,12 +185,18 @@ void StaticRecompCore::Init()
  
    LoadModule();
    m_idle_pc = Config::Get(Config::MAIN_STATICRECOMP_IDLE_PC);
@@ -598,16 +805,18 @@ index e3581cc..d0cc647 100644
    m_lockstep_verifier->Init();
  
 -#ifdef _M_ARM_64
-+  // Code the module doesn't cover runs on the JIT. Sideloaded iOS can't map
-+  // executable pages and uses the interpreter; Android can.
-+#if defined(_M_ARM_64) && !defined(TURBULENCE_IOS)
++  // Mobile builds use the interpreter for the (rare) uncovered code: sideloaded
++  // iOS can't map executable pages, and on Android a fallback JIT only added
++  // block-cache invalidation work to every cache flush (~2.5% of the CPU
++  // thread in a Sonic Riders profile) while running zero guest blocks.
++#if defined(_M_ARM_64) && !defined(TURBULENCE_IOS) && !defined(TURBULENCE_ANDROID)
    m_fallback_jit = std::make_unique<JitArm64>(m_system);
 -#elif defined(_M_X86_64)
 +#elif defined(_M_X86_64) && !defined(TURBULENCE_IOS) && !defined(TURBULENCE_ANDROID)
    m_fallback_jit = std::make_unique<Jit64>(m_system);
  #endif
    if (m_fallback_jit)
-@@ -200,6 +207,8 @@ void StaticRecompCore::Init()
+@@ -200,6 +209,8 @@ void StaticRecompCore::Init()
  
  void StaticRecompCore::Shutdown()
  {
@@ -616,7 +825,7 @@ index e3581cc..d0cc647 100644
    g_static_recomp_core = nullptr;
    std::fprintf(stderr,
                 "[staticrecomp] shutdown: native=%llu fallback=%llu native_exc=%llu hook_fb=%llu "
-@@ -328,6 +337,7 @@ void StaticRecompCore::LoadModule()
+@@ -328,6 +339,7 @@ void StaticRecompCore::LoadModule()
    }
    m_active_rel_sections.clear();
    m_rel_mapping_generation = 0;
@@ -624,7 +833,7 @@ index e3581cc..d0cc647 100644
    m_failed_chunks = 0;
    m_lookup_ram_size = 0;
    m_lookup_exram_size = 0;
-@@ -356,6 +366,7 @@ void StaticRecompCore::ClearCache()
+@@ -356,6 +368,7 @@ void StaticRecompCore::ClearCache()
    if (!m_module)
      return;
    std::fill(m_chunk_state.begin(), m_chunk_state.end(), u8{CHUNK_UNVERIFIED});
