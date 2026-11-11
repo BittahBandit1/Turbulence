@@ -16,7 +16,9 @@ import java.util.*;
 public class MainActivity extends Activity implements SurfaceHolder.Callback {
  static {System.loadLibrary("turbulence");}
  private static Context application;
- private static native void nativeStart(Surface surface,String game,String user,String sys,float scale);
+ private static native void nativeStart(Surface surface,String game,String user,String sys,float scale,String driverLib);
+ private static native void nativeSetDriverDirectories(String root,String libraries);
+ private static native boolean nativeSupportsCustomDriver();
  private static native void nativePromptStyle(int style);
  private static native void nativeStop();
  private static native void nativePause(boolean pause);
@@ -59,6 +61,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
   setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
   getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
   immersive();library=new File(getFilesDir(),"GXEE8P");user=new File(getFilesDir(),"user");sys=new File(getFilesDir(),"Sys");
+  setUpDrivers();
+  if(getIntent().getBooleanExtra("systemdriver",false))uninstallDriver();
+  String driverPath=getIntent().getStringExtra("driver");
+  if(driverPath!=null){try(InputStream in=new FileInputStream(driverPath)){String result=installDriver(in);android.util.Log.i("Turbulence","Driver install from "+driverPath+": "+result);}catch(Exception e){android.util.Log.e("Turbulence","Driver install failed",e);}}
   pendingDisc=getIntent().getStringExtra("disc");autoPlay=getIntent().getBooleanExtra("autoplay",false);
   home("Preparing runtime files…");busy=true;
   new Thread(()->{try{copyAssets("Sys",sys);copyAsset("GFX.ini",new File(getFilesDir(),"GFX.ini"));
@@ -78,12 +84,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
   Button choose=new Button(this);choose.setText("Choose ISO / CISO");choose.setEnabled(!busy);choose.setOnClickListener(v->{Intent intent=new Intent(Intent.ACTION_OPEN_DOCUMENT);intent.setType("*/*");intent.addCategory(Intent.CATEGORY_OPENABLE);startActivityForResult(intent,10);});view.addView(choose);
   Button play=new Button(this);play.setText("Play Sonic Riders");play.setEnabled(ready()&&!busy);play.setOnClickListener(v->play());view.addView(play);
   Button logs=new Button(this);logs.setText("View gameplay log");logs.setOnClickListener(v->{try{File f=new File(user,"gameplay.log");RandomAccessFile log=new RandomAccessFile(f,"r");long size=log.length();log.seek(Math.max(0,size-60000));byte[] bytes=new byte[(int)Math.min(60000,size)];log.readFully(bytes);log.close();new AlertDialog.Builder(this).setMessage(new String(bytes,"UTF-8")).setPositiveButton("Close",null).show();}catch(Exception e){status.setText("No gameplay log yet.");}});view.addView(logs);
+  TextView driverStatus=new TextView(this);driverStatus.setTextColor(Color.LTGRAY);driverStatus.setGravity(Gravity.CENTER);driverStatus.setPadding(0,16,0,4);
+  boolean customOk=nativeSupportsCustomDriver();String driverName=prefs().getString("driverName","");
+  driverStatus.setText(!customOk?"GPU driver: system (custom drivers need a Qualcomm Adreno GPU)":driverName.isEmpty()?"GPU driver: system":"GPU driver: "+driverName);view.addView(driverStatus);
+  LinearLayout driverRow=new LinearLayout(this);driverRow.setGravity(Gravity.CENTER);
+  Button installDriver=new Button(this);installDriver.setText("Install GPU driver (.zip)");installDriver.setEnabled(customOk&&!busy);installDriver.setOnClickListener(v->{Intent intent=new Intent(Intent.ACTION_OPEN_DOCUMENT);intent.setType("*/*");intent.addCategory(Intent.CATEGORY_OPENABLE);startActivityForResult(intent,11);});driverRow.addView(installDriver);
+  Button systemDriver=new Button(this);systemDriver.setText("Use system driver");systemDriver.setEnabled(!driverName.isEmpty()&&!busy);systemDriver.setOnClickListener(v->{uninstallDriver();home("Using the system GPU driver.");});driverRow.addView(systemDriver);
+  view.addView(driverRow);
   TextView hint=new TextView(this);hint.setText("Use a controller or the on-screen controls.\nThree-finger tap opens options.");hint.setTextColor(Color.LTGRAY);hint.setGravity(Gravity.CENTER);hint.setPadding(0,12,0,0);view.addView(hint);
   setContentView(view);immersive();
  }
  private void copyAsset(String name,File destination)throws Exception{destination.getParentFile().mkdirs();try(InputStream input=getAssets().open(name);OutputStream out=new FileOutputStream(destination)){byte[] buffer=new byte[65536];int n;while((n=input.read(buffer))>=0)out.write(buffer,0,n);}}
  private void copyAssets(String path,File destination)throws Exception {String[] children=getAssets().list(path);if(children!=null&&children.length>0){destination.mkdirs();for(String child:children)copyAssets(path+"/"+child,new File(destination,child));}else copyAsset(path,destination);}
- @Override protected void onActivityResult(int request,int result,Intent data){super.onActivityResult(request,result,data);if(request==10&&result==RESULT_OK&&data!=null&&data.getData()!=null){Uri uri=data.getData();busy=true;home("Reading selected disc…");new Thread(()->{File source=new File(getCacheDir(),"disc-import.ciso");try(InputStream in=getContentResolver().openInputStream(uri);OutputStream out=new FileOutputStream(source)){if(in==null)throw new IOException("The file provider could not open this disc");byte[] bytes=new byte[1024*1024];int n;while((n=in.read(bytes))>=0)out.write(bytes,0,n);runOnUiThread(()->{busy=false;importFile(source);});}catch(Exception e){source.delete();runOnUiThread(()->{busy=false;home(e.toString());});}},"Turbulence disc copy").start();}}
+ @Override protected void onActivityResult(int request,int result,Intent data){super.onActivityResult(request,result,data);
+  if(request==11&&result==RESULT_OK&&data!=null&&data.getData()!=null){Uri uri=data.getData();busy=true;home("Installing GPU driver…");new Thread(()->{String message;try(InputStream in=getContentResolver().openInputStream(uri)){message=in==null?"The file provider could not open this driver package.":installDriver(in);}catch(Exception e){uninstallDriver();message="Driver install failed: "+e.getMessage();}final String text=message;runOnUiThread(()->{busy=false;home(text);});},"Turbulence driver install").start();return;}if(request==10&&result==RESULT_OK&&data!=null&&data.getData()!=null){Uri uri=data.getData();busy=true;home("Reading selected disc…");new Thread(()->{File source=new File(getCacheDir(),"disc-import.ciso");try(InputStream in=getContentResolver().openInputStream(uri);OutputStream out=new FileOutputStream(source)){if(in==null)throw new IOException("The file provider could not open this disc");byte[] bytes=new byte[1024*1024];int n;while((n=in.read(bytes))>=0)out.write(bytes,0,n);runOnUiThread(()->{busy=false;importFile(source);});}catch(Exception e){source.delete();runOnUiThread(()->{busy=false;home(e.toString());});}},"Turbulence disc copy").start();}}
  private void importFile(File source){
   if(busy||playing)return;
   if(ready()){if(autoPlay)play();else home("Game is already imported. Choose Play.");return;}
@@ -117,7 +131,47 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
    }
   }
  }
- public void surfaceCreated(SurfaceHolder holder){requestSixtyHz(holder.getSurface());nativeStart(holder.getSurface(),library.getAbsolutePath(),user.getAbsolutePath(),sys.getAbsolutePath(),getResources().getDisplayMetrics().density);}
+ public void surfaceCreated(SurfaceHolder holder){requestSixtyHz(holder.getSurface());nativeStart(holder.getSurface(),library.getAbsolutePath(),user.getAbsolutePath(),sys.getAbsolutePath(),getResources().getDisplayMetrics().density,prefs().getString("driverLib",""));}
+
+ // Custom GPU drivers: adrenotools packages (a .zip with meta.json naming the
+ // Vulkan library, e.g. Mesa Turnip builds). One driver is installed at a time.
+ private File driverRoot,driverDir;
+ private SharedPreferences prefs(){return getSharedPreferences("turbulence",MODE_PRIVATE);}
+ private void setUpDrivers(){
+  driverRoot=new File(getFilesDir(),"GpuDrivers");driverDir=new File(driverRoot,"Extracted");
+  driverDir.mkdirs();new File(driverRoot,"Tmp").mkdirs();new File(driverRoot,"FileRedirect").mkdirs();
+  nativeSetDriverDirectories(driverRoot.getAbsolutePath(),getApplicationInfo().nativeLibraryDir);
+  String lib=prefs().getString("driverLib","");
+  if(!lib.isEmpty()&&!new File(driverDir,lib).isFile())uninstallDriver();
+ }
+ private static void deleteTree(File file){File[] children=file.listFiles();if(children!=null)for(File child:children)deleteTree(child);file.delete();}
+ private void uninstallDriver(){deleteTree(driverDir);driverDir.mkdirs();prefs().edit().remove("driverLib").remove("driverName").apply();}
+ private String installDriver(InputStream input)throws IOException{
+  uninstallDriver();
+  String canonical=driverDir.getCanonicalPath()+File.separator;
+  try(java.util.zip.ZipInputStream zip=new java.util.zip.ZipInputStream(new BufferedInputStream(input))){
+   java.util.zip.ZipEntry entry;byte[] buffer=new byte[65536];
+   while((entry=zip.getNextEntry())!=null){
+    File target=new File(driverDir,entry.getName());
+    if(!target.getCanonicalPath().startsWith(canonical)){uninstallDriver();return "Driver package rejected: unsafe file path.";}
+    if(entry.isDirectory()){target.mkdirs();continue;}
+    target.getParentFile().mkdirs();
+    try(OutputStream out=new FileOutputStream(target)){int n;while((n=zip.read(buffer))>0)out.write(buffer,0,n);}
+   }
+  }
+  File meta=new File(driverDir,"meta.json");
+  if(!meta.isFile()){uninstallDriver();return "Not a GPU driver package: meta.json is missing.";}
+  try{
+   org.json.JSONObject json=new org.json.JSONObject(new String(java.nio.file.Files.readAllBytes(meta.toPath()),"UTF-8"));
+   String lib=json.optString("libraryName","");
+   if(lib.isEmpty()||lib.contains("/")||!new File(driverDir,lib).isFile()){uninstallDriver();return "Driver package is missing its Vulkan library ("+lib+").";}
+   if(Build.VERSION.SDK_INT<json.optInt("minApi",0)){uninstallDriver();return "This driver needs Android API "+json.optInt("minApi",0)+" or newer.";}
+   String name=json.optString("name",lib);String version=json.optString("driverVersion","");
+   String label=version.isEmpty()?name:name+" ("+version+")";
+   prefs().edit().putString("driverLib",lib).putString("driverName",label).apply();
+   return "Installed GPU driver: "+label+". It is used the next time you start the game.";
+  }catch(org.json.JSONException e){uninstallDriver();return "Driver package has an invalid meta.json.";}
+ }
  public void surfaceChanged(SurfaceHolder holder,int format,int width,int height){nativeResize();}
  public void surfaceDestroyed(SurfaceHolder holder){if(playing)nativeStop();}
  @Override public void onBackPressed(){if(playing)nativeToggleMenu();else super.onBackPressed();}

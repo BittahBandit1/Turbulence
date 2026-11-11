@@ -16,7 +16,11 @@ def generated_sources(root, generated=None, rel_generated=None):
             continue
         if sha256((candidate/'main.dol').read_bytes()).hexdigest() != DOL_SHA256:
             continue
-        if not any((candidate/'chunks').glob('*.c')) or not any((rel/'chunks').glob('*.c')):
+        # The main executable may be C or LLVM-backend output (precompiled
+        # objects); the REL is always C.
+        llvm = 'DOLRECOMP_BACKEND_LLVM' in (candidate/'generated.h').read_text(errors='ignore')
+        main_chunks = (candidate/'chunks').glob('*.o' if llvm else '*.c')
+        if not any(main_chunks) or not any((rel/'chunks').glob('*.c')):
             continue
         return candidate, rel
     raise ValueError('Generate Sonic Riders USA code with the project build first, or supply '

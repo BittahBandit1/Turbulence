@@ -5,8 +5,23 @@ from pathlib import Path
 import os,shutil,subprocess,zipfile
 from mobile_common import generated_sources
 ROOT=Path(__file__).resolve().parents[1]
+# libadrenotools hook libraries: loaded from the APK's native library directory
+# when a custom GPU driver (e.g. Mesa Turnip) is selected.
+HOOKS=('hook_impl','main_hook','file_redirect_hook','gsl_alloc_hook')
 os.environ.setdefault("CCACHE_DIR",str(ROOT/"build/codex-ccache"))
 def run(*args,**kwargs):subprocess.run([str(a) for a in args],cwd=ROOT,check=True,**kwargs)
+def llvm_main(c_generated):
+ """LLVM-backend objects for the C output's main.dol, built for Android ARM64.
+ Needs lib/DolRecomp built with -DDOLRECOMP_ENABLE_LLVM=ON in build-llvm."""
+ out=ROOT/'build/llvm-android/dol';generated=out/'generated'
+ if not (generated/'generated.h').is_file():
+  dolrecomp=ROOT/'lib/DolRecomp/build-llvm/dolrecomp'
+  if not dolrecomp.is_file():raise SystemExit('Build DolRecomp with LLVM first: cmake -S lib/DolRecomp -B lib/DolRecomp/build-llvm -G Ninja -DCMAKE_BUILD_TYPE=Release -DDOLRECOMP_ENABLE_LLVM=ON -DLLVM_DIR=<llvm 19/20>/lib/cmake/llvm && cmake --build lib/DolRecomp/build-llvm --target dolrecomp')
+  out.mkdir(parents=True,exist_ok=True)
+  run(dolrecomp,'-j',os.cpu_count() or 4,'--backend=llvm','--targets','aarch64','--cpu','gekko','--gamecube',c_generated/'main.dol',out,
+      env=dict(os.environ,DOLRECOMP_LLVM_TARGET='aarch64-unknown-linux-android26'))
+ shutil.copy2(c_generated/'main.dol',generated/'main.dol')
+ return generated
 def main():
  parser=argparse.ArgumentParser(description=__doc__)
  parser.add_argument('--generated',type=Path)
@@ -14,18 +29,20 @@ def main():
  parser.add_argument('--sdk',type=Path,default=Path(os.environ.get('ANDROID_HOME',ROOT/'build/android-sdk')))
  parser.add_argument('--jobs',type=int,default=6)
  parser.add_argument('--package-only',action='store_true')
+ parser.add_argument('--llvm',action='store_true',help='main.dol from DolRecomp\'s LLVM backend (REL stays C); generated on first use')
  args=parser.parse_args()
  sdk=args.sdk.resolve();build=ROOT/'build/ports/android-arm64';tools=sdk/'build-tools/35.0.0';ndk=sdk/'ndk/27.3.13750724'
  java=Path(os.environ.get('JAVA_HOME') or subprocess.check_output(['/usr/libexec/java_home'],text=True).strip())
  env=dict(os.environ,JAVA_HOME=str(java))
  if not args.package_only:
   args.generated,args.rel_generated=generated_sources(ROOT,args.generated,args.rel_generated)
+  if args.llvm:args.generated=llvm_main(args.generated)
   run('cmake','-S',ROOT/'ports/android','-B',build,'-G','Ninja',
       '-DCMAKE_TOOLCHAIN_FILE='+str(ndk/'build/cmake/android.toolchain.cmake'),
       '-DANDROID_ABI=arm64-v8a','-DANDROID_PLATFORM=android-26','-DCMAKE_BUILD_TYPE=Release',
       '-DTURBULENCE_ANDROID_GENERATED_DIR='+str(args.generated.resolve()),
       '-DTURBULENCE_ANDROID_REL_GENERATED_DIR='+str(args.rel_generated.resolve()))
-  run('cmake','--build',build,'--target','turbulence','-j',args.jobs)
+  run('cmake','--build',build,'--target','turbulence',*HOOKS,'-j',args.jobs)
  staging=build/'apk-stage'
  if staging.exists():shutil.rmtree(staging)
  assets=staging/'assets';assets.mkdir(parents=True)
@@ -46,6 +63,10 @@ def main():
   archive.write(dex/'classes.dex','classes.dex')
   archive.write(lib,'lib/arm64-v8a/libturbulence.so')
   archive.write(llvm/'sysroot/usr/lib/aarch64-linux-android/libc++_shared.so','lib/arm64-v8a/libc++_shared.so')
+  for hook in HOOKS:
+   built=build/'moderngekko/vendor/dolphin/Externals/libadrenotools/src/hook'/f'lib{hook}.so'
+   staged=staging/built.name;shutil.copy2(built,staged);run(llvm/'bin/llvm-strip','--strip-unneeded',staged)
+   archive.write(staged,f'lib/arm64-v8a/{built.name}')
  aligned=staging/'aligned.apk';run(tools/'zipalign','-f','-p','4',unsigned,aligned)
  key=ROOT/'build/android-tools/turbulence-debug.keystore'
  key.parent.mkdir(parents=True,exist_ok=True)

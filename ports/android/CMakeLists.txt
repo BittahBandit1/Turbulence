@@ -17,6 +17,8 @@ set_target_properties(androidcommon PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_features(androidcommon PUBLIC cxx_std_23)
 target_include_directories(androidcommon PRIVATE "${DOLPHIN}/Source/Android" "${DOLPHIN}/Source/Core")
 target_link_libraries(androidcommon PRIVATE android log)
+# 16 KiB-page devices: every shared library, including the adrenotools hooks.
+set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,max-page-size=16384")
 add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../../lib/ModernGekko" moderngekko)
 target_link_libraries(androidcommon PRIVATE common fmt::fmt)
 # NDK r27 ships stop_token/jthread in its experimental C++20 library.
@@ -34,9 +36,11 @@ add_library(turbulence SHARED GameplayBridge.cpp AAudioStream.cpp
 )
 target_compile_features(turbulence PRIVATE cxx_std_23)
 target_compile_definitions(turbulence PRIVATE _LIBCPP_ENABLE_EXPERIMENTAL TURBULENCE_ANDROID=1)
-target_include_directories(turbulence PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../src"
+target_include_directories(turbulence PRIVATE "${DOLPHIN}/Externals/Vulkan-Headers/include"
+ "${DOLPHIN}/Externals/VulkanMemoryAllocator/include" "${CMAKE_CURRENT_SOURCE_DIR}/../../src"
  "${CMAKE_CURRENT_SOURCE_DIR}/../../lib/ModernGekko/tools" "${DOLPHIN}/Source/Core" "${DOLPHIN}/Source/Android")
-target_link_libraries(turbulence PRIVATE ModernGekko::Runtime core imgui gGXEE8P_recomp aaudio android log c++experimental)
+target_link_libraries(turbulence PRIVATE ModernGekko::Runtime core imgui gGXEE8P_recomp aaudio android log c++experimental videovulkan)
+target_compile_definitions(turbulence PRIVATE HAS_VULKAN)
 
 # Support devices with 16 KiB host pages as well as older 4 KiB devices.
 target_link_options(turbulence PRIVATE "-Wl,-z,max-page-size=16384")

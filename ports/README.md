@@ -24,6 +24,10 @@ Android requires JDK, SDK platform/build tools 35, and NDK 27.3.13750724:
 python3 scripts/android.py --sdk "$ANDROID_HOME"
 ```
 
+Add `--llvm` to build main.dol with DolRecomp's LLVM backend (faster; the
+REL stays C). It needs DolRecomp built with LLVM 19/20 in
+lib/DolRecomp/build-llvm; the script prints the command if it is missing.
+
 The debug-signed ARM64 APK is written under build/release. A local signing key
 is generated only in build/android-tools. Minimum Android version is 8.0/API26.
 Touch controls include an analog pad, jump A, boost B, independent L/R drift,
@@ -45,6 +49,11 @@ The scripts verify device Mach-O architecture and minimum OS before packaging.
 Game controller family changes update automatic prompts; manual choices in
 Turbulence's options take priority. Apps pause input/audio when backgrounded.
 Desktop settings are separate; mobile starts at native internal resolution.
+
+Android on Adreno GPUs can load a custom Vulkan driver (for example Mesa
+Turnip): Install GPU driver (.zip) on the home screen takes a standard
+adrenotools package (meta.json plus the driver library). Use system driver
+removes it. The first launch with a new driver compiles shaders for it.
 
 ## Verification
 

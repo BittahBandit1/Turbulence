@@ -119,6 +119,19 @@ index c0548a0..f0a612f 100644
 +    enable_language(Swift)
 +    add_subdirectory("${TURBULENCE_IOS_APP_SOURCE_DIR}" turbulence-ios)
 +endif()
+diff --git a/include/moderngekko/mod_loader.hpp b/include/moderngekko/mod_loader.hpp
+index a33dd1d..dd7e79d 100644
+--- a/include/moderngekko/mod_loader.hpp
++++ b/include/moderngekko/mod_loader.hpp
+@@ -71,6 +71,8 @@ public:
+   bool HandlesAddress(std::uint32_t address) const;
+   bool HandlesRange(std::uint32_t start, std::uint32_t end) const;
+   bool HasGuestInterception() const;
++  // True when any mod was loaded (even one without guest hooks).
++  bool HasLoadedMods() const;
+   std::uint64_t InterceptionGeneration() const;
+   bool Empty() const;
+ 
 diff --git a/include/moderngekko/runtime.hpp b/include/moderngekko/runtime.hpp
 index 0adc855..8f7e888 100644
 --- a/include/moderngekko/runtime.hpp
@@ -151,7 +164,7 @@ index 0adc855..8f7e888 100644
    bool fullscreen = false;
    bool allow_interpreter = false;
 diff --git a/src/runtime/dolphin_runtime.cpp b/src/runtime/dolphin_runtime.cpp
-index f9b5405..acd7e81 100644
+index f9b5405..a636cbc 100644
 --- a/src/runtime/dolphin_runtime.cpp
 +++ b/src/runtime/dolphin_runtime.cpp
 @@ -1,8 +1,14 @@
@@ -389,7 +402,26 @@ index f9b5405..acd7e81 100644
  
    auto &jit = Core::System::GetInstance().GetJitInterface();
    StaticRecompModuleSource recomp_source;
-@@ -708,6 +840,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -700,14 +832,21 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+     recomp_source = StaticRecompModuleSource::Attached(
+         reinterpret_cast<const StaticRecompModuleDesc *>(
+             impl->config.module.descriptor));
+-  recomp_source.host_call = &ModManager::HostCall;
+-  recomp_source.host_call_contains = &ModManager::HostCallContains;
+-  recomp_source.host_call_range_contains =
+-      &ModManager::HostCallRangeContains;
+-  recomp_source.host_call_user = impl->mods.get();
++  // Turbulence: install the mod hook only when mods are loaded. Without it the
++  // recompiled code skips a host round trip on every dispatch (~2.5% of the
++  // Android CPU thread) and LLVM-backend regions enter without a query.
++  if (impl->mods && impl->mods->HasLoadedMods())
++  {
++    recomp_source.host_call = &ModManager::HostCall;
++    recomp_source.host_call_contains = &ModManager::HostCallContains;
++    recomp_source.host_call_range_contains =
++        &ModManager::HostCallRangeContains;
++    recomp_source.host_call_user = impl->mods.get();
++  }
    jit.SetStaticRecompModuleSource(std::move(recomp_source));
  
    s_runtime_active = true;
@@ -397,7 +429,7 @@ index f9b5405..acd7e81 100644
    s_platform = impl->platform.get();
    s_window_title = impl->title;
    s_show_fps_in_title = impl->config.show_fps_in_title;
-@@ -739,6 +872,7 @@ Runtime::~Runtime() {
+@@ -739,6 +878,7 @@ Runtime::~Runtime() {
    s_window_title.clear();
    s_show_fps_in_title = true;
    s_runtime_active = false;
@@ -405,7 +437,7 @@ index f9b5405..acd7e81 100644
  }
  
  void Runtime::StopAutomation() {
-@@ -790,6 +924,19 @@ RuntimeRunResult Runtime::Run() {
+@@ -790,6 +930,19 @@ RuntimeRunResult Runtime::Run() {
                           "Dolphin could not boot sys/main.dol"}};
    }
    m_impl->booted = true;
@@ -425,6 +457,19 @@ index f9b5405..acd7e81 100644
    m_impl->present_hook =
        GetVideoEvents().after_present_event.Register([this](const PresentInfo &info) {
          m_impl->automation_state.frame_count.store(info.frame_count,
+diff --git a/src/runtime/mod_loader.cpp b/src/runtime/mod_loader.cpp
+index 4b2345f..185bd55 100644
+--- a/src/runtime/mod_loader.cpp
++++ b/src/runtime/mod_loader.cpp
+@@ -653,6 +653,8 @@ bool ModManager::HandlesRange(std::uint32_t start, std::uint32_t end) const {
+       });
+ }
+ 
++bool ModManager::HasLoadedMods() const { return !m_impl->mods.empty(); }
++
+ bool ModManager::HasGuestInterception() const {
+   return !m_impl->patches.empty() || !m_impl->hooks.empty() ||
+          !m_impl->pending_returns.empty();
 diff --git a/tools/frontend_config.cpp b/tools/frontend_config.cpp
 index 03740d4..0724326 100644
 --- a/tools/frontend_config.cpp

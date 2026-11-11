@@ -64,7 +64,7 @@ index 3a81fe3..037d4b1 100644
 +# Small timing errors still recover naturally; no rendered frames are skipped.
 +MaxFallback = 20
 diff --git a/GXRuntime/include/core/cpu.h b/GXRuntime/include/core/cpu.h
-index e242b00..aff2c98 100644
+index e242b00..8b846f3 100644
 --- a/GXRuntime/include/core/cpu.h
 +++ b/GXRuntime/include/core/cpu.h
 @@ -3,6 +3,9 @@
@@ -77,7 +77,20 @@ index e242b00..aff2c98 100644
  #ifdef __cplusplus
  extern "C" {
  #endif
-@@ -447,6 +450,182 @@ static inline bool ppc_psq_store_inline(CPUState* cpu, u8 frS, u32 ea, bool w,
+@@ -404,6 +407,12 @@ static inline bool ppc_fp_available_inline(CPUState* cpu, u32 cia) {
+ }
+ void ppc_fallback_instruction(CPUState* cpu, u32 raw, u32 cia);
+ bool ppc_host_call(CPUState* cpu, u32 address);
++/* DolRecomp's LLVM backend asks this before entering a native region while a
++ * host_call hook is installed (mods may intercept addresses inside it). */
++#define PPC_HOST_CALL_NATIVE_REGION_QUERY 0xFFFFFFFCu
++#define PPC_NATIVE_REGION_QUERY_PENDING 0xFEu
++#define PPC_NATIVE_REGION_QUERY_HANDLED 0xFFu
++bool ppc_native_region_available(CPUState* cpu, u32 start, u32 end);
+ void ppc_system_call_exception(CPUState* cpu, u32 cia);
+ void ppc_dsi_exception(CPUState* cpu, u32 ea, u32 cia, u32 dsisr);
+ void ppc_alignment_exception(CPUState* cpu, u32 ea, u32 cia);
+@@ -447,6 +456,182 @@ static inline bool ppc_psq_store_inline(CPUState* cpu, u8 frS, u32 ea, bool w,
      }
      return ppc_psq_store(cpu, frS, ea, w, gqr_index, indexed, cia);
  }
@@ -261,7 +274,7 @@ index e242b00..aff2c98 100644
  void ppc_ecowx(CPUState* cpu, u32 ea, u32 value, u32 cia);
  void ppc_tlbie(CPUState* cpu, u32 ea, u32 cia);
 diff --git a/GXRuntime/src/core/cpu.c b/GXRuntime/src/core/cpu.c
-index 345b960..b85f7fa 100644
+index 345b960..1f77e16 100644
 --- a/GXRuntime/src/core/cpu.c
 +++ b/GXRuntime/src/core/cpu.c
 @@ -1,5 +1,6 @@
@@ -271,7 +284,34 @@ index 345b960..b85f7fa 100644
  #include <stdio.h>
  #include <stdlib.h>
  #include <string.h>
-@@ -194,7 +195,7 @@ static u32 psq_type_size(u8 type) {
+@@ -141,6 +142,26 @@ bool ppc_host_call(CPUState* cpu, u32 address) {
+     return cpu->host_call ? cpu->host_call(cpu, address) : false;
+ }
+ 
++/* Same contract as DolRecomp's runtime: the host answers the query through
++ * host_call; an unanswered query blocks native entry. */
++bool ppc_native_region_available(CPUState* cpu, u32 start, u32 end) {
++    if (!cpu || !cpu->host_call)
++        return true;
++
++    u32 saved_addr = cpu->external_addr;
++    u32 saved_value = cpu->external_value;
++    u8 saved_rid = cpu->external_rid;
++    cpu->external_addr = start;
++    cpu->external_value = end;
++    cpu->external_rid = PPC_NATIVE_REGION_QUERY_PENDING;
++    bool blocked = cpu->host_call(cpu, PPC_HOST_CALL_NATIVE_REGION_QUERY);
++    bool handled = cpu->external_rid == PPC_NATIVE_REGION_QUERY_HANDLED;
++    cpu->external_addr = saved_addr;
++    cpu->external_value = saved_value;
++    cpu->external_rid = saved_rid;
++    return handled && !blocked;
++}
++
+ void ppc_system_call_exception(CPUState* cpu, u32 cia) {
+     ppc_take_exception(cpu, PPC_EXC_SYSTEM_CALL, PPC_VECTOR_SYSTEM_CALL, cia + 4u, 0);
+ }
+@@ -194,7 +215,7 @@ static u32 psq_type_size(u8 type) {
  static f64 psq_dequant(f64 value, s32 scale) {
      if (scale == 0)
          return (f64)(f32)value;
@@ -280,7 +320,7 @@ index 345b960..b85f7fa 100644
  }
  
  static f64 psq_load_value(CPUState* cpu, u32 ea, u8 type, s32 scale) {
-@@ -215,7 +216,7 @@ static f64 psq_load_value(CPUState* cpu, u32 ea, u8 type, s32 scale) {
+@@ -215,7 +236,7 @@ static f64 psq_load_value(CPUState* cpu, u32 ea, u8 type, s32 scale) {
  }
  
  static s64 psq_quantize_int(f64 value, s64 min_value, s64 max_value, s32 scale) {
@@ -289,7 +329,7 @@ index 345b960..b85f7fa 100644
      if (isnan(conv))
          return 0;
      if (conv <= (f32)min_value)
-@@ -283,6 +284,16 @@ bool ppc_psq_store(CPUState* cpu, u8 frS, u32 ea, bool w, u8 gqr_index, bool ind
+@@ -283,6 +304,16 @@ bool ppc_psq_store(CPUState* cpu, u8 frS, u32 ea, bool w, u8 gqr_index, bool ind
      if (size == 0) /* invalid GQR type: nothing is stored */
          return true;
  
@@ -876,6 +916,26 @@ index d084fea..235ebaa 100644
  };
  
  extern StaticRecompCore* g_static_recomp_core;
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
+index 7b3d845..7035eba 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
+@@ -22,6 +22,15 @@ constexpr u32 LOCKED_CACHE_BASE = 0xE0000000u;
+ bool StaticRecompCore::HookHostCall(CPUState* cpu, u32 address)
+ {
+   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
++  if (address == PPC_HOST_CALL_NATIVE_REGION_QUERY)
++  {
++    // LLVM-backend native region entry: blocked only if a mod intercepts an
++    // address inside [external_addr, external_value).
++    cpu->external_rid = PPC_NATIVE_REGION_QUERY_HANDLED;
++    return core->m_module_source.host_call_range_contains &&
++           core->m_module_source.host_call_range_contains(
++               cpu->external_addr, cpu->external_value, core->m_module_source.host_call_user);
++  }
+   return core->m_module_source.host_call &&
+          core->m_module_source.host_call(cpu, address, core->m_module_source.host_call_user);
+ }
 diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
 index d91ec2d..2505c1d 100644
 --- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
@@ -3014,7 +3074,7 @@ index fe30aa2..e3da818 100644
    Common::HookableEvent<u32> config_changed_event;
  
 diff --git a/module-template/CMakeLists.txt b/module-template/CMakeLists.txt
-index dac92e8..4a94c8d 100644
+index dac92e8..a1f592a 100644
 --- a/module-template/CMakeLists.txt
 +++ b/module-template/CMakeLists.txt
 @@ -39,16 +39,32 @@ set(MODULE_NAME "g${GAME_ID}_recomp")
@@ -3071,16 +3131,15 @@ index dac92e8..4a94c8d 100644
    module_export.c
    "${MODULE_TABLES}"
    "${GXRUNTIME_DIR}/src/core/cpu.c"
-@@ -116,6 +141,33 @@ target_include_directories(${MODULE_NAME} PRIVATE
+@@ -116,6 +141,32 @@ target_include_directories(${MODULE_NAME} PRIVATE
    "${CHASSIS_ABI_DIR}"
    "${CMAKE_CURRENT_BINARY_DIR}")
  
 +# Turbulence: the REL's chunks include their own generated.h, so they build as
 +# a separate object library with the REL output first on the include path.
 +if(REL_GENERATED_DIR)
-+  if(GENERATED_HEADER_TEXT MATCHES "DOLRECOMP_BACKEND_LLVM")
-+    message(FATAL_ERROR "REL_GENERATED_DIR currently supports the C backend only")
-+  endif()
++  # The REL must be C-backend output; the main executable may be either. Both
++  # dispatchers share only the CPUState module ABI (module_export.c).
 +  file(GLOB REL_CHUNK_INPUTS CONFIGURE_DEPENDS "${REL_GENERATED_DIR}/chunks/*.c")
 +  if(NOT REL_CHUNK_INPUTS)
 +    message(FATAL_ERROR "REL output has no generated chunks in ${REL_GENERATED_DIR}/chunks")
@@ -3105,7 +3164,7 @@ index dac92e8..4a94c8d 100644
  if(NOT WIN32)
    target_link_libraries(${MODULE_NAME} PRIVATE m)
  endif()
-@@ -172,3 +224,14 @@ elseif(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+@@ -172,3 +223,14 @@ elseif(CMAKE_C_COMPILER_ID STREQUAL "GNU")
    target_compile_options(${MODULE_NAME} PRIVATE
      -O${RECOMPCORE_MODULE_OPT_LEVEL} -ffp-contract=off -fno-fast-math)
  endif()

@@ -411,3 +411,61 @@ CPU thread to the prime core (the scheduler already keeps it there at
 3.19 GHz). Top remaining costs (simpleperf, CPU thread): the game's own
 generated code (~45%), quantized stores/loads (~18%), dispatcher and cache-
 flush bookkeeping (~10%).
+
+## Android: LLVM backend for main.dol, custom GPU drivers — November 11, 2026 (Claude)
+
+**LLVM backend.** `python3 scripts/android.py --llvm` builds main.dol with
+DolRecomp's LLVM backend (native ARM64 objects for
+`aarch64-unknown-linux-android26`, generated into `build/llvm-android/` on
+first use) while _Main.rel stays C-backend output. Both run natively; only the
+code generator differs. Needs DolRecomp built with LLVM 19/20 in
+`lib/DolRecomp/build-llvm` (the script prints the cmake line).
+
+What made mixing possible:
+- module-template no longer rejects an LLVM main.dol with a C REL; the two
+  dispatchers only share the CPUState module ABI (module_export.c tries the
+  DOL's, then the REL's).
+- GXRuntime gains `ppc_native_region_available`, which LLVM regions call on
+  entry while a host_call hook is installed; StaticRecompCore answers the
+  `PPC_HOST_CALL_NATIVE_REGION_QUERY` from `ModManager::HandlesRange`.
+- The runtime installs the mod host_call hook only when mods are loaded. With
+  no mods (the normal case) the recompiled code skips a ModManager round trip
+  on every dispatch (~2.5% of the CPU thread) and LLVM regions skip the query.
+- CPUState layouts of DolRecomp's and GXRuntime's headers were checked
+  identical (only union field aliases differ).
+- `scripts/mobile_common.py` accepts LLVM objects for the main executable.
+
+Attract loop, heavy stretch (movie + demo races), Retroid Pocket Nova:
+
+| Build | Average | Worst 5 s sample |
+|---|---|---|
+| C backend (Nov 10) | 56.8 | 49.6 |
+| C backend + no-mods host_call | 58.5 | 52.5 |
+| LLVM main.dol + C REL | 59.9 | 59.0 |
+
+The LLVM build held 59-60 through the movie and three demo races (including
+2-player split screen), 0 hitches over 25 ms, correct rendering. iOS is not
+built with it yet (needs an `arm64-apple-ios15` triple and checking that the
+sideload restrictions allow the objects as-is; they contain no JIT).
+
+**Custom GPU drivers (Android).** Home screen: "Install GPU driver (.zip)" /
+"Use system driver". Takes standard adrenotools packages (meta.json +
+Vulkan library, e.g. Mesa Turnip builds); validates meta.json, libraryName,
+minApi and rejects zip path traversal. The package is extracted to
+`files/GpuDrivers/Extracted`; libadrenotools (already in Dolphin) loads it via
+the hook libraries, which the APK now ships (libhook_impl, libmain_hook,
+libfile_redirect_hook, libgsl_alloc_hook). Only offered when
+`Vulkan::SupportsCustomDriver()` (API 28+, Adreno/KGSL). gameplay.log and
+logcat print `Vulkan device: ...` on the first frame. Test hooks: intent
+extras `--es driver <path to zip>` and `--ez systemdriver true`.
+
+Verified with MrPurple Turnip T30 (26.3.0-devel): device reported as
+"PurpleVK-public Adreno (TM) 740", game runs. The first launch on a new driver
+waits ~50 s while every cached shader compiles for it (WaitForShadersBefore
+Starting); later launches are normal.
+
+Follow-up: Dolphin saves the Vulkan pipeline cache only on a clean shutdown,
+which a killed Android app never gets, so Turnip recompiled its startup
+shaders on every launch (46.8 s). The Android host now also saves it after the
+first frame and when the app is backgrounded: relaunch with Turnip 0.55 s.
+(The stock Qualcomm driver hid this with its own internal cache.)
