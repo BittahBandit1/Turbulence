@@ -8,6 +8,7 @@ TC="$PWD/ports/windows/clang-cl-xwin.cmake"
 B=build/windows-x64
 REL=$(ls -d build/modules/GXEE8P/*-5f8c8e46802d6f00/dolrecomp-output/rel/generated | head -1)
 cmake -S lib/ModernGekko -B $B/runtime -G Ninja -DCMAKE_TOOLCHAIN_FILE="$TC" -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_EXE_LINKER_FLAGS_RELEASE="/INCREMENTAL:NO /MAP" \
   -DBUILD_TESTING=OFF -DTURBULENCE_OPTIONS_SOURCE_DIR="$PWD/src" \
   -DUSE_SYSTEM_LIBS=OFF -DCMAKE_IGNORE_PREFIX_PATH="/opt/homebrew;/usr/local"
 cmake --build $B/runtime --target moderngekko-run -j"${JOBS:-10}" ${NINJA_K:+-- -k 0}

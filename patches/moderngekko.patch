@@ -182,7 +182,7 @@ index 0adc855..8f7e888 100644
    bool fullscreen = false;
    bool allow_interpreter = false;
 diff --git a/src/runtime/dolphin_runtime.cpp b/src/runtime/dolphin_runtime.cpp
-index f9b5405..a636cbc 100644
+index f9b5405..9e39771 100644
 --- a/src/runtime/dolphin_runtime.cpp
 +++ b/src/runtime/dolphin_runtime.cpp
 @@ -1,8 +1,14 @@
@@ -276,7 +276,7 @@ index f9b5405..a636cbc 100644
  void Host_Message(HostMessageID id) {
    if (id == HostMessageID::WMUserStop && s_platform)
      s_platform->Stop();
-@@ -134,7 +186,7 @@ void Host_JitCacheInvalidation() {}
+@@ -134,12 +186,17 @@ void Host_JitCacheInvalidation() {}
  void Host_JitProfileDataWiped() {}
  void Host_RequestRenderWindowSize(int, int) {}
  bool Host_RendererHasFocus() {
@@ -285,7 +285,17 @@ index f9b5405..a636cbc 100644
  }
  bool Host_RendererHasFullFocus() { return Host_RendererHasFocus(); }
  bool Host_RendererIsFullscreen() {
-@@ -203,6 +255,10 @@ void ClearAutomationPad(int port)
+   return s_platform && s_platform->IsWindowFullscreen();
+ }
++// Turbulence: the options menu's Fullscreen row (render thread).
++void Host_RequestFullscreen(bool fullscreen) {
++  if (s_platform)
++    s_platform->RequestFullscreen(fullscreen);
++}
+ bool Host_TASInputHasFocus() { return false; }
+ void Host_YieldToUI() {}
+ void Host_TitleChanged() {}
+@@ -203,6 +260,10 @@ void ClearAutomationPad(int port)
  
  void ApplyAutomationPad(const automation::PadState& pad)
  {
@@ -296,7 +306,7 @@ index f9b5405..a636cbc 100644
    ClearAutomationPad(pad.port);
    for (std::size_t index = 0; index < pad.controls.size(); ++index)
    {
-@@ -547,6 +603,9 @@ ModuleSource::AttachedDescriptor(const ModernGekkoModuleDesc *descriptor) {
+@@ -547,6 +608,9 @@ ModuleSource::AttachedDescriptor(const ModernGekkoModuleDesc *descriptor) {
  Runtime::Runtime(std::unique_ptr<Impl> impl) : m_impl(std::move(impl)) {}
  
  RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
@@ -306,7 +316,7 @@ index f9b5405..a636cbc 100644
    std::lock_guard lock(s_runtime_mutex);
    if (s_runtime_active)
      return {
-@@ -609,6 +668,10 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -609,13 +673,26 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
  
    if (!s_external_ui_common) {
      UICommon::SetUserDirectory(impl->config.user_directory.string());
@@ -317,7 +327,14 @@ index f9b5405..a636cbc 100644
      UICommon::Init();
      impl->ui_initialized = true;
    }
-@@ -616,6 +679,9 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+-  Config::SetBase(Config::MAIN_FULLSCREEN, impl->config.fullscreen);
++  bool fullscreen = impl->config.fullscreen;
++#if defined(TURBULENCE_OPTIONS_MENU) && !defined(TURBULENCE_IOS) && !defined(TURBULENCE_ANDROID)
++  // A launcher/command-line request wins; otherwise the menu's saved choice.
++  if (!fullscreen)
++    fullscreen = turbulence::LoadFullscreenPreference(impl->config.user_directory) == 1;
++#endif
++  Config::SetBase(Config::MAIN_FULLSCREEN, fullscreen);
  
    if (impl->config.headless)
      impl->platform = Platform::CreateHeadlessPlatform();
@@ -327,7 +344,7 @@ index f9b5405..a636cbc 100644
  #ifdef _WIN32
    else
      impl->platform = Platform::CreateWin32Platform();
-@@ -658,6 +724,16 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -658,6 +735,16 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
    impl->platform->SetTitle(impl->title);
  
    Config::SetBase(Config::MAIN_CPU_CORE, SelectCPUCore());
@@ -344,7 +361,7 @@ index f9b5405..a636cbc 100644
    if (!impl->config.graphics.backend.empty())
      Config::SetBase(Config::MAIN_GFX_BACKEND, impl->config.graphics.backend);
    else if (impl->config.headless)
-@@ -665,6 +741,63 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -665,6 +752,63 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
    if (impl->config.graphics.internal_resolution_scale)
      Config::SetBase(Config::GFX_EFB_SCALE,
                      *impl->config.graphics.internal_resolution_scale);
@@ -408,7 +425,7 @@ index f9b5405..a636cbc 100644
    Config::SetBase(Config::GFX_SHADER_CACHE, true);
    Config::SetBase(Config::GFX_SHADER_COMPILATION_MODE,
                    ShaderCompilationMode::AsynchronousUberShaders);
-@@ -687,9 +820,8 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -687,9 +831,8 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
    }
    Config::SetBase(Config::MAIN_AUDIO_BACKEND, impl->config.audio.backend);
    if (impl->config.audio.mute)
@@ -420,7 +437,7 @@ index f9b5405..a636cbc 100644
  
    auto &jit = Core::System::GetInstance().GetJitInterface();
    StaticRecompModuleSource recomp_source;
-@@ -700,14 +832,21 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -700,14 +843,21 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
      recomp_source = StaticRecompModuleSource::Attached(
          reinterpret_cast<const StaticRecompModuleDesc *>(
              impl->config.module.descriptor));
@@ -447,7 +464,7 @@ index f9b5405..a636cbc 100644
    s_platform = impl->platform.get();
    s_window_title = impl->title;
    s_show_fps_in_title = impl->config.show_fps_in_title;
-@@ -739,6 +878,7 @@ Runtime::~Runtime() {
+@@ -739,6 +889,7 @@ Runtime::~Runtime() {
    s_window_title.clear();
    s_show_fps_in_title = true;
    s_runtime_active = false;
@@ -455,7 +472,7 @@ index f9b5405..a636cbc 100644
  }
  
  void Runtime::StopAutomation() {
-@@ -790,6 +930,19 @@ RuntimeRunResult Runtime::Run() {
+@@ -790,6 +941,19 @@ RuntimeRunResult Runtime::Run() {
                           "Dolphin could not boot sys/main.dol"}};
    }
    m_impl->booted = true;
@@ -642,10 +659,110 @@ index af1c2a5..8ceba9c 100644
      configure += " -DCMAKE_C_FLAGS=" + QuoteText(pgo_compile_flags) +
                   " -DCMAKE_SHARED_LINKER_FLAGS=" + QuoteText(pgo_compile_flags);
 diff --git a/tools/moderngekko_run.cpp b/tools/moderngekko_run.cpp
-index d6b3569..050f296 100644
+index d6b3569..20291d0 100644
 --- a/tools/moderngekko_run.cpp
 +++ b/tools/moderngekko_run.cpp
-@@ -191,6 +191,7 @@ int RunMain(int argc, char **argv) {
+@@ -6,11 +6,20 @@
+ #include "netplay_session.hpp"
+ 
+ #include "Common/StringUtil.h"
++#include "Common/Config/Config.h"
++#include "Common/HookableEvent.h"
++#include "Core/Config/MainSettings.h"
++#include "Core/System.h"
++#include "VideoCommon/PerformanceMetrics.h"
++#include "VideoCommon/Present.h"
++#include "VideoCommon/VideoEvents.h"
+ 
+ #include <charconv>
+ #include <chrono>
+ #include <csignal>
++#include <cstdio>
+ #include <cstdlib>
++#include <cstring>
+ #include <exception>
+ #include <filesystem>
+ #include <fstream>
+@@ -124,10 +133,78 @@ std::filesystem::path ExecutableDirectory(const char *argv0) {
+       std::filesystem::weakly_canonical(argv0, ec);
+   return ec ? std::filesystem::current_path() : executable.parent_path();
+ }
++
++#if defined(_WIN32)
++// Turbulence: a crash on Windows otherwise exits silently. Report the
++// exception and the module + offset it happened in, so a tester can paste it.
++LONG WINAPI ReportUnhandledException(EXCEPTION_POINTERS *info) {
++  const EXCEPTION_RECORD *record = info->ExceptionRecord;
++  const void *address = record->ExceptionAddress;
++  char module_path[MAX_PATH] = "?";
++  HMODULE module = nullptr;
++  uintptr_t offset = 0;
++  if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                         static_cast<LPCSTR>(address), &module) &&
++      module) {
++    GetModuleFileNameA(module, module_path, MAX_PATH);
++    offset = reinterpret_cast<uintptr_t>(address) - reinterpret_cast<uintptr_t>(module);
++  }
++  const char *name = std::strrchr(module_path, '\\');
++  std::fprintf(stderr, "\n[crash] exception 0x%08lX at %p (%s+0x%llX)",
++               static_cast<unsigned long>(record->ExceptionCode), address,
++               name ? name + 1 : module_path, static_cast<unsigned long long>(offset));
++  if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2)
++    std::fprintf(stderr, " %s 0x%llX",
++                 record->ExceptionInformation[0] == 0   ? "reading"
++                 : record->ExceptionInformation[0] == 8 ? "executing"
++                                                        : "writing",
++                 static_cast<unsigned long long>(record->ExceptionInformation[1]));
++  std::fprintf(stderr, "\n");
++  // MSVC C++ exception: [1] thrown object, [2] ThrowInfo, [3] image base (x64
++  // RVAs). Print the catchable type names and std::exception::what().
++  if (record->ExceptionCode == 0xE06D7363 && record->NumberParameters >= 4 &&
++      record->ExceptionInformation[2] && record->ExceptionInformation[3]) {
++    const auto base = static_cast<uintptr_t>(record->ExceptionInformation[3]);
++    const auto *object = reinterpret_cast<const char *>(record->ExceptionInformation[1]);
++    const auto *throw_info = reinterpret_cast<const int32_t *>(record->ExceptionInformation[2]);
++    const auto *types = reinterpret_cast<const int32_t *>(base + static_cast<uint32_t>(throw_info[3]));
++    for (int32_t i = 0; i < types[0] && i < 16; ++i) {
++      const auto *type = reinterpret_cast<const int32_t *>(base + static_cast<uint32_t>(types[1 + i]));
++      const char *name = reinterpret_cast<const char *>(base + static_cast<uint32_t>(type[1])) +
++                         2 * sizeof(void *);
++      std::fprintf(stderr, "[crash]   type %s\n", name);
++      if (object && std::strcmp(name, ".?AVexception@std@@") == 0 && type[3] < 0)
++        std::fprintf(stderr, "[crash]   what(): %s\n",
++                     reinterpret_cast<const std::exception *>(object + type[2])->what());
++    }
++  }
++  void *frames[48];
++  const USHORT count = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
++  for (USHORT i = 0; i < count; ++i) {
++    char frame_module[MAX_PATH] = "?";
++    HMODULE frame_handle = nullptr;
++    uintptr_t frame_offset = reinterpret_cast<uintptr_t>(frames[i]);
++    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                           static_cast<LPCSTR>(frames[i]), &frame_handle) &&
++        frame_handle) {
++      GetModuleFileNameA(frame_handle, frame_module, MAX_PATH);
++      frame_offset -= reinterpret_cast<uintptr_t>(frame_handle);
++    }
++    const char *frame_name = std::strrchr(frame_module, '\\');
++    std::fprintf(stderr, "[crash]   #%u %s+0x%llX\n", i, frame_name ? frame_name + 1 : frame_module,
++                 static_cast<unsigned long long>(frame_offset));
++  }
++  std::fflush(stderr);
++  return EXCEPTION_CONTINUE_SEARCH;
++}
++#endif
+ } // namespace
+ 
+ int RunMain(int argc, char **argv) {
+ #if defined(_WIN32)
++  SetUnhandledExceptionFilter(ReportUnhandledException);
+   if (!std::getenv("SDL_GAMECONTROLLER_ALLOW_STEAM_VIRTUAL_GAMEPAD"))
+     _putenv_s("SDL_GAMECONTROLLER_ALLOW_STEAM_VIRTUAL_GAMEPAD", "1");
+ #else
+@@ -191,6 +268,7 @@ int RunMain(int argc, char **argv) {
        config.window_system = moderngekko::WindowSystem::Wayland;
      else if (arg == "--mute")
        config.audio.mute = true;
@@ -653,7 +770,7 @@ index d6b3569..050f296 100644
      else if (arg == "--automation-dir")
        config.automation.directory = value("--automation-dir");
      else if (arg == "--headless")
-@@ -279,6 +280,25 @@ int RunMain(int argc, char **argv) {
+@@ -279,6 +357,25 @@ int RunMain(int argc, char **argv) {
    if (dol_changed)
      std::cout << "Applied native DOL patches\n";
  #endif
@@ -679,3 +796,34 @@ index d6b3569..050f296 100644
    const auto inspected = moderngekko::InspectGame(config.game_root);
    if (!inspected) {
      std::cerr << "invalid game: " << inspected.error << '\n';
+@@ -405,7 +502,30 @@ int RunMain(int argc, char **argv) {
+       std::this_thread::sleep_for(std::chrono::milliseconds(50));
+     }
+   });
++  // Turbulence: TURBULENCE_PERF_LOG=1 prints speed every 5 s (desktop
++  // counterpart of the Android "Perf fps" logcat line) for unattended tuning.
++  Common::EventHook perf_log;
++  if (const char *perf = std::getenv("TURBULENCE_PERF_LOG"); perf && perf[0] && perf[0] != '0') {
++    perf_log = GetVideoEvents().after_present_event.Register([](const PresentInfo &) {
++      static auto last = std::chrono::steady_clock::now();
++      static bool reported = false;
++      if (!reported) {
++        reported = true;
++        std::fprintf(stderr, "[turbulence] video backend: %s\n",
++                     Config::Get(Config::MAIN_GFX_BACKEND).c_str());
++      }
++      const auto now = std::chrono::steady_clock::now();
++      if (now - last < std::chrono::seconds(5))
++        return;
++      last = now;
++      const auto &m = Core::System::GetInstance().GetPerfMetrics();
++      std::fprintf(stderr, "[turbulence] Perf fps=%.1f vps=%.1f speed=%.1f%%\n", m.GetFPS(),
++                   m.GetVPS(), m.GetSpeed() * 100.0);
++      std::fflush(stderr);
++    });
++  }
+   const moderngekko::RuntimeRunResult result = created.runtime->Run();
++  perf_log.reset();
+   signal_watcher.request_stop();
+   if (result.error) {
+     std::cerr << "runtime failed: " << result.error->message << '\n';

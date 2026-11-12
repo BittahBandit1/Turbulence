@@ -43,7 +43,10 @@ Style StyleForDevice(const std::string& name) {
 Style StyleForDevice(const ciface::Core::Device& device) {
   if (device.GetSource() == "XInput") return Style::Xbox;
 #ifdef HAVE_SDL3
-  if (const auto* pad = dynamic_cast<const ciface::SDL::Gamepad*>(&device)) {
+  // Every SDL-source device is an SDL::Gamepad. No dynamic_cast: Dolphin
+  // builds with /GR- on Windows, where it throws "no RTTI data".
+  if (device.GetSource() == "SDL") {
+    const auto* pad = static_cast<const ciface::SDL::Gamepad*>(&device);
     switch (SDL_GetGamepadTypeForID(pad->GetSDLInstanceID())) {
     case SDL_GAMEPAD_TYPE_PS3:
     case SDL_GAMEPAD_TYPE_PS4:
@@ -101,9 +104,16 @@ struct ButtonPrompts::Impl {
     if ((tick++ % 2u) != 0u || !g_controller_interface.IsInit()) return;
     const bool focused = Host_RendererHasFocus();
     int first_pad = -1, used = -1;
+    // On Windows the same pad also shows up through DInput (with a generic
+    // name -> GameCube prompts); with SDL present, ignore DInput so the
+    // prompts don't flip on every press.
+    bool have_sdl = false;
+    for (const auto& device : g_controller_interface.GetAllDevices())
+      have_sdl = have_sdl || device->GetSource() == "SDL";
     for (const auto& device : g_controller_interface.GetAllDevices()) {
       const auto source = device->GetSource();
       if (source != "SDL" && source != "XInput" && source != "DInput") continue;
+      if (have_sdl && source == "DInput") continue;
       const int style = StyleForDevice(*device);
       if (first_pad < 0) first_pad = style;
       if (!focused || used >= 0) continue;

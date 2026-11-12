@@ -29,6 +29,9 @@
 
 // Defined in Dolphin's VideoCommon (HUD layout).
 extern bool g_turbulence_hud_stretched;
+// Defined by the runtime (dolphin_runtime.cpp): asks the desktop platform to
+// enter or leave fullscreen on its own window thread.
+void Host_RequestFullscreen(bool fullscreen);
 
 namespace turbulence {
 namespace {
@@ -93,9 +96,13 @@ constexpr const char* kPromptLabels[] = {"Automatic", "GameCube", "Xbox", "PlayS
 // Dolphin post-processing shader shipped in Sys/Shaders/FXAA.glsl.
 constexpr const char* kFXAAShader = "FXAA";
 
-enum class Row { Scale, Aspect, HudLayout, FXAA, VSync, MetalHUD, PerfOverlay, Prompts, MenuButton, Exit };
+enum class Row { Scale, Aspect, Fullscreen, HudLayout, FXAA, VSync, MetalHUD, PerfOverlay, Prompts, MenuButton, Exit };
 const std::vector<Row>& Rows() {
-  static const std::vector<Row> rows = {Row::Scale, Row::Aspect, Row::HudLayout, Row::FXAA,
+  static const std::vector<Row> rows = {Row::Scale, Row::Aspect,
+#if !defined(TURBULENCE_IOS) && !defined(TURBULENCE_ANDROID)
+    Row::Fullscreen,  // desktop only: mobile is always full screen
+#endif
+    Row::HudLayout, Row::FXAA,
     Row::VSync,
 #ifdef __APPLE__
     Row::MetalHUD,
@@ -112,6 +119,7 @@ const char* RowLabel(Row row) {
   switch (row) {
   case Row::Scale: return "Resolution scale";
   case Row::Aspect: return "Aspect ratio";
+  case Row::Fullscreen: return "Fullscreen";
   case Row::HudLayout: return "HUD and menus";
   case Row::FXAA: return "FXAA";
   case Row::VSync: return "V-Sync";
@@ -324,6 +332,7 @@ struct OptionsMenu::Impl {
   bool stretch_hud = false;
   bool fxaa = false;
   bool vsync = true;
+  bool fullscreen = false;
   bool metal_hud = true;
   int perf_overlay = 0;  // 0 off, 1 FPS, 2 FPS + frame times
   FrameIntervals intervals;
@@ -360,6 +369,8 @@ struct OptionsMenu::Impl {
     stretch_hud = g_turbulence_hud_stretched;
     fxaa = Config::Get(Config::GFX_ENHANCE_POST_SHADER) == kFXAAShader;
     vsync = Config::Get(Config::GFX_VSYNC);
+    // Alt+Enter / Cmd+Return / the window menu can change it too.
+    fullscreen = Host_RendererIsFullscreen();
     const int scale = Config::Get(Config::GFX_EFB_SCALE);
     scale_index = 0;
     for (int i=0; i<static_cast<int>(scales.size()); ++i)
@@ -435,6 +446,12 @@ struct OptionsMenu::Impl {
       ini.GetOrCreateSection("Hardware")->Set("VSync", vsync);
     });
   }
+  void ApplyFullscreen() {
+    Host_RequestFullscreen(fullscreen);
+    save_error = SaveTurbulenceIni(directory, [&](Common::IniFile& ini) {
+      ini.GetOrCreateSection("Video")->Set("Fullscreen", fullscreen);
+    }) ? "" : "Could not save the fullscreen setting; change applies this session.";
+  }
   void ApplyMetalHUD() {
     SetMetalHUDVisible(render_view, metal_hud);
     save_error = SaveTurbulenceIni(directory, [&](Common::IniFile& ini) {
@@ -470,6 +487,7 @@ struct OptionsMenu::Impl {
       aspect_index = (aspect_index + delta + count) % count;
       ApplyAspect(); break;
     }
+    case Row::Fullscreen: fullscreen = !fullscreen; ApplyFullscreen(); break;
     case Row::HudLayout: stretch_hud = !stretch_hud; ApplyHudLayout(); break;
     case Row::FXAA: fxaa = !fxaa; ApplyFXAA(); break;
     case Row::VSync: vsync = !vsync; ApplyVSync(); break;
@@ -500,7 +518,7 @@ struct OptionsMenu::Impl {
     switch (CurrentRow()) {
     case Row::Exit: confirm_exit = true; exit_choice = 0; break;
     case Row::MenuButton: StartCapture(); break;
-    case Row::HudLayout: case Row::FXAA: case Row::VSync: case Row::MetalHUD: case Row::PerfOverlay: case Row::Prompts: Step(1); break;
+    case Row::Fullscreen: case Row::HudLayout: case Row::FXAA: case Row::VSync: case Row::MetalHUD: case Row::PerfOverlay: case Row::Prompts: Step(1); break;
     default: break;
     }
   }
@@ -514,6 +532,7 @@ struct OptionsMenu::Impl {
     switch (row) {
     case Row::Scale: return scales[scale_index].label;
     case Row::Aspect: return aspects[aspect_index].label;
+    case Row::Fullscreen: return fullscreen ? "On" : "Off";
     case Row::HudLayout: return stretch_hud ? "Stretched" : "Centered (4:3)";
     case Row::FXAA: return fxaa ? "On" : "Off";
     case Row::VSync: return vsync ? "On" : "Off";
@@ -706,6 +725,16 @@ int LoadPerfOverlayPreference(const std::filesystem::path& directory) {
   ini.GetOrCreateSection("Video")->Get("FPSCounter", &mode, 0);
   if (const char* forced = std::getenv("TURBULENCE_FPS_COUNTER"); forced && *forced) mode = std::atoi(forced);
   return std::clamp(mode, 0, 2);
+}
+
+int LoadFullscreenPreference(const std::filesystem::path& directory) {
+  Common::IniFile ini;
+  ini.Load(TurbulenceIni(directory));
+  const auto* section = ini.GetSection("Video");
+  bool enabled = false;
+  if (!section || !section->Exists("Fullscreen")) return -1;
+  section->Get("Fullscreen", &enabled, false);
+  return enabled ? 1 : 0;
 }
 
 bool LoadMetalHUDPreference(const std::filesystem::path& directory) {

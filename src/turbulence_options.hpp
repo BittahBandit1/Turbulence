@@ -42,6 +42,9 @@ void PrepareMetalHUD();
 // renderer reads at startup.
 void PrepareOptions(const std::filesystem::path& user_directory);
 MenuButtonBinding LoadMenuButtonBinding(const std::filesystem::path& user_directory);
+// Desktop fullscreen saved from the menu ([Video] Fullscreen): 1 on, 0 off,
+// -1 never set (use the launcher's choice).
+int LoadFullscreenPreference(const std::filesystem::path& user_directory);
 bool LoadMetalHUDPreference(const std::filesystem::path& user_directory);
 // FPS counter: 0 off, 1 FPS, 2 FPS + frame-interval graph ([Video] FPSCounter).
 int LoadPerfOverlayPreference(const std::filesystem::path& user_directory);
