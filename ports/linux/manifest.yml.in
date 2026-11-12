@@ -1,0 +1,65 @@
+# Generated per architecture by ports/linux/container-build.sh (@ARCH@).
+id: io.github.bittahbandit1.Turbulence
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+command: turbulence
+finish-args:
+  - --share=ipc
+  - --socket=x11
+  - --socket=wayland
+  - --socket=pulseaudio
+  - --device=all
+  - --filesystem=home
+modules:
+  - name: moderngekko
+    buildsystem: cmake-ninja
+    builddir: true
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DBUILD_TESTING=OFF
+      - -DTURBULENCE_OPTIONS_SOURCE_DIR=/run/build/moderngekko/turbulence-src
+    make-args: [moderngekko-run]
+    no-make-install: true
+    post-install:
+      - install -Dm755 moderngekko-run /app/bin/moderngekko-run
+      - cp -r Sys /app/bin/Sys
+      - install -Dm755 ../turbulence-linux/turbulence.sh /app/bin/turbulence
+      - install -Dm644 ../turbulence-config/GCPadNew.ini /app/share/turbulence/GCPadNew.ini
+    sources:
+      - type: dir
+        path: @ROOT@/lib/ModernGekko
+        skip: [build, .git]
+      - type: dir
+        path: @ROOT@/src
+        dest: turbulence-src
+      - type: dir
+        path: @ROOT@/ports/linux
+        dest: turbulence-linux
+      - type: dir
+        path: @ROOT@/config
+        dest: turbulence-config
+  - name: game-module
+    buildsystem: simple
+    build-commands:
+      - cmake -S mg/module-template -B mb -G Ninja -DCMAKE_BUILD_TYPE=Release -DGAME_ID=GXEE8P
+        -DGENERATED_DIR=$PWD/dol -DREL_GENERATED_DIR=$PWD/rel -DGXRUNTIME_DIR=$PWD/mg/GXRuntime
+        -DCHASSIS_ABI_DIR=$PWD/mg/StaticRecomp
+      - cmake --build mb
+      - install -Dm755 mb/gGXEE8P_recomp.so /app/lib/turbulence/gGXEE8P_recomp.so
+    sources:
+      - type: dir
+        path: @ROOT@/lib/ModernGekko/vendor/dolphin/module-template
+        dest: mg/module-template
+      - type: dir
+        path: @ROOT@/lib/ModernGekko/vendor/dolphin/GXRuntime
+        dest: mg/GXRuntime
+      - type: dir
+        path: @ROOT@/lib/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp
+        dest: mg/StaticRecomp
+      - type: dir
+        path: @ROOT@/build/llvm-linux-@ARCH@/dol/generated
+        dest: dol
+      - type: dir
+        path: @REL@
+        dest: rel

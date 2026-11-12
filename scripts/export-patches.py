@@ -5,7 +5,8 @@ import subprocess
 ROOT=Path(__file__).resolve().parents[1]
 REPOS=[('lib/ModernGekko','moderngekko'),('lib/ModernGekko/vendor/dolphin','dolphin'),
        ('lib/ModernGekko/vendor/dolphin/DolRecomp','dolrecomp'),
-       ('lib/ModernGekko/vendor/dolphin/Externals/watcher/watcher','watcher-mobile')]
+       ('lib/ModernGekko/vendor/dolphin/Externals/watcher/watcher','watcher-mobile'),
+       ('lib/ModernGekko/vendor/dolphin/Externals/libspng/libspng','libspng-windows')]
 def git(repo,*args):return subprocess.check_output(['git','-C',str(repo),*args])
 def main():
  bases=[]

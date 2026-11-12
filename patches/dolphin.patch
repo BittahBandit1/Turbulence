@@ -1,8 +1,22 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 9f837ec..9ea6d7c 100644
+index 9f837ec..b28b845 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -334,6 +334,10 @@ else()
+@@ -249,8 +249,11 @@ if(MSVC)
+   # Set warning level 4 (the highest)
+   add_compile_options(/W4)
+ 
+-  # Treat all warnings as errors
+-  add_compile_options(/WX)
++  # Treat all warnings as errors (MSVC itself; clang-cl's extra diagnostics
++  # would otherwise stop a cross-compile on warnings MSVC doesn't emit).
++  if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
++    add_compile_options(/WX)
++  endif()
+ 
+   # Disable some warnings
+   add_compile_options(
+@@ -334,6 +337,10 @@ else()
    endif()
  endif()
  
@@ -13,7 +27,7 @@ index 9f837ec..9ea6d7c 100644
  if(CMAKE_SYSTEM_NAME MATCHES "Darwin")
    if(NOT MACOS_USE_DEFAULT_SEARCH_PATH)
      # Hack up the path to prioritize the path to built-in OS libraries to
-@@ -661,7 +665,7 @@ if(ENABLE_VULKAN)
+@@ -661,7 +668,7 @@ if(ENABLE_VULKAN)
    endif()
  endif()
  
@@ -22,7 +36,7 @@ index 9f837ec..9ea6d7c 100644
    # OpenGL is available on all platforms except windows-arm64
    add_definitions(-DHAS_OPENGL)
  endif()
-@@ -715,7 +719,7 @@ if(ENABLE_CUBEB)
+@@ -715,7 +722,7 @@ if(ENABLE_CUBEB)
    add_definitions(-DHAVE_CUBEB)
  endif()
  
@@ -31,7 +45,7 @@ index 9f837ec..9ea6d7c 100644
    dolphin_find_optional_system_library(LibUSB Externals/libusb)
    add_definitions(-D__LIBUSB__)
  endif()
-@@ -743,7 +747,7 @@ dolphin_find_optional_system_library(MBEDTLS Externals/mbedtls 2.28)
+@@ -743,7 +750,7 @@ dolphin_find_optional_system_library(MBEDTLS Externals/mbedtls 2.28)
  
  dolphin_find_optional_system_library(CURL Externals/curl)
  
@@ -63,6 +77,21 @@ index 3a81fe3..037d4b1 100644
 +# Keep obsolete host deadlines from carrying a six-frame backlog after a stall.
 +# Small timing errors still recover naturally; no rendered frames are skipped.
 +MaxFallback = 20
+diff --git a/GXRuntime/CMakeLists.txt b/GXRuntime/CMakeLists.txt
+index f9e2bde..bb801a3 100644
+--- a/GXRuntime/CMakeLists.txt
++++ b/GXRuntime/CMakeLists.txt
+@@ -47,7 +47,9 @@ target_include_directories(gxruntime
+ )
+ 
+ include(CheckLibraryExists)
+-check_library_exists(m sqrt "" GXRUNTIME_HAVE_LIBM)
++if(NOT WIN32)
++    check_library_exists(m sqrt "" GXRUNTIME_HAVE_LIBM)
++endif()
+ if(GXRUNTIME_HAVE_LIBM)
+     target_link_libraries(gxruntime PUBLIC m)
+ endif()
 diff --git a/GXRuntime/include/core/cpu.h b/GXRuntime/include/core/cpu.h
 index e242b00..8b846f3 100644
 --- a/GXRuntime/include/core/cpu.h
@@ -443,8 +472,23 @@ index 2564448..514e370 100644
 +  target_sources(audiocommon PRIVATE IOSSoundStream.mm)
 +  target_link_libraries(audiocommon PRIVATE "-framework AudioToolbox")
 +endif()
+diff --git a/Source/Core/Common/Assert.h b/Source/Core/Common/Assert.h
+index ab31424..81be49f 100644
+--- a/Source/Core/Common/Assert.h
++++ b/Source/Core/Common/Assert.h
+@@ -16,8 +16,8 @@
+       if (!PanicYesNoFmtAssert(_t_,                                                                \
+                                "An error occurred.\n\n" _fmt_ "\n\n"                               \
+                                "  Condition: {}\n  File: {}\n  Line: {}\n  Function: {}\n\n"       \
+-                               "Ignore and continue?",                                             \
+-                               __VA_ARGS__ __VA_OPT__(, ) #_a_, __FILE__, __LINE__, __func__))     \
++                               "Ignore and continue?" __VA_OPT__(, ) __VA_ARGS__,                                             \
++                               #_a_, __FILE__, __LINE__, __func__))     \
+         Crash();                                                                                   \
+     }                                                                                              \
+   } while (0)
 diff --git a/Source/Core/Common/CMakeLists.txt b/Source/Core/Common/CMakeLists.txt
-index 807dca3..b181e63 100644
+index 807dca3..8ac4bf8 100644
 --- a/Source/Core/Common/CMakeLists.txt
 +++ b/Source/Core/Common/CMakeLists.txt
 @@ -327,7 +327,7 @@ if(WIN32)
@@ -456,6 +500,29 @@ index 807dca3..b181e63 100644
    target_sources(common PRIVATE
      GL/GLInterface/AGL.h
      GL/GLInterface/AGL.mm
+@@ -390,12 +390,16 @@ if(UNIX)
+ elseif(WIN32)
+   set(VC_TOOLS_VERSION "")
+   if(MSVC)
+-    find_package(PowerShell REQUIRED)
+-    execute_process(
+-      COMMAND ${POWERSHELL_EXE} -Command "[System.Diagnostics.FileVersionInfo]::GetVersionInfo('$ENV{VCToolsRedistDir}vc_redist.x64.exe').ProductVersion"
+-      OUTPUT_VARIABLE VC_TOOLS_VERSION
+-      OUTPUT_STRIP_TRAILING_WHITESPACE
+-      )
++    # Only stamps the VC redist version into build_info.txt; optional so the
++    # tree can be cross-compiled (clang-cl + xwin) without PowerShell.
++    find_package(PowerShell)
++    if(POWERSHELL_EXE)
++      execute_process(
++        COMMAND ${POWERSHELL_EXE} -Command "[System.Diagnostics.FileVersionInfo]::GetVersionInfo('$ENV{VCToolsRedistDir}vc_redist.x64.exe').ProductVersion"
++        OUTPUT_VARIABLE VC_TOOLS_VERSION
++        OUTPUT_STRIP_TRAILING_WHITESPACE
++        )
++    endif()
+     target_link_libraries(common PRIVATE "-INCLUDE:enableCompatPatches")
+   endif()
+   configure_file(
 diff --git a/Source/Core/Common/FileUtil.cpp b/Source/Core/Common/FileUtil.cpp
 index 6d2853b..3d1178f 100644
 --- a/Source/Core/Common/FileUtil.cpp
@@ -801,6 +868,18 @@ index e58579e..da44963 100644
    // Ignore full focus if we don't require basic focus
    const bool full_focus_passes =
        !require_focus || !require_full_focus || (focus_passes && Host_RendererHasFullFocus());
+diff --git a/Source/Core/Core/HW/Triforce/FZeroAX.cpp b/Source/Core/Core/HW/Triforce/FZeroAX.cpp
+index dde1068..4a37f32 100644
+--- a/Source/Core/Core/HW/Triforce/FZeroAX.cpp
++++ b/Source/Core/Core/HW/Triforce/FZeroAX.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include "Core/HW/Triforce/FZeroAX.h"
+ 
++#include <functional>
+ #include <numeric>
+ 
+ #include <fmt/ranges.h>
 diff --git a/Source/Core/Core/HW/WiimoteReal/IOAndroid.h b/Source/Core/Core/HW/WiimoteReal/IOAndroid.h
 index 4a79b90..730c1af 100644
 --- a/Source/Core/Core/HW/WiimoteReal/IOAndroid.h
@@ -1835,6 +1914,45 @@ index e56dd03..f9ccf8f 100644
  add_subdirectory(Null)
  add_subdirectory(Software)
  
+diff --git a/Source/Core/VideoBackends/D3D/CMakeLists.txt b/Source/Core/VideoBackends/D3D/CMakeLists.txt
+index ed75b29..590065a 100644
+--- a/Source/Core/VideoBackends/D3D/CMakeLists.txt
++++ b/Source/Core/VideoBackends/D3D/CMakeLists.txt
+@@ -34,3 +34,8 @@ if(MSVC)
+   # Add precompiled header
+   target_link_libraries(videod3d PRIVATE use_pch)
+ endif()
++
++# clang-cl is stricter than MSVC about narrowing in brace initializers.
++if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
++  target_compile_options(videod3d PRIVATE -Wno-c++11-narrowing)
++endif()
+diff --git a/Source/Core/VideoBackends/D3D12/CMakeLists.txt b/Source/Core/VideoBackends/D3D12/CMakeLists.txt
+index bc89b89..acb6758 100644
+--- a/Source/Core/VideoBackends/D3D12/CMakeLists.txt
++++ b/Source/Core/VideoBackends/D3D12/CMakeLists.txt
+@@ -40,3 +40,8 @@ if(MSVC)
+   # Add precompiled header
+   target_link_libraries(videod3d12 PRIVATE use_pch)
+ endif()
++
++# clang-cl is stricter than MSVC about narrowing in brace initializers.
++if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
++  target_compile_options(videod3d12 PRIVATE -Wno-c++11-narrowing)
++endif()
+diff --git a/Source/Core/VideoBackends/D3DCommon/CMakeLists.txt b/Source/Core/VideoBackends/D3DCommon/CMakeLists.txt
+index 90464c7..08f275e 100644
+--- a/Source/Core/VideoBackends/D3DCommon/CMakeLists.txt
++++ b/Source/Core/VideoBackends/D3DCommon/CMakeLists.txt
+@@ -18,3 +18,8 @@ if(MSVC)
+   # Add precompiled header
+   target_link_libraries(videod3dcommon PRIVATE use_pch)
+ endif()
++
++# clang-cl is stricter than MSVC about narrowing in brace initializers.
++if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
++  target_compile_options(videod3dcommon PRIVATE -Wno-c++11-narrowing)
++endif()
 diff --git a/Source/Core/VideoBackends/Metal/CMakeLists.txt b/Source/Core/VideoBackends/Metal/CMakeLists.txt
 index db633a0..b224d8b 100644
 --- a/Source/Core/VideoBackends/Metal/CMakeLists.txt
@@ -2122,6 +2240,33 @@ index 69a0968..00b4ecf 100644
    Statistics.h
    TextureCacheBase.cpp
    TextureCacheBase.h
+diff --git a/Source/Core/VideoCommon/CPUCullImpl.h b/Source/Core/VideoCommon/CPUCullImpl.h
+index e9a1d54..52574fb 100644
+--- a/Source/Core/VideoCommon/CPUCullImpl.h
++++ b/Source/Core/VideoCommon/CPUCullImpl.h
+@@ -19,13 +19,18 @@
+ #error This file is meant to be used by CPUCull.cpp only!
+ #endif
+ 
+-#if defined(__GNUC__) && defined(USE_FMA) && !(defined(__AVX__) && defined(__FMA__))
++// clang-cl defines __clang__ but not __GNUC__; it still needs the target attribute.
++#if (defined(__GNUC__) || defined(__clang__)) && !defined(CPUCULL_GNU)
++#define CPUCULL_GNU 1
++#endif
++
++#if defined(CPUCULL_GNU) && defined(USE_FMA) && !(defined(__AVX__) && defined(__FMA__))
+ #define ATTR_TARGET __attribute__((target("avx,fma")))
+-#elif defined(__GNUC__) && defined(USE_AVX) && !defined(__AVX__)
++#elif defined(CPUCULL_GNU) && defined(USE_AVX) && !defined(__AVX__)
+ #define ATTR_TARGET __attribute__((target("avx")))
+-#elif defined(__GNUC__) && defined(USE_SSE41) && !defined(__SSE4_1__)
++#elif defined(CPUCULL_GNU) && defined(USE_SSE41) && !defined(__SSE4_1__)
+ #define ATTR_TARGET __attribute__((target("sse4.1")))
+-#elif defined(__GNUC__) && defined(USE_SSE3) && !defined(__SSE3__)
++#elif defined(CPUCULL_GNU) && defined(USE_SSE3) && !defined(__SSE3__)
+ #define ATTR_TARGET __attribute__((target("sse3")))
+ #else
+ #define ATTR_TARGET
 diff --git a/Source/Core/VideoCommon/OnScreenUI.cpp b/Source/Core/VideoCommon/OnScreenUI.cpp
 index 451109b..cd89b2c 100644
 --- a/Source/Core/VideoCommon/OnScreenUI.cpp
@@ -3072,6 +3217,22 @@ index fe30aa2..e3da818 100644
 +
    // Called when certain video config setting are changed
    Common::HookableEvent<u32> config_changed_event;
+ 
+diff --git a/Source/PCH/CMakeLists.txt b/Source/PCH/CMakeLists.txt
+index 7e909a3..acae63b 100644
+--- a/Source/PCH/CMakeLists.txt
++++ b/Source/PCH/CMakeLists.txt
+@@ -7,6 +7,11 @@ add_library(use_pch INTERFACE)
+ 
+ # Uncomment this return to disable PCH
+ #return()
++# clang-cl (cross-compiling) doesn't support this shared /Yc+/Yu+/FI scheme;
++# it only saves build time, so skip it there.
++if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
++  return()
++endif()
+ 
+ add_library(build_pch pch.h pch.cpp)
  
 diff --git a/module-template/CMakeLists.txt b/module-template/CMakeLists.txt
 index dac92e8..a1f592a 100644

@@ -1,4 +1,4 @@
-# Turbulence mobile builds
+# Turbulence ports
 
 The Android and iOS hosts are adapted from Crazy Taxi ReFare's mobile ports
 (ReFare contributors, GPL-3.0; see COPYING). Turbulence keeps its own disc ID,
@@ -24,9 +24,9 @@ Android requires JDK, SDK platform/build tools 35, and NDK 27.3.13750724:
 python3 scripts/android.py --sdk "$ANDROID_HOME"
 ```
 
-Add `--llvm` to build main.dol with DolRecomp's LLVM backend (faster; the
-REL stays C). It needs DolRecomp built with LLVM 19/20 in
-lib/DolRecomp/build-llvm; the script prints the command if it is missing.
+main.dol is built with DolRecomp's LLVM backend by default (the REL stays C);
+pass `--c-backend` to either script for the older C output. LLVM output needs
+DolRecomp built with LLVM 19/20 in lib/DolRecomp/build-llvm.
 
 The debug-signed ARM64 APK is written under build/release. A local signing key
 is generated only in build/android-tools. Minimum Android version is 8.0/API26.
@@ -54,6 +54,34 @@ Android on Adreno GPUs can load a custom Vulkan driver (for example Mesa
 Turnip): Install GPU driver (.zip) on the home screen takes a standard
 adrenotools package (meta.json plus the driver library). Use system driver
 removes it. The first launch with a new driver compiles shaders for it.
+
+## Windows x64 and Linux Flatpak
+
+These are cross-built from macOS. Both use LLVM main.dol objects
+(x86-64-v2 with a runtime-selected x86-64-v3 copy on x86_64) and the C REL.
+
+```sh
+# Windows: needs Homebrew llvm@20 + lld and the MSVC CRT/SDK from xwin in ~/.xwin
+#   (xwin --accept-license splat --output ~/.xwin)
+bash scripts/windows.sh          # -> build/release/Turbulence-Windows-x64.zip
+# Linux: needs Docker (Colima with --vz-rosetta for x86_64 on Apple Silicon)
+bash scripts/flatpak.sh aarch64  # -> build/release/Turbulence-linux-aarch64.flatpak
+bash scripts/flatpak.sh x86_64   # -> build/release/Turbulence-linux-x86_64.flatpak
+```
+
+The LLVM objects come from
+`lib/DolRecomp/build-llvm/dolrecomp --backend=llvm --cpu gekko --targets <list>`
+with `DOLRECOMP_LLVM_TARGET` set to `x86_64-pc-windows-msvc`,
+`x86_64-unknown-linux-gnu` or `aarch64-unknown-linux-gnu`, written to
+build/llvm-<windows-x86_64|linux-x86_64|linux-aarch64>/dol/generated.
+
+Windows: unzip, put the extracted Sonic Riders USA folder (with sys\main.dol)
+in `game` next to Turbulence.bat, and run Turbulence.bat. Settings go in `user`.
+
+Linux: `flatpak install --user Turbulence-linux-<arch>.flatpak` (pulls the
+freedesktop 25.08 runtime from Flathub), put the extracted game in
+~/Turbulence/game (or set TURBULENCE_GAME), then
+`flatpak run io.github.bittahbandit1.Turbulence`.
 
 ## Verification
 

@@ -469,3 +469,48 @@ which a killed Android app never gets, so Turnip recompiled its startup
 shaders on every launch (46.8 s). The Android host now also saves it after the
 first frame and when the app is backgrounded: relaunch with Turnip 0.55 s.
 (The stock Qualcomm driver hid this with its own internal cache.)
+
+## LLVM backend on every platform — November 11, 2026 (Claude)
+
+main.dol now uses DolRecomp's LLVM backend by default everywhere; _Main.rel
+stays C. `--c-backend` (mobile scripts) or `BACKEND=c` (Makefile) selects C.
+
+- macOS: `make recompile GAME=Sonic-Riders-USA-En-Ja-Fr-De-Es-It` builds the
+  runtime (build/codex-runtime, DOLRECOMP_ENABLE_LLVM=ON, Homebrew LLVM 20
+  found automatically) and the LLVM module, and makes it active
+  (previous: active-module-before-llvm.txt). moderngekko-port no longer
+  rejects LLVM with a recompiled REL.
+  Attract loop on the M3 Pro: 59.9 FPS throughout, whole process ~50% of one
+  core; shutdown counters native=213M fallback=0 smc_failed=0, interpreted
+  hook-fallback instructions 3.75M (C module: 261M per run).
+- iOS: `python3 scripts/ios.py gameplay-app --ipa` (objects for
+  arm64-apple-ios15.0, generated into build/llvm-ios/).
+- Android: `python3 scripts/android.py` (LLVM default).
+
+Fixes found on the way:
+- DolRecomp's LLVM backend put a cold helper in an ELF-only section
+  (".text.unlikely.*"), which Mach-O rejects: every Apple build failed. Now
+  ELF-only (fp_fixups.cpp, both DolRecomp copies).
+- The project path contains parentheses: ModernGekko's dolrecomp copy step
+  lacked VERBATIM, and moderngekko-port forced Ninja response files for every
+  compile, whose unquoted "@path.rsp" broke under sh. Response files are now
+  left to CMake (it still uses one for the module link) except on Windows.
+- Makefile: tool builds moved to build/dolrecomp and build/codex-runtime
+  (lib/*/build held caches from the old Gemini workspace path).
+
+Windows x64 and Linux Flatpaks (cross-built on macOS, untested on target
+hardware yet; commands in ports/README.md):
+- Windows: clang-cl + lld-link + xwin CRT/SDK (ports/windows/clang-cl-xwin.cmake),
+  static CRT, imports only system DLLs. Dolphin needed: no /WX or PCH under
+  clang-cl, optional PowerShell, -Wno-c++11-narrowing on the D3D backends,
+  the CPUCull target attribute for clang-cl, <functional> in FZeroAX.cpp,
+  _putenv_s in moderngekko-run, no libm on Windows (GXRuntime, libspng —
+  saved as patches/libspng-windows.patch), and ASSERT_MSG reordered:
+  clang-cl's MS-compatible preprocessor deletes the comma before an empty
+  __VA_ARGS__, which glued the condition string onto the format string.
+- Linux: Fedora 41 container + flatpak-builder on freedesktop 25.08
+  (ports/linux), flatpak-builder always runs natively and builds x86_64 with
+  Rosetta-run tools (an x86_64 bwrap under Rosetta can't install seccomp).
+  Headless smoke test in a container with --graphics Null: both bundles load
+  the module and boot with fallback=0, smc_failed=0 (aarch64 45 s,
+  5.36G guest cycles; x86_64 under Rosetta on the v2 path).

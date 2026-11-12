@@ -1,7 +1,7 @@
 DOLRECOMP_DIR    := lib/DolRecomp
 MODERNGEKKO_DIR  := lib/ModernGekko
-DOLRECOMP_BUILD  := $(DOLRECOMP_DIR)/build
-MODERNGEKKO_BUILD:= $(MODERNGEKKO_DIR)/build
+DOLRECOMP_BUILD  := build/dolrecomp
+MODERNGEKKO_BUILD:= build/codex-runtime
 
 DOLRECOMP_BIN      := $(DOLRECOMP_BUILD)/dolrecomp
 MODERNGEKKO_PORT_BIN := $(MODERNGEKKO_BUILD)/moderngekko-port
@@ -27,9 +27,10 @@ BUILD_TESTING ?= OFF
 export TURBULENCE_REL_BASE ?= 0x803FBD00
 export TURBULENCE_REL_BSS ?= 0x805FB080
 
-# Generated-code backend: portable C or native LLVM objects.
-BACKEND ?= c
-LLVM_DIR ?=
+# Generated-code backend for main.dol: native LLVM objects (default) or
+# portable C. _Main.rel always uses the C backend.
+BACKEND ?= llvm
+LLVM_DIR ?= $(firstword $(wildcard /opt/homebrew/opt/llvm@20/lib/cmake/llvm /opt/homebrew/opt/llvm@19/lib/cmake/llvm /usr/local/opt/llvm@20/lib/cmake/llvm))
 ifneq ($(filter $(BACKEND),c llvm),$(BACKEND))
 $(error BACKEND must be c or llvm)
 endif

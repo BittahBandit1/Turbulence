@@ -15,7 +15,7 @@ import subprocess
 import struct
 import sys
 import zipfile
-from mobile_common import generated_sources
+from mobile_common import generated_sources, llvm_main
 
 ROOT = Path(__file__).resolve().parent.parent
 CACHE = ROOT / "build/ios-module-cache"
@@ -77,11 +77,15 @@ def main():
     parser.add_argument('--team', help='Apple development team ID, only for signing the import app')
     parser.add_argument('--jobs', type=int, default=6)
     parser.add_argument('--ipa', action='store_true', help='Package an unsigned device app for sideloading')
+    parser.add_argument('--c-backend', action='store_true',
+                        help='use the C backend for main.dol instead of LLVM (the REL is always C)')
     args = parser.parse_args()
     if platform.system() != 'Darwin':
         parser.error('The iOS toolchain requires macOS and Xcode')
     if args.target in ('module', 'gameplay-app'):
         args.generated, args.rel_generated = generated_sources(ROOT, args.generated, args.rel_generated)
+        if not args.c_backend and not args.simulator:
+            args.generated = llvm_main(ROOT, args.generated, 'arm64-apple-ios15.0', 'ios')
     if args.ipa and (args.target not in ('import-app', 'gameplay-app') or args.simulator or args.team):
         parser.error('--ipa requires an unsigned device app build (no --simulator or --team)')
     if args.target == 'gameplay-app':

@@ -38,6 +38,30 @@ index e37c893..99cecc1 100644
          rel_free(&rel);
          return 0;
      }
+diff --git a/src/backend/llvm/fp_fixups.cpp b/src/backend/llvm/fp_fixups.cpp
+index 4376667..b6a90eb 100644
+--- a/src/backend/llvm/fp_fixups.cpp
++++ b/src/backend/llvm/fp_fixups.cpp
+@@ -5,6 +5,7 @@
+ #include <llvm/IR/IRBuilder.h>
+ #include <llvm/IR/Intrinsics.h>
+ #include <llvm/IR/Module.h>
++#include <llvm/TargetParser/Triple.h>
+ 
+ #include "common/types.h"
+ 
+@@ -18,7 +19,10 @@ static void markColdFixup(Function *function) {
+   function->addFnAttr(Attribute::NoInline);
+   function->addFnAttr(Attribute::NoUnwind);
+   function->addFnAttr(Attribute::WillReturn);
+-  function->setSection(".text.unlikely." + function->getName().str());
++  // ELF section name; Mach-O (macOS/iOS) and COFF reject this form, and the
++  // Cold attribute already lets them place the function out of the hot path.
++  if (Triple(function->getParent()->getTargetTriple()).isOSBinFormatELF())
++    function->setSection(".text.unlikely." + function->getName().str());
+ }
+ 
+ Function *getPairNaNFixup(Module &module, Type *pairType) {
 diff --git a/src/frontend/container/rel.c b/src/frontend/container/rel.c
 index b894a36..484de19 100644
 --- a/src/frontend/container/rel.c

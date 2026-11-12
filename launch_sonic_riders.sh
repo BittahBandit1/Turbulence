@@ -38,7 +38,7 @@ cat <<'BANNER'
 ==========================================
  Launching Sonic Riders macOS Recomp
  Game ID: GXEE8P (GameCube)
- Backend: Portable C + Native Metal
+ Backend: LLVM native code + Metal
  Controls: Press [R1] or [Tab] for Options
 ==========================================
 BANNER

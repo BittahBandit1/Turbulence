@@ -1,9 +1,17 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index c0548a0..f0a612f 100644
+index c0548a0..dfa5d3a 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -5,6 +5,18 @@ else()
-     project(ModernGekko LANGUAGES C CXX)
+@@ -1,10 +1,23 @@
+ cmake_minimum_required(VERSION 3.20)
++# Objective-C++ only for Apple targets; APPLE is known only after project()
++# (a cross-compiling toolchain file is read by project() itself).
++project(ModernGekko LANGUAGES C CXX)
+ if(APPLE)
+-    project(ModernGekko LANGUAGES C CXX OBJCXX)
+-else()
+-    project(ModernGekko LANGUAGES C CXX)
++    enable_language(OBJCXX)
  endif()
  
 +if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
@@ -21,7 +29,7 @@ index c0548a0..f0a612f 100644
  include(CTest)
  include(CheckIncludeFileCXX)
  
-@@ -105,7 +117,9 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+@@ -105,7 +118,9 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
      set(ENCODE_FRAMEDUMPS OFF CACHE BOOL "" FORCE)
      set(ENABLE_LLVM OFF CACHE BOOL "" FORCE)
      # Cubeb is Dolphin's only audio backend on macOS
@@ -32,7 +40,7 @@ index c0548a0..f0a612f 100644
          set(ENABLE_CUBEB ON CACHE BOOL "" FORCE)
      else()
          set(ENABLE_CUBEB OFF CACHE BOOL "" FORCE)
-@@ -113,7 +127,11 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+@@ -113,7 +128,11 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
      set(ENABLE_HWDB OFF CACHE BOOL "" FORCE)
      set(ENABLE_EVDEV OFF CACHE BOOL "" FORCE)
      set(ENABLE_WAYLAND ON CACHE BOOL "" FORCE)
@@ -45,7 +53,7 @@ index c0548a0..f0a612f 100644
      set(USE_SYSTEM_SDL3 OFF CACHE BOOL "" FORCE)
      # SDL bundles its own copy of the macOS hidapi backend
      if(APPLE)
-@@ -245,7 +263,7 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+@@ -245,7 +264,7 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
          vendor/dolphin/Source/Core/DolphinNoGUI/Platform.cpp
          vendor/dolphin/Source/Core/DolphinNoGUI/PlatformHeadless.cpp
      )
@@ -54,7 +62,7 @@ index c0548a0..f0a612f 100644
          target_sources(moderngekko PRIVATE
              vendor/dolphin/Source/Core/InputCommon/ControllerInterface/Touch/InputOverrider.cpp)
      endif()
-@@ -255,7 +273,7 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+@@ -255,7 +274,7 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
              vendor/dolphin/Source/Core/DolphinNoGUI/PlatformWin32.cpp)
          target_link_libraries(moderngekko PRIVATE dwmapi)
      endif()
@@ -63,7 +71,7 @@ index c0548a0..f0a612f 100644
          # Dolphin's windowed backend for macOS
          target_sources(moderngekko PRIVATE
              vendor/dolphin/Source/Core/DolphinNoGUI/PlatformMacos.mm)
-@@ -281,6 +299,27 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+@@ -281,6 +300,27 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
          target_compile_definitions(moderngekko PRIVATE _M_GENERIC=1)
      endif()
      target_link_libraries(moderngekko PRIVATE core uicommon)
@@ -91,7 +99,7 @@ index c0548a0..f0a612f 100644
      if(TARGET PkgConfig::X11)
          target_sources(moderngekko PRIVATE
              vendor/dolphin/Source/Core/DolphinNoGUI/PlatformX11.cpp)
-@@ -403,7 +442,7 @@ target_link_libraries(moderngekko-module-info
+@@ -403,7 +443,7 @@ target_link_libraries(moderngekko-module-info
      PRIVATE ModernGekko::Runtime
  )
  
@@ -100,7 +108,7 @@ index c0548a0..f0a612f 100644
      if(TARGET SDL3-static)
          set(_moderngekko_sdl_target SDL3-static)
      elseif(TARGET SDL3::SDL3-shared)
-@@ -495,7 +534,8 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+@@ -495,7 +535,8 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
      add_custom_command(TARGET moderngekko-run POST_BUILD
          COMMAND ${CMAKE_COMMAND} -E copy_directory
                  "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/Data/Sys"
@@ -110,7 +118,17 @@ index c0548a0..f0a612f 100644
      if(MODERNGEKKO_DOL_PATCH_MANIFEST)
          add_custom_command(TARGET moderngekko-run POST_BUILD
              COMMAND ${CMAKE_COMMAND} -E make_directory
-@@ -1056,3 +1096,8 @@ if(BUILD_TESTING)
+@@ -626,7 +667,8 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+                 "$<TARGET_FILE:dolrecomp>"
+                 "$<TARGET_FILE_DIR:moderngekko-port>"
+         DEPENDS dolrecomp
+-        COMMENT "Refreshing dolrecomp beside moderngekko-port")
++        COMMENT "Refreshing dolrecomp beside moderngekko-port"
++        VERBATIM)  # quotes paths with spaces/parentheses
+     add_dependencies(moderngekko-port moderngekko-port-recompiler)
+ endif()
+ 
+@@ -1056,3 +1098,8 @@ if(BUILD_TESTING)
      add_test(NAME moderngekko.dolphin_shader
               COMMAND moderngekko_dolphin_shader_test)
  endif()
@@ -519,10 +537,10 @@ index 3b18d05..71ef24e 100644
    std::vector<std::string> controllers;
    bool show_fps_in_title = true;
 diff --git a/tools/moderngekko_port.cpp b/tools/moderngekko_port.cpp
-index af1c2a5..c59f2b6 100644
+index af1c2a5..8ceba9c 100644
 --- a/tools/moderngekko_port.cpp
 +++ b/tools/moderngekko_port.cpp
-@@ -670,6 +670,29 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
+@@ -670,6 +670,27 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
        pgo_compile_flags += " -Werror=profile-instr-out-of-date";
    }
  
@@ -540,11 +558,9 @@ index af1c2a5..c59f2b6 100644
 +  const std::string rel_bss = env_text("TURBULENCE_REL_BSS");
 +  const bool recompile_rel = !game.main_rel.empty() && !rel_base.empty() &&
 +                             env_text("TURBULENCE_REL_DISABLE").empty();
-+  if (recompile_rel && options.backend != "c")
-+  {
-+    std::cerr << "TURBULENCE_REL_BASE currently needs the C backend\n";
-+    return std::nullopt;
-+  }
++  // Turbulence: the REL is always generated with the C backend (below); the
++  // main DOL may use either backend, since the two dispatchers only share the
++  // CPUState module ABI.
 +  const std::string rel_identity = recompile_rel
 +      ? "|rel=" + game.rel_sha256 + "@" + rel_base + "/bss=" + rel_bss + "|rel-glue=2"
 +      : std::string();
@@ -552,7 +568,7 @@ index af1c2a5..c59f2b6 100644
    const std::string identity = std::string(RECOMPCORE_REVISION) + "|dolrecomp=" +
        std::string(DOLRECOMP_REVISION) + "|module-abi=" +
        std::to_string(MODERNGEKKO_MODULE_ABI_VERSION) + "|cpu-abi=" +
-@@ -677,7 +700,7 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
+@@ -677,7 +698,7 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
        std::string(architecture) + "|" + flags + "|backend=" + options.backend +
        "|patches=" + patches.fingerprint + "|dolrecomp_binary=" +
        *dolrecomp_hash + "|" + moderngekko::pgo::PgoCacheIdentity(options.pgo) +
@@ -561,7 +577,7 @@ index af1c2a5..c59f2b6 100644
    std::ostringstream key_tail;
    key_tail << std::hex << std::setfill('0') << std::setw(16) << Fnv1a(identity);
    const std::string cache_key = game.dol_sha256 + "-" + key_tail.str();
-@@ -711,6 +734,9 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
+@@ -711,6 +732,9 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
               << "flags=" << flags << '\n'
               << "backend=" << options.backend << '\n'
               << "patches=" << patches.fingerprint << '\n';
@@ -571,7 +587,7 @@ index af1c2a5..c59f2b6 100644
      if (options.pgo.mode != moderngekko::pgo::PgoMode::Off)
        manifest << moderngekko::pgo::FormatPgoManifest(options.pgo, options.pgo_facts);
      manifest.close();
-@@ -794,6 +820,32 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
+@@ -794,8 +818,43 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
    else
      std::ofstream{normalized_smc};
  
@@ -602,9 +618,21 @@ index af1c2a5..c59f2b6 100644
 +  }
 +
    const unsigned compile_jobs = std::max(1u, std::thread::hardware_concurrency());
-   std::string configure = "cmake -E env CMAKE_NINJA_FORCE_RESPONSE_FILE=1 cmake -S " +
+-  std::string configure = "cmake -E env CMAKE_NINJA_FORCE_RESPONSE_FILE=1 cmake -S " +
++#if defined(_WIN32)
++  // cmd.exe's 8 KiB limit: always use response files.
++  const std::string configure_env = "cmake -E env CMAKE_NINJA_FORCE_RESPONSE_FILE=1 ";
++#else
++  // CMake switches to a response file by itself where a command exceeds
++  // ARG_MAX (the module link). Forcing them for every compile breaks on source
++  // paths containing parentheses: Ninja passes "@path.rsp" unquoted to sh.
++  const std::string configure_env;
++#endif
++  std::string configure = configure_env + "cmake -S " +
        Quote(source_root / "vendor/dolphin/module-template") +
-@@ -806,6 +858,8 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
+       " -B " + Quote(module_build) + " -G Ninja -DCMAKE_BUILD_TYPE=Release" +
+       " -DCMAKE_C_COMPILER=" + compiler + " -DGAME_ID=" + game.disc_id +
+@@ -806,6 +865,8 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
             : " -DRECOMPCORE_MODULE_OPT_LEVEL=" + options.opt_level) +
        " -DCHASSIS_ABI_DIR=" +
        Quote(source_root / "vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp");
@@ -614,7 +642,7 @@ index af1c2a5..c59f2b6 100644
      configure += " -DCMAKE_C_FLAGS=" + QuoteText(pgo_compile_flags) +
                   " -DCMAKE_SHARED_LINKER_FLAGS=" + QuoteText(pgo_compile_flags);
 diff --git a/tools/moderngekko_run.cpp b/tools/moderngekko_run.cpp
-index d6b3569..baa4098 100644
+index d6b3569..050f296 100644
 --- a/tools/moderngekko_run.cpp
 +++ b/tools/moderngekko_run.cpp
 @@ -191,6 +191,7 @@ int RunMain(int argc, char **argv) {
@@ -625,7 +653,7 @@ index d6b3569..baa4098 100644
      else if (arg == "--automation-dir")
        config.automation.directory = value("--automation-dir");
      else if (arg == "--headless")
-@@ -279,6 +280,18 @@ int RunMain(int argc, char **argv) {
+@@ -279,6 +280,25 @@ int RunMain(int argc, char **argv) {
    if (dol_changed)
      std::cout << "Applied native DOL patches\n";
  #endif
@@ -639,7 +667,14 @@ index d6b3569..baa4098 100644
 +  {
 +    const std::string from = std::string("TURBULENCE_SR_") + name;
 +    if (const char* value = std::getenv(from.c_str()))
-+      setenv((std::string("STATICRECOMP_") + name).c_str(), value, 1);
++    {
++      const std::string to = std::string("STATICRECOMP_") + name;
++#if defined(_WIN32)
++      _putenv_s(to.c_str(), value);
++#else
++      setenv(to.c_str(), value, 1);
++#endif
++    }
 +  }
    const auto inspected = moderngekko::InspectGame(config.game_root);
    if (!inspected) {
