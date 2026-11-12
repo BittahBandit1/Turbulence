@@ -894,7 +894,7 @@ index 4a79b90..730c1af 100644
  #include <string>
  
 diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
-index e3581cc..354bb70 100644
+index e3581cc..8a923f9 100644
 --- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
 +++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
 @@ -2,6 +2,7 @@
@@ -944,15 +944,16 @@ index e3581cc..354bb70 100644
    g_static_recomp_core = nullptr;
    std::fprintf(stderr,
                 "[staticrecomp] shutdown: native=%llu fallback=%llu native_exc=%llu hook_fb=%llu "
-@@ -328,6 +339,7 @@ void StaticRecompCore::LoadModule()
+@@ -328,6 +339,8 @@ void StaticRecompCore::LoadModule()
    }
    m_active_rel_sections.clear();
    m_rel_mapping_generation = 0;
++  InvalidateResolveCache();
 +  m_rel_scan_dirty = true;
    m_failed_chunks = 0;
    m_lookup_ram_size = 0;
    m_lookup_exram_size = 0;
-@@ -356,6 +368,7 @@ void StaticRecompCore::ClearCache()
+@@ -356,6 +369,7 @@ void StaticRecompCore::ClearCache()
    if (!m_module)
      return;
    std::fill(m_chunk_state.begin(), m_chunk_state.end(), u8{CHUNK_UNVERIFIED});
@@ -961,19 +962,20 @@ index e3581cc..354bb70 100644
    ++m_reverify_events;
  }
 diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
-index d084fea..235ebaa 100644
+index d084fea..4a165d2 100644
 --- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
 +++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
-@@ -3,6 +3,8 @@
+@@ -3,6 +3,9 @@
  
  #pragma once
  
++#include <array>
 +#include <chrono>
 +
  #include <string>
  #include <unordered_map>
  #include <unordered_set>
-@@ -194,6 +196,13 @@ private:
+@@ -194,10 +197,42 @@ private:
    std::vector<int> m_chunk_rel_sections;
    std::vector<u64> m_effective_chunk_hashes;
    u64 m_rel_mapping_generation = 0;
@@ -987,7 +989,36 @@ index d084fea..235ebaa 100644
    u32 m_failed_chunks = 0;    // chunks currently failing verification (real SMC)
    u64 m_verifications = 0;    // chunk hash checks performed
    u64 m_reverify_events = 0;  // invalidations that reset a chunk to Unverified
-@@ -212,6 +221,7 @@ private:
+ 
++  // Turbulence: ResolveNativeAddress/ChunkIndexOf run 2-3 times per native
++  // dispatch (~2M/s in a race), and each probes REL sections and the 24 MB
++  // lookup table -- a cache miss on most x86 parts. Their results depend only
++  // on the REL mapping and the table, so remember recent ones. Bump the epoch
++  // whenever either changes.
++  struct ResolveCacheEntry
++  {
++    u32 runtime_address = 0;
++    u32 linked_address = 0;
++    int chunk = -1;
++    u32 epoch = 0;  // 0 = empty
++    bool resolved = false;
++  };
++  std::array<ResolveCacheEntry, 4096> m_resolve_cache{};
++  u32 m_resolve_epoch = 1;
++  void InvalidateResolveCache()
++  {
++    if (++m_resolve_epoch == 0)
++    {
++      m_resolve_cache.fill({});
++      m_resolve_epoch = 1;
++    }
++  }
++  const ResolveCacheEntry& LookupResolveCache(u32 runtime_address);
++
+   // Lookup table optimization for O(1) chunk searches
+   std::vector<int> m_chunk_lookup_table;
+   u32 m_lookup_ram_size = 0;
+@@ -212,6 +247,7 @@ private:
    bool m_collect_dispatch_samples = false;
    bool m_has_rel_modules = false;
    u32 m_idle_pc = 0;
@@ -1016,7 +1047,7 @@ index 7b3d845..7035eba 100644
           core->m_module_source.host_call(cpu, address, core->m_module_source.host_call_user);
  }
 diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
-index d91ec2d..2505c1d 100644
+index d91ec2d..ccabb00 100644
 --- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
 +++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
 @@ -2,6 +2,16 @@
@@ -1066,9 +1097,16 @@ index d91ec2d..2505c1d 100644
      const std::string current_game_id = SConfig::GetInstance().GetGameID();
      m_module_active = m_module && (current_game_id.empty() || current_game_id == m_module->game_id);
  
-@@ -155,6 +181,32 @@ void StaticRecompCore::Run()
+@@ -153,8 +179,38 @@ void StaticRecompCore::Run()
+           const u32 runtime_dispatch_address = m_guest.pc;
+           u32 linked_dispatch_address = runtime_dispatch_address;
            if (m_has_rel_modules)
-             ResolveNativeAddress(runtime_dispatch_address, &linked_dispatch_address, nullptr);
+-            ResolveNativeAddress(runtime_dispatch_address, &linked_dispatch_address, nullptr);
++          {
++            const ResolveCacheEntry& resolved = LookupResolveCache(runtime_dispatch_address);
++            if (resolved.resolved)
++              linked_dispatch_address = resolved.linked_address;
++          }
            m_guest.pc = linked_dispatch_address;
 +          // Sonic Riders USA: engine perspective/culling matrix constructor.
 +          // The module verifies its code chunks before dispatching here.
@@ -1099,7 +1137,7 @@ index d91ec2d..2505c1d 100644
            m_module->dispatch(&m_guest, linked_dispatch_address);
            if (m_has_rel_modules)
              m_guest.pc = TranslateRelAddress(m_guest.pc);
-@@ -184,7 +236,22 @@ void StaticRecompCore::Run()
+@@ -184,7 +240,22 @@ void StaticRecompCore::Run()
            // Idle loop skipping for configured target loops (e.g. Wii Menu OSIdleThread)
            if (m_guest.pc == m_idle_pc && m_idle_pc != 0)
            {
@@ -1124,7 +1162,7 @@ index d91ec2d..2505c1d 100644
  
            // ctx->timebase is refreshed at burst start (SyncIn), and here we
 diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
-index 491c57e..6dc0944 100644
+index 491c57e..bd8617a 100644
 --- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
 +++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
 @@ -22,6 +22,9 @@ void StaticRecompCore::RefreshRelSections()
@@ -1185,7 +1223,15 @@ index 491c57e..6dc0944 100644
          break;
        }
      }
-@@ -132,8 +155,11 @@ bool StaticRecompCore::ResolveNativeAddress(u32 runtime_address, u32* linked_add
+@@ -89,6 +112,7 @@ void StaticRecompCore::RefreshRelSections()
+     return;
+   m_active_rel_sections = std::move(discovered);
+   ++m_rel_mapping_generation;
++  InvalidateResolveCache();
+   for (u32 i = 0; i < m_chunk_rel_sections.size(); ++i)
+   {
+     if (m_chunk_rel_sections[i] < 0)
+@@ -132,8 +156,11 @@ bool StaticRecompCore::ResolveNativeAddress(u32 runtime_address, u32* linked_add
        return true;
      }
    }
@@ -1199,7 +1245,54 @@ index 491c57e..6dc0944 100644
  }
  
  bool StaticRecompCore::ResolveRuntimeAddress(u32 linked_address, u32* runtime_address) const
-@@ -339,6 +365,7 @@ void StaticRecompCore::OnICacheInvalidate(u32 address, u32 length)
+@@ -174,6 +201,7 @@ void StaticRecompCore::InitLookupTable(u32 ram_size, u32 exram_size)
+ 
+   m_lookup_ram_size = ram_size;
+   m_lookup_exram_size = exram_size;
++  InvalidateResolveCache();
+ 
+   if (!m_module)
+   {
+@@ -200,19 +228,29 @@ void StaticRecompCore::InitLookupTable(u32 ram_size, u32 exram_size)
+   }
+ }
+ 
++const StaticRecompCore::ResolveCacheEntry& StaticRecompCore::LookupResolveCache(u32 runtime_address)
++{
++  ResolveCacheEntry& entry = m_resolve_cache[(runtime_address >> 2) & (m_resolve_cache.size() - 1)];
++  if (entry.epoch == m_resolve_epoch && entry.runtime_address == runtime_address)
++    return entry;
++  u32 linked_address = runtime_address;
++  const bool resolved = ResolveNativeAddress(runtime_address, &linked_address, nullptr);
++  int chunk = -1;
++  if (resolved)
++  {
++    const int idx = GetAddressLookupIndex(linked_address);
++    if (idx >= 0 && idx < static_cast<int>(m_chunk_lookup_table.size()))
++      chunk = m_chunk_lookup_table[idx];
++  }
++  entry = {runtime_address, linked_address, chunk, m_resolve_epoch, resolved};
++  return entry;
++}
++
+ int StaticRecompCore::ChunkIndexOf(u32 address)
+ {
+   if (!m_module_active || m_chunk_lookup_table.empty())
+     return -1;
+-
+-  u32 linked_address = address;
+-  if (!ResolveNativeAddress(address, &linked_address, nullptr))
+-    return -1;
+-  int idx = GetAddressLookupIndex(linked_address);
+-  if (idx < 0 || idx >= static_cast<int>(m_chunk_lookup_table.size()))
+-    return -1;
+-
+-  return m_chunk_lookup_table[idx];
++  return LookupResolveCache(address).chunk;
+ }
+ 
+ bool StaticRecompCore::FastDispatchableAt(u32 address)
+@@ -339,6 +377,7 @@ void StaticRecompCore::OnICacheInvalidate(u32 address, u32 length)
  
    if (!m_module_active || length == 0)
      return;
@@ -4359,3 +4452,20 @@ index 5b0729a..2432818 100644
 +  int TakeFullscreenRequest() { return m_fullscreen_request.exchange(-1); }
 +  std::atomic<int> m_fullscreen_request{-1};
  };
+diff --git a/Source/Core/Core/Config/MainSettings.cpp b/Source/Core/Core/Config/MainSettings.cpp
+index cddac14..253de4e 100644
+--- a/Source/Core/Core/Config/MainSettings.cpp
++++ b/Source/Core/Core/Config/MainSettings.cpp
+@@ -56,8 +56,11 @@ const Info<bool> MAIN_RUSH_FRAME_PRESENTATION{{System::Main, "Core", "RushFrameP
+                                               false};
+ const Info<bool> MAIN_SMOOTH_EARLY_PRESENTATION{{System::Main, "Core", "SmoothEarlyPresentation"},
+                                                 false};
+-#if defined(ANDROID)
++#if defined(ANDROID) || defined(_WIN32)
+ // Currently enabled by default on Android because the performance boost is really needed.
++// Turbulence: also on Windows. Single-core, Sonic Riders races ran at 79-90% speed on a
++// Ryzen 7 8845HS (game, dispatcher and video work all on one thread); dual-core holds 60.
++// [Core] CPUThread in Dolphin.ini still overrides it.
+ constexpr bool DEFAULT_CPU_THREAD = true;
+ #else
+ constexpr bool DEFAULT_CPU_THREAD = false;
