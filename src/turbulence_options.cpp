@@ -13,6 +13,7 @@
 #include "InputCommon/ControllerInterface/ControllerInterface.h"
 #include "VideoCommon/PerformanceMetrics.h"
 #include "VideoCommon/Present.h"
+#include "VideoCommon/VideoBackendBase.h"
 #include "VideoCommon/VideoConfig.h"
 #include "VideoCommon/VideoEvents.h"
 #include "imgui.h"
@@ -293,6 +294,11 @@ void DrawPerfOverlay(const FrameIntervals& intervals, int mode) {
   const ImVec4 fps_color = fps >= 59.0 ? ImVec4(0.45f, 0.95f, 0.45f, 1) : fps >= 50.0 ? p.title : p.danger;
   ImGui::TextColored(fps_color, "%.1f FPS", fps);
   ImGui::SameLine(); ImGui::TextColored(p.text_dim, "%.0f%% speed", speed * 100.0);
+  // The video backend actually in use (Vulkan, Direct3D 11, Metal...), to
+  // confirm a backend change took effect.
+  if (g_video_backend) {
+    ImGui::SameLine(); ImGui::TextColored(p.text_dim, "%s", g_video_backend->GetDisplayName().c_str());
+  }
   if (mode >= 2) {
     ImGui::TextColored(p.text, "Frame %.2f ms  (min %.2f / max %.2f)", avg, recent ? low : 0.0f, high);
     ImGui::TextColored(over ? p.title : p.text_dim, "VPS %.1f   hitches >25 ms: %d / %ds", vps, over, FrameIntervals::kSize / 60);
