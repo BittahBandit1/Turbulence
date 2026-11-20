@@ -3,6 +3,8 @@
 // thread; reads controllers through Dolphin's controller interface, so it
 // respects window focus like the game does.
 #include "turbulence_options.hpp"
+#include "turbulence_native_text.hpp"
+#include "VideoCommon/TurbulenceNativeMenu.h"
 #include "turbulence_metal.hpp"
 #include "turbulence_prompts.hpp"
 #include "Common/Config/Config.h"
@@ -33,6 +35,7 @@ extern bool g_turbulence_hud_stretched;
 namespace turbulence {
 namespace {
 std::atomic<bool> s_blocks_input{false};
+std::atomic<unsigned> s_automation_buttons{0};
 
 // Sonic Riders palette, sampled from the game: indigo panels and the teal
 // selection pill with a bright cyan outline from its own menus (save data,
@@ -102,9 +105,6 @@ const std::vector<Row>& Rows() {
 #endif
     Row::PerfOverlay,
     Row::Prompts,
-#if !defined(TURBULENCE_IOS) && !defined(TURBULENCE_ANDROID)
-    Row::MenuButton,
-#endif
     Row::Exit};
   return rows;
 }
@@ -193,8 +193,8 @@ Buttons ReadButtons() {
     };
     if (device->GetSource() == "SDL") {
       result[Toggle] |= !s_menu_binding.pad.empty() && held(s_menu_binding.pad);
-      result[Up] |= held("Pad N"); result[Down] |= held("Pad S");
-      result[Left] |= held("Pad W"); result[Right] |= held("Pad E");
+      result[Up] |= held("Pad N") || held("Left Y+"); result[Down] |= held("Pad S") || held("Left Y-");
+      result[Left] |= held("Pad W") || held("Left X-"); result[Right] |= held("Pad E") || held("Left X+");
       result[Back] |= held("Button E");
       result[Confirm] |= held("Button S");
     } else {
@@ -226,7 +226,7 @@ bool SaveTurbulenceIni(const std::filesystem::path& directory,
 // FPS counter: frame rate plus the interval between new game frames, as the
 // renderer presented them (duplicate presents of an unchanged frame are folded
 // into the next interval, so a dropped frame shows as a ~33 ms spike).
-constexpr const char* kPerfLabels[] = {"Off", "On", "On + frame times"};
+constexpr const char* kPerfLabels[] = {"Off", "On", "On and frame times"};
 class FrameIntervals {
 public:
   static constexpr int kSize = 240;  // 4 seconds at 60 fps
@@ -319,6 +319,7 @@ struct OptionsMenu::Impl {
   bool open = false;
   bool drain = false;
   int selected = 0;
+  NativeMenuText native_text;
   int scale_index = 0;
   int aspect_index = 0;
   bool stretch_hud = false;
@@ -338,9 +339,10 @@ struct OptionsMenu::Impl {
   Impl(std::filesystem::path path, void* view, std::function<void()> exit,
        std::function<OptionsInput()> source, std::function<MenuButtonCapture()> capture)
       : directory(std::move(path)), render_view(view),
-        input_source(source ? std::move(source) : ReadButtons),
+        input_source(std::move(source)),
         request_exit(std::move(exit)),
         capture_source(capture ? std::move(capture) : ReadCapture) {
+    TurbulenceNativeMenu::host_ui_available=true;
     s_menu_binding = LoadMenuButtonBinding(directory);
     binding = s_menu_binding;
     metal_hud = LoadMetalHUDPreference(directory);
@@ -354,7 +356,12 @@ struct OptionsMenu::Impl {
       open_on_first_draw = true;
   }
   bool open_on_first_draw = false;
-  ~Impl() { draw_hook.reset(); present_hook.reset(); s_blocks_input = false; }
+  ~Impl() {
+    draw_hook.reset();present_hook.reset();s_blocks_input=false;
+    TurbulenceNativeMenu::host_ui_available=false;
+    TurbulenceNativeMenu::settings_page=false;
+    TurbulenceNativeMenu::request_settings=false;
+  }
   Row CurrentRow() const { return Rows()[selected]; }
   void ReadSettings() {
     stretch_hud = g_turbulence_hud_stretched;
@@ -504,7 +511,10 @@ struct OptionsMenu::Impl {
     default: break;
     }
   }
-  void Close() { open = false; confirm_exit = false; capturing = false; drain = true; }
+  void Close() {
+    if(TurbulenceNativeMenu::settings_page.load()) TurbulenceNativeMenu::close_settings=true;
+    open = false; confirm_exit = false; capturing = false; drain = true;
+  }
   void FinishExit() {
     exiting = true;
     Close();
@@ -582,6 +592,63 @@ struct OptionsMenu::Impl {
     ImGui::End();
     PopTheme();
   }
+  void DrawNativeSettings() {
+    const ImVec2 display=ImGui::GetIO().DisplaySize;
+    float w=display.x,h=display.y;
+    if(aspect_index>0) {
+      const float aspect=float(aspects[aspect_index].width)/aspects[aspect_index].height;
+      w=std::min(w,h*aspect);h=std::min(h,w/aspect);
+    }
+    const float sy=h/480.f,sx=stretch_hud?w/640.f:sy;
+    const ImVec2 origin{(display.x-640*sx)*.5f,(display.y-h)*.5f};
+    const auto point=[&](float x,float y){return ImVec2{origin.x+x*sx,origin.y+y*sy};};
+    ImGui::SetNextWindowPos({0,0});ImGui::SetNextWindowSize(display);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,{0,0});
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize,0);
+    ImGui::Begin("##NativeRecompSettings",nullptr,
+      ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoBackground|
+      ImGuiWindowFlags_NoSavedSettings|ImGuiWindowFlags_NoMove|
+      ImGuiWindowFlags_NoScrollbar|ImGuiWindowFlags_NoScrollWithMouse);
+    auto* draw=ImGui::GetWindowDrawList();
+    const ImU32 white=IM_COL32_WHITE,cyan=IM_COL32(0,240,238,255);
+    const auto text=[&](float x,float y,float size,ImU32 color,const char* value,float max=0) {
+      native_text.Draw(draw,point(x,y),size,sx,sy,color,value,max);
+    };
+    const auto hit=[&](const char* id,float x,float y,float width,float height) {
+      ImGui::SetCursorScreenPos(point(x,y));
+      return ImGui::InvisibleButton(id,{width*sx,height*sy});
+    };
+    text(48,38,24,white,"Recomp Settings",275);
+    const int first=std::clamp(selected-5,0,std::max(0,int(Rows().size())-6));
+    TurbulenceNativeMenu::settings_selection=selected-first;
+    for(int i=first;i<std::min(first+6,int(Rows().size()));++i) {
+      const float y=130+(i-first)*29.f;
+      text(80,y,21,i==selected?cyan:white,RowLabel(Rows()[i]),185);
+      if(hit(RowLabel(Rows()[i]),40,y-1,237,28)) selected=i;
+    }
+    const auto centered=[&](float y,float size,ImU32 color,const char* value) {
+      const float width=std::min(211.f,native_text.Width(value,size));
+      text(468.f-width*.5f,y,size,color,value,211);
+    };
+    centered(165,20,cyan,RowLabel(CurrentRow()));
+    if(confirm_exit) {
+      text(365,202,19,white,"Exit Turbulence?",205);
+      text(365,245,19,exit_choice==0?cyan:white,"No");
+      text(492,245,19,exit_choice==1?cyan:white,"Yes");
+      if(hit("##keep-playing",355,235,95,36)) confirm_exit=false;
+      if(hit("##exit-game",480,235,95,36)) FinishExit();
+    } else {
+      centered(198,19,white,RowValue(CurrentRow()));
+      if(CurrentRow()!=Row::Exit) {
+        if(hit("##decrease",350,154,112,148)) Step(-1);
+        if(hit("##increase",462,154,120,148)) Step(1);
+      } else if(hit("##confirm-exit",350,154,232,148)) Activate();
+    }
+    text(80,307,13,white,(std::to_string(selected+1)+" / "+std::to_string(Rows().size())).c_str());
+    text(35,380,17,white,"Left / Right: change. Changes are saved automatically.",580);
+    if(!save_error.empty()) text(35,410,14,IM_COL32(255,150,120,255),save_error.c_str(),580);
+    ImGui::End();ImGui::PopStyleVar(2);
+  }
   void Draw() {
     if (!ImGui::GetCurrentContext()) return;
     if (!hud_applied) {
@@ -591,22 +658,33 @@ struct OptionsMenu::Impl {
       if (!metal_hud) SetMetalHUDVisible(render_view, false);
       hud_applied = true;
     }
-    const Buttons down = input_source();
+    if (exiting) { s_blocks_input = true; return; }
+    if (open_on_first_draw) { open_on_first_draw = false; open = true; ReadSettings(); }
+    if (TurbulenceNativeMenu::request_settings.exchange(false)) {
+      open=true; selected=0; confirm_exit=false; previous.fill(true); ReadSettings();
+    }
+    // The game opens this page. Poll menu controls only while it owns input,
+    // including the release of the Back button after closing.
+    if (!open && !drain) {
+      // Mobile input providers also drain queued touch events.
+      if (input_source) input_source();
+      if (perf_overlay) DrawPerfOverlay(intervals, perf_overlay);
+      return;
+    }
+    Buttons down = input_source ? input_source() : ReadButtons();
+    const unsigned automation=s_automation_buttons.load();
+    for(int i=0;i<Count;++i) down[i]=down[i] || (automation & (1u<<i));
     Buttons pressed{};
     for (int i=0;i<Count;++i) pressed[i] = down[i] && !previous[i];
     previous = down;
-    if (exiting) { s_blocks_input = true; return; }
-    if (open_on_first_draw) { open_on_first_draw = false; open = true; ReadSettings(); }
     if (capturing) UpdateCapture();
-    else if (pressed[Toggle]) {
-      if (open) Close();
-      else { open = true; selected = 0; confirm_exit = false; ReadSettings(); }
-    } else if (open && pressed[Back] && !confirm_exit) Close();
+    else if (open && pressed[Back] && !confirm_exit) Close();
     else if (open) HandleInput(pressed);
     if (drain && std::none_of(down.begin(), down.end(), [](bool b){return b;})) drain = false;
     s_blocks_input = open || drain;
     if (perf_overlay) DrawPerfOverlay(intervals, perf_overlay);
     if (!open) return;
+    if(TurbulenceNativeMenu::settings_page.load()) { DrawNativeSettings(); return; }
     const Palette& p = kPalette;
     const auto& io = ImGui::GetIO();
     const float width = std::min(520.0f, io.DisplaySize.x - 24.0f);
@@ -675,6 +753,11 @@ OptionsMenu::OptionsMenu(std::filesystem::path directory, void* render_view,
   : m_impl(std::make_unique<Impl>(std::move(directory), render_view, std::move(request_exit),
                                   std::move(source), std::move(capture_source))) {}
 OptionsMenu::~OptionsMenu() = default;
+void SetOptionsAutomationInput(const OptionsInput& input) {
+  unsigned buttons=0;
+  for(int i=0;i<Count;++i) if(input[i]) buttons|=1u<<i;
+  s_automation_buttons=buttons;
+}
 bool OptionsMenuBlocksInput() { return s_blocks_input.load(); }
 
 void PrepareMetalHUD() {

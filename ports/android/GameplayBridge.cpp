@@ -153,14 +153,21 @@ extern "C" JNIEXPORT jstring JNICALL JNI_METHOD(nativeMessage)(JNIEnv* env,jclas
 extern "C" JNIEXPORT jlong JNICALL JNI_METHOD(nativeFrames)(JNIEnv*,jclass){return frames.load();}
 extern "C" JNIEXPORT jboolean JNICALL JNI_METHOD(nativeMenuOpen)(JNIEnv*,jclass){return turbulence::OptionsMenuBlocksInput();}
 extern "C" JNIEXPORT void JNICALL JNI_METHOD(nativeToggleMenu)(JNIEnv*,jclass){toggle=true;}
-extern "C" JNIEXPORT void JNICALL JNI_METHOD(nativeMenuButtons)(JNIEnv*,jclass,jint mask){buttons=mask;}
 extern "C" JNIEXPORT void JNICALL JNI_METHOD(nativePointer)(JNIEnv*,jclass,jfloat x,jfloat y,jboolean down){std::lock_guard guard(pointer_lock);if(pointers.size()<256)pointers.push_back({x,y,down!=0});}
-extern "C" JNIEXPORT void JNICALL JNI_METHOD(nativeInput)(JNIEnv*,jclass,jint id,jdouble value){
- if(id<0||id>17||!std::isfinite(value))return;
- auto guard=ControllerEmu::EmulatedController::GetStateLock();
- ciface::Touch::SetControlState(0,static_cast<ciface::Touch::ControlID>(id),turbulence::OptionsMenuBlocksInput()?0:std::clamp(value,-1.0,1.0));
- static double last_start=0;
- if(id==5&&value!=last_start){last_start=value;if(Core::IsRunning(Core::System::GetInstance())){auto pad=Pad::GetStatus(0);__android_log_print(ANDROID_LOG_INFO,"Turbulence","Start=%g; native pad buttons=%04x connected=%d",value,pad.button,pad.isConnected);}}
+extern "C" JNIEXPORT void JNICALL JNI_METHOD(nativeInput)(JNIEnv* env, jclass, jdoubleArray input, jint menu_mask) {
+  constexpr int control_count = 18;
+  if (!input || env->GetArrayLength(input) != control_count) return;
+  jdouble values[control_count];
+  env->GetDoubleArrayRegion(input, 0, control_count, values);
+  if (env->ExceptionCheck()) return;
+
+  buttons.store(menu_mask);
+  auto guard = ControllerEmu::EmulatedController::GetStateLock();
+  const bool blocked = turbulence::OptionsMenuBlocksInput();
+  for (int id = 0; id < control_count; ++id) {
+    const double value = !blocked && std::isfinite(values[id]) ? std::clamp(values[id], -1.0, 1.0) : 0.0;
+    ciface::Touch::SetControlState(0, static_cast<ciface::Touch::ControlID>(id), value);
+  }
 }
 extern "C" JNIEXPORT void JNICALL JNI_METHOD(nativePause)(JNIEnv*,jclass,jboolean paused){
  std::lock_guard guard(lock);

@@ -26,8 +26,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
  private static native String nativeMessage();
  private static native long nativeFrames();
  private static native boolean nativeMenuOpen();
- private static native void nativeInput(int id,double value);
- private static native void nativeMenuButtons(int mask);
+ private static native void nativeInput(double[] values, int menuMask);
  private static native void nativePointer(float x,float y,boolean down);
  private static native void nativeToggleMenu();
  private static native void nativeResize();
@@ -193,16 +192,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
   nativePromptStyle(device.getVendorId()==0x054c||name.contains("playstation")||name.contains("dualshock")||name.contains("dualsense")||name.contains("wireless controller")?2:1);
  }
  private boolean held(int key){return keys.contains(key);}
+ private static final int[] BUTTON_CODES = {96,97,99,100,102,108,19,20,21,22};
+ private final double[] values = new double[18];
  private void sendInput(){
-  double[] values=axes.clone();for(int i=0;i<18;i++)if(touchValues[i]!=0)values[i]=touchValues[i];int[] codes={96,97,99,100,102,108,19,20,21,22};
-  for(int i=0;i<codes.length;i++)if(held(codes[i]))values[i]=1;
+  System.arraycopy(axes,0,values,0,values.length);for(int i=0;i<18;i++)if(touchValues[i]!=0)values[i]=touchValues[i];
+  for(int i=0;i<BUTTON_CODES.length;i++)if(held(BUTTON_CODES[i]))values[i]=1;
   if(held(KeyEvent.KEYCODE_DPAD_CENTER))values[0]=1;
   if(values[14]==0)values[14]=values[9]-values[8];
   if(values[15]==0)values[15]=values[6]-values[7];
   if(held(104)){values[10]=1;values[12]=1;}if(held(105)){values[11]=1;values[13]=1;}
   if(values[12]>.9)values[10]=1;if(values[13]>.9)values[11]=1;
   int mask=0;if(held(103))mask|=1;if(values[6]>0||values[15]>.5)mask|=2;if(values[7]>0||values[15]<-.5)mask|=4;if(values[8]>0||values[14]<-.5)mask|=8;if(values[9]>0||values[14]>.5)mask|=16;if(values[1]>0)mask|=32;if(values[0]>0)mask|=64;
-  nativeMenuButtons(mask);for(int i=0;i<18;i++)nativeInput(i,values[i]);
+  nativeInput(values, mask);
  }
  // Native filesystem helpers. The importer opens SAF documents through ContentResolver.
  public static int openContent(String uri,String mode){try(ParcelFileDescriptor fd=application.getContentResolver().openFileDescriptor(Uri.parse(uri),mode)){return fd==null?-1:fd.detachFd();}catch(Exception e){return -1;}}

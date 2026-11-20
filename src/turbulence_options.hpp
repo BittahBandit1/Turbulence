@@ -34,6 +34,8 @@ private:
   std::unique_ptr<Impl> m_impl;
 };
 bool OptionsMenuBlocksInput();
+// Explicit automation pad commands also navigate the host settings page.
+void SetOptionsAutomationInput(const OptionsInput& input);
 // First thing at startup, before Metal is touched: enables the Metal HUD
 // machinery (shown or hidden later from the saved preference) and keeps macOS
 // from napping or throttling the game.

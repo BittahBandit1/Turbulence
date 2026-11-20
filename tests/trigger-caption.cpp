@@ -45,6 +45,15 @@ int main(int argc, char** argv)
       for (u32 x=0;x<64;++x)
         for (u32 c=0;c<4;++c)
           assert(image[(y*width+x)*4+c] == original[(y*width+x+64)*4+c]);
+    // Preserve the original PS2 L/R lettering; only the binding digit changes.
+    if (style == PlayStation)
+      for (const auto& cell : drift.cells)
+        if (!cell.labels[style].empty())
+          for (u32 y=0; y<64; ++y)
+            for (u32 x=0; x<35; ++x)
+              for (u32 k=0; k<4; ++k)
+                assert(image[((cell.y+y)*width+cell.x+x)*4+k] ==
+                       original[((cell.source_y[style]+y)*width+cell.source_x[style]+x)*4+k]);
     // Arrow art, modern source keycaps and the plus symbol are untouched.
     for (u32 y=0;y<height;++y)
       for (u32 x=0;x<width;++x)
@@ -73,7 +82,7 @@ int main(int argc, char** argv)
     auto image=hud;
     Detail::ApplyCells(image,512,512,hud,512,boost,style);
     if (style==GameCube) { assert(image==hud); continue; }
-    const u32 source=style==Xbox?426:401;
+    const u32 source=style==Xbox?376:401;
     for (u32 y=0;y<512;++y)
       for (u32 x=0;x<512;++x)
         for (u32 c=0;c<4;++c)

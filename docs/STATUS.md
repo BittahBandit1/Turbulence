@@ -2,6 +2,22 @@
 
 Sonic Riders (USA, GXEE8P) static recompilation on ModernGekko + DolRecomp.
 
+## Native Recomp Settings (2026-11-18)
+
+Options now contains a fifth native **Recomp Settings** button. The original
+Options artwork, font, navigation and other four entries remain in place.
+The new page reuses the original Language Setting frames and disc bitmap
+lettering, with the green preview panel cleared of the map and globe for
+future custom icons. Left/Right changes settings and saves automatically;
+Back returns through the native menu lifecycle. Shoulder-button opening is
+removed. Earlier R1 quick-menu notes below describe the superseded UI.
+
+The native integration targets the USA GXEE8P front-end. Menu hooks are active
+only while the host settings UI is available and the front-end task is active;
+racing retains its normal dispatch path. Sanitized hook tests cover the extra
+item, stack restoration, focus mapping, native Back lifecycle and preserving
+the real language preference. macOS live checks cover entry, saving and Back.
+
 ## What is recompiled
 - `sys/main.dol`: 57 chunks.
 - `files/_Main.rel` (459,831 instructions, about two thirds of the game's
@@ -514,3 +530,87 @@ hardware yet; commands in ports/README.md):
   Headless smoke test in a container with --graphics Null: both bundles load
   the module and boot with fallback=0, smc_failed=0 (aarch64 45 s,
   5.36G guest cycles; x86_64 under Rosetta on the v2 path).
+
+## Original controller artwork — 2026-11-17
+
+Inspected owner-provided Xbox and PS2 USA discs. Xbox drift/shake now uses
+the original Xbox L-stick artwork and both triggers use its original trigger
+silhouette, replacing PS2-derived generic keycaps. Original PlayStation L/R
+lettering and keycap shading are preserved; only the binding digit becomes 2
+for Turbulence's existing analog-trigger controls. Full 64px/48px cells are
+replaced, including transparency. Shared renderer changes apply when each
+platform is rebuilt. See CONTROLLER-PROMPTS.md for provenance and extraction.
+
+Mac runtime build and sanitized atlas/artwork tests pass. Xbox extraction
+reproduces the artwork header byte for byte. Live Metal captures verify Xbox
+Boost B, PlayStation Boost Circle and both shake atlases. Drift/trigger
+coverage was verified through cell tests; not all situational cues were
+triggered live. No Android/iOS/Windows release packages rebuilt in this pass.
+Existing unrelated Windows changes were preserved; no commit requested.
+
+### Boost identification correction — 2026-11-17
+
+The earlier claim that the orange B was Xbox was wrong: the shared atlas was
+misidentified. GameCube uses x=426 (flat orange-red B); Xbox uses x=376
+(glossy red B). Finding both in the Xbox disc was not evidence of which cell
+Xbox displays. Corrected both Boost aliases to x=376 in Xbox mode, updated the
+regression expectation and rebuilt macOS. The captured live Xbox texture now
+matches x=376 exactly and differs from x=426. Replaced the mislabeled local
+comparison with boost-button-comparison-corrected.png. PlayStation remains
+x=401. Original controller stick/trigger artwork changes are unaffected.
+
+## Centered HUD background and results edges — 2026-11-17
+
+Full-width solid menu panels now fill the viewport even when the background
+is split into horizontal quads. Track select's side gaps become blue while
+its textured circular design and foreground remain centered. Results silver
+wedge vertices at the original left boundary extend to the physical edge;
+other vertices, portrait circles, ranks and text retain the centered transform.
+The silver extension is disabled in stretched HUD mode and at native 4:3.
+The results atlas is selected by content hash (46f9f97b69e89d02), not size alone.
+
+Validation: rebuilt macOS runtime; sanitized viewport/cursor tests pass with
+full-width panel exclusion checks and silver edge/interior/stretched cases.
+Offscreen Metal captures pass for track select at centered 16:9, centered
+32:9 and stretched 16:9 (build/hud-fill). The owner verified the live results
+fix in the test game. Shader waiting was disabled only in isolated offscreen
+test profiles because its progress UI requires an ImGui context. The normal
+launcher settings were not changed. Vendor patches exported and reverse-apply
+checks pass. No commit requested.
+
+### Menu scanline coverage — 2026-11-17
+
+Extended the three original scanline strips across the full viewport. Only
+the identified menu-atlas strips (0a503a7ee2456e29, original half-width x
+[-1,0], 128px high) are widened. Vertical positions/UVs are unchanged, so the
+scanline pitch is unchanged; their original horizontal fade spans the screen
+without gutter seams. Circular art and foreground draws remain independent.
+The treatment also works with stretched HUDs; native 4:3 is unchanged.
+
+Mac runtime rebuilt. Offscreen Metal captures verified centered 16:9,
+centered 32:9 and stretched 16:9 in build/hud-fill/*-scanlines. Pixel-column
+analysis measured 12px line spacing in both the original and extended strip.
+Sanitized viewport tests cover strip classification and horizontal projected
+movement preserving Y, including rotated matrices and singular rejection.
+Vendor patch export and reverse-apply checks pass. Restart the game to load
+the rebuilt runtime; no commit requested.
+
+### Menu gray dividers and footer coverage — 2026-11-17
+
+Extended the flat outer columns of the gray divider atlas
+(8ef9802115e76654), top/bottom gray trim (549fadeb773fc748), and footer
+bevels (0406bb54a29b5554) to the viewport edges in centered HUD mode.
+The footer's half-width solid gradient draws continue their edge colors as
+well. Added quads preserve the original artwork, curves, vertical UVs,
+scanline pitch and text placement. Atlas samples are slightly inset to
+avoid transparent boundary texels, with a small overlap only for textured
+trim; translucent gradient joins do not overlap. Native 4:3 and stretched
+HUD mode bypass this padding.
+
+Mac runtime rebuilt; sanitized viewport/cursor tests pass, including outer
+endpoint, internal join and already-offscreen exclusion cases. Offscreen
+Metal captures checked centered 16:9, centered 32:9 and stretched 16:9 in
+build/hud-fill/*-bars. Final 32:9 capture in debug-32-9-bars confirms footer
+joins without dark seams. Vendor patches exported; reverse-apply and
+whitespace checks pass. Restart the game for the rebuilt runtime. No commit
+requested.

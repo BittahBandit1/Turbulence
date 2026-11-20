@@ -894,18 +894,28 @@ index 4a79b90..730c1af 100644
  #include <string>
  
 diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
-index e3581cc..354bb70 100644
+index e3581cc..5a6a296 100644
 --- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
 +++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
-@@ -2,6 +2,7 @@
+@@ -2,6 +2,8 @@
  // SPDX-License-Identifier: GPL-2.0-or-later
  
  #include "Core/PowerPC/StaticRecomp/StaticRecompCore.h"
 +#include "VideoCommon/TurbulenceViewport.h"
++#include "VideoCommon/TurbulenceNativeMenu.h"
  
  #include <algorithm>
  #include <cstdio>
-@@ -145,6 +146,8 @@ StaticRecompCore::~StaticRecompCore() = default;
+@@ -115,6 +117,8 @@ bool StaticRecompCore::IsModuleActive() const
+ 
+ bool StaticRecompCore::IsHostCallAddress(u32 address) const
+ {
++  if (TurbulenceNativeMenu::IsAvailable() && m_module && std::strcmp(m_module->game_id,"GXEE8P")==0 &&
++      TurbulenceNativeMenu::Handles(address)) return true;
+   if (!m_module_source.host_call_contains)
+     return false;
+   if (m_module_source.host_call_contains(address, m_module_source.host_call_user))
+@@ -145,6 +149,8 @@ StaticRecompCore::~StaticRecompCore() = default;
  
  void StaticRecompCore::Init()
  {
@@ -914,7 +924,7 @@ index e3581cc..354bb70 100644
    g_static_recomp_core = this;
    RefreshConfig();
    m_collect_dispatch_samples = std::getenv("STATICRECOMP_DISPATCH_SAMPLES") != nullptr;
-@@ -182,12 +185,18 @@ void StaticRecompCore::Init()
+@@ -182,12 +188,18 @@ void StaticRecompCore::Init()
  
    LoadModule();
    m_idle_pc = Config::Get(Config::MAIN_STATICRECOMP_IDLE_PC);
@@ -935,7 +945,7 @@ index e3581cc..354bb70 100644
    m_fallback_jit = std::make_unique<Jit64>(m_system);
  #endif
    if (m_fallback_jit)
-@@ -200,6 +209,8 @@ void StaticRecompCore::Init()
+@@ -200,6 +212,8 @@ void StaticRecompCore::Init()
  
  void StaticRecompCore::Shutdown()
  {
@@ -944,15 +954,17 @@ index e3581cc..354bb70 100644
    g_static_recomp_core = nullptr;
    std::fprintf(stderr,
                 "[staticrecomp] shutdown: native=%llu fallback=%llu native_exc=%llu hook_fb=%llu "
-@@ -328,6 +339,7 @@ void StaticRecompCore::LoadModule()
+@@ -327,7 +341,9 @@ void StaticRecompCore::LoadModule()
+     }
    }
    m_active_rel_sections.clear();
++  m_rel_addresses_match = true;
    m_rel_mapping_generation = 0;
 +  m_rel_scan_dirty = true;
    m_failed_chunks = 0;
    m_lookup_ram_size = 0;
    m_lookup_exram_size = 0;
-@@ -356,6 +368,7 @@ void StaticRecompCore::ClearCache()
+@@ -356,6 +372,7 @@ void StaticRecompCore::ClearCache()
    if (!m_module)
      return;
    std::fill(m_chunk_state.begin(), m_chunk_state.end(), u8{CHUNK_UNVERIFIED});
@@ -961,7 +973,7 @@ index e3581cc..354bb70 100644
    ++m_reverify_events;
  }
 diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
-index d084fea..235ebaa 100644
+index d084fea..70fb2a2 100644
 --- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
 +++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
 @@ -3,6 +3,8 @@
@@ -973,7 +985,20 @@ index d084fea..235ebaa 100644
  #include <string>
  #include <unordered_map>
  #include <unordered_set>
-@@ -194,6 +196,13 @@ private:
+@@ -123,7 +125,7 @@ private:
+ 
+   void OnICacheInvalidate(u32 address, u32 length);
+   int ChunkIndexOf(u32 address);
+-  bool IsForcedFallbackAddress(u32 address) const;
++  bool IsForcedFallbackAddress(u32 address);
+   bool ChunkContainsHostCall(u32 index) const;
+   void VerifyChunk(u32 index);
+   bool ResolveNativeAddress(u32 runtime_address, u32* linked_address, u32* rel_section_index);
+@@ -191,9 +193,17 @@ private:
+     u32 size;
+   };
+   std::vector<ActiveRelSection> m_active_rel_sections;
++  bool m_rel_addresses_match = true;
    std::vector<int> m_chunk_rel_sections;
    std::vector<u64> m_effective_chunk_hashes;
    u64 m_rel_mapping_generation = 0;
@@ -987,7 +1012,7 @@ index d084fea..235ebaa 100644
    u32 m_failed_chunks = 0;    // chunks currently failing verification (real SMC)
    u64 m_verifications = 0;    // chunk hash checks performed
    u64 m_reverify_events = 0;  // invalidations that reset a chunk to Unverified
-@@ -212,6 +221,7 @@ private:
+@@ -212,6 +222,7 @@ private:
    bool m_collect_dispatch_samples = false;
    bool m_has_rel_modules = false;
    u32 m_idle_pc = 0;
@@ -996,10 +1021,21 @@ index d084fea..235ebaa 100644
  
  extern StaticRecompCore* g_static_recomp_core;
 diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
-index 7b3d845..7035eba 100644
+index 7b3d845..e534ac3 100644
 --- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
 +++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
-@@ -22,6 +22,15 @@ constexpr u32 LOCKED_CACHE_BASE = 0xE0000000u;
+@@ -3,7 +3,10 @@
+ 
+ #include "Core/PowerPC/StaticRecomp/StaticRecompCore.h"
+ #include "Core/System.h"
++#include "VideoCommon/TurbulenceNativeMenu.h"
++#include <cstring>
+ #include "Core/PowerPC/MMU.h"
++#include "Core/HW/Memmap.h"
+ #include "Core/PowerPC/PowerPC.h"
+ #include "Core/PowerPC/JitInterface.h"
+ #include "Core/PowerPC/Interpreter/Interpreter.h"
+@@ -22,6 +25,20 @@ constexpr u32 LOCKED_CACHE_BASE = 0xE0000000u;
  bool StaticRecompCore::HookHostCall(CPUState* cpu, u32 address)
  {
    auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
@@ -1008,18 +1044,23 @@ index 7b3d845..7035eba 100644
 +    // LLVM-backend native region entry: blocked only if a mod intercepts an
 +    // address inside [external_addr, external_value).
 +    cpu->external_rid = PPC_NATIVE_REGION_QUERY_HANDLED;
-+    return core->m_module_source.host_call_range_contains &&
-+           core->m_module_source.host_call_range_contains(
-+               cpu->external_addr, cpu->external_value, core->m_module_source.host_call_user);
++    return (TurbulenceNativeMenu::IsAvailable() && core->m_module && std::strcmp(core->m_module->game_id,"GXEE8P")==0 &&
++            TurbulenceNativeMenu::HandlesRange(cpu->external_addr,cpu->external_value)) ||
++           (core->m_module_source.host_call_range_contains &&
++            core->m_module_source.host_call_range_contains(
++               cpu->external_addr, cpu->external_value, core->m_module_source.host_call_user));
 +  }
++  if (TurbulenceNativeMenu::IsAvailable() && core->m_module && std::strcmp(core->m_module->game_id,"GXEE8P")==0 &&
++      TurbulenceNativeMenu::Handles(address) &&
++      TurbulenceNativeMenu::BeforeDispatch(*cpu,core->m_system.GetMemory(),address)) return true;
    return core->m_module_source.host_call &&
           core->m_module_source.host_call(cpu, address, core->m_module_source.host_call_user);
  }
 diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
-index d91ec2d..2505c1d 100644
+index d91ec2d..d68de4c 100644
 --- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
 +++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
-@@ -2,6 +2,16 @@
+@@ -2,6 +2,17 @@
  // SPDX-License-Identifier: GPL-2.0-or-later
  
  #include "Core/PowerPC/StaticRecomp/StaticRecompCore.h"
@@ -1027,6 +1068,7 @@ index d91ec2d..2505c1d 100644
 +#include <chrono>
 +#include <cstring>
 +#include "VideoCommon/TurbulenceViewport.h"
++#include "VideoCommon/TurbulenceNativeMenu.h"
 +#include "Core/PowerPC/StaticRecomp/TurbulenceIdleWait.h"
 +#include "Core/HW/Memmap.h"
 +#include "Common/Swap.h"
@@ -1036,7 +1078,7 @@ index d91ec2d..2505c1d 100644
  #include "Core/System.h"
  #include "Core/PowerPC/PowerPC.h"
  #include "Core/PowerPC/Interpreter/Interpreter.h"
-@@ -50,6 +60,11 @@ FilePtr OpenDispatchTrace()
+@@ -50,6 +61,11 @@ FilePtr OpenDispatchTrace()
  
  void StaticRecompCore::Run()
  {
@@ -1048,7 +1090,7 @@ index d91ec2d..2505c1d 100644
    auto& core_timing = m_system.GetCoreTiming();
    auto& power_pc = m_system.GetPowerPC();
    auto& ppc = power_pc.GetPPCState();
-@@ -120,6 +135,17 @@ void StaticRecompCore::Run()
+@@ -120,8 +136,26 @@ void StaticRecompCore::Run()
    while (*state_ptr == CPU::State::Running)
    {
      core_timing.Advance();
@@ -1065,9 +1107,22 @@ index d91ec2d..2505c1d 100644
 +    }
      const std::string current_game_id = SConfig::GetInstance().GetGameID();
      m_module_active = m_module && (current_game_id.empty() || current_game_id == m_module->game_id);
++    // No per-dispatch host hook during racing. The original front-end task
++    // owns this slot while menus are active; its callback is an identity check.
++    const auto* menu_task=memory.GetPointerForRange(0x803d9048,4);
++    const bool native_menu=TurbulenceNativeMenu::IsAvailable() && m_module && std::strcmp(m_module->game_id,"GXEE8P")==0 &&
++      menu_task && Common::swap32(menu_task)==0x8050edb8;
++    m_guest.host_call=(m_module_source.host_call || native_menu)?HookHostCall:nullptr;
++
  
-@@ -155,6 +181,32 @@ void StaticRecompCore::Run()
-           if (m_has_rel_modules)
+     do
+     {
+@@ -152,11 +186,37 @@ void StaticRecompCore::Run()
+             ++m_dispatch_samples[m_guest.pc];
+           const u32 runtime_dispatch_address = m_guest.pc;
+           u32 linked_dispatch_address = runtime_dispatch_address;
+-          if (m_has_rel_modules)
++          if (!m_rel_addresses_match)
              ResolveNativeAddress(runtime_dispatch_address, &linked_dispatch_address, nullptr);
            m_guest.pc = linked_dispatch_address;
 +          // Sonic Riders USA: engine perspective/culling matrix constructor.
@@ -1097,9 +1152,12 @@ index d91ec2d..2505c1d 100644
 +            }
 +          }
            m_module->dispatch(&m_guest, linked_dispatch_address);
-           if (m_has_rel_modules)
+-          if (m_has_rel_modules)
++          if (!m_rel_addresses_match)
              m_guest.pc = TranslateRelAddress(m_guest.pc);
-@@ -184,7 +236,22 @@ void StaticRecompCore::Run()
+           ++m_native_dispatches;
+ 
+@@ -184,7 +244,22 @@ void StaticRecompCore::Run()
            // Idle loop skipping for configured target loops (e.g. Wii Menu OSIdleThread)
            if (m_guest.pc == m_idle_pc && m_idle_pc != 0)
            {
@@ -1124,10 +1182,19 @@ index d91ec2d..2505c1d 100644
  
            // ctx->timebase is refreshed at burst start (SyncIn), and here we
 diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
-index 491c57e..6dc0944 100644
+index 491c57e..003d267 100644
 --- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
 +++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
-@@ -22,6 +22,9 @@ void StaticRecompCore::RefreshRelSections()
+@@ -8,6 +8,8 @@
+ #include "Common/Logging/Log.h"
+ #include <algorithm>
+ #include <cstdio>
++#include <cstring>
++#include "VideoCommon/TurbulenceNativeMenu.h"
+ 
+ namespace
+ {
+@@ -22,6 +24,9 @@ void StaticRecompCore::RefreshRelSections()
  {
    if (!m_module || m_module->num_rel_modules == 0 || !m_guest.ram || m_guest.ram_size < 0x40)
      return;
@@ -1137,7 +1204,7 @@ index 491c57e..6dc0944 100644
  
    std::vector<ActiveRelSection> discovered;
    for (u32 module_index = 0; module_index < m_module->num_rel_modules; ++module_index)
-@@ -31,15 +34,19 @@ void StaticRecompCore::RefreshRelSections()
+@@ -31,15 +36,19 @@ void StaticRecompCore::RefreshRelSections()
                            static_cast<u64>(module.section_count) * 8;
      if (table_end > m_guest.ram_size)
        continue;
@@ -1162,7 +1229,7 @@ index 491c57e..6dc0944 100644
  
        std::vector<ActiveRelSection> candidate_sections;
        bool valid = true;
-@@ -70,6 +77,22 @@ void StaticRecompCore::RefreshRelSections()
+@@ -70,6 +79,22 @@ void StaticRecompCore::RefreshRelSections()
        if (valid)
        {
          discovered.insert(discovered.end(), candidate_sections.begin(), candidate_sections.end());
@@ -1185,7 +1252,18 @@ index 491c57e..6dc0944 100644
          break;
        }
      }
-@@ -132,8 +155,11 @@ bool StaticRecompCore::ResolveNativeAddress(u32 runtime_address, u32* linked_add
+@@ -87,6 +112,10 @@ void StaticRecompCore::RefreshRelSections()
+                                    });
+   if (!changed)
+     return;
++  // A module loaded at its linked address needs no PC translation. Recheck
++  // whenever the guest loads, moves, or unloads a section.
++  m_rel_addresses_match = std::all_of(discovered.begin(), discovered.end(),
++      [](const ActiveRelSection& section) { return section.linked_start == section.runtime_start; });
+   m_active_rel_sections = std::move(discovered);
+   ++m_rel_mapping_generation;
+   for (u32 i = 0; i < m_chunk_rel_sections.size(); ++i)
+@@ -132,8 +161,11 @@ bool StaticRecompCore::ResolveNativeAddress(u32 runtime_address, u32* linked_add
        return true;
      }
    }
@@ -1199,7 +1277,52 @@ index 491c57e..6dc0944 100644
  }
  
  bool StaticRecompCore::ResolveRuntimeAddress(u32 linked_address, u32* runtime_address) const
-@@ -339,6 +365,7 @@ void StaticRecompCore::OnICacheInvalidate(u32 address, u32 length)
+@@ -235,8 +267,16 @@ bool StaticRecompCore::DispatchableAt(u32 address)
+   return m_chunk_state[index] == CHUNK_VERIFIED;
+ }
+ 
+-bool StaticRecompCore::IsForcedFallbackAddress(u32 address) const
++bool StaticRecompCore::IsForcedFallbackAddress(u32 address)
+ {
++  if (m_guest.host_call && TurbulenceNativeMenu::IsAvailable() && m_module && std::strcmp(m_module->game_id,"GXEE8P")==0) {
++    const int index=ChunkIndexOf(address);
++    if(index>=0) {
++      const auto& chunk=m_module->chunk_ranges[index];
++      if(TurbulenceNativeMenu::HandlesRange(chunk.start,chunk.end)) return true;
++    }
++  }
++
+   for (const StaticRecompRange& range : m_forced_fallback_ranges)
+   {
+     if (address >= range.start && address < range.end)
+@@ -247,7 +287,7 @@ bool StaticRecompCore::IsForcedFallbackAddress(u32 address) const
+ 
+ bool StaticRecompCore::ChunkContainsHostCall(u32 index) const
+ {
+-  if (!m_module_source.host_call_contains || index >= m_chunk_host_call_state.size())
++  if (index >= m_chunk_host_call_state.size())
+     return false;
+ 
+   u8& state = m_chunk_host_call_state[index];
+@@ -255,13 +295,14 @@ bool StaticRecompCore::ChunkContainsHostCall(u32 index) const
+     return state == 2;
+ 
+   const auto& chunk = m_module->chunk_ranges[index];
+-  bool found = false;
+-  if (m_module_source.host_call_range_contains)
++  bool found = std::strcmp(m_module->game_id,"GXEE8P")==0 &&
++               TurbulenceNativeMenu::HandlesRange(chunk.start,chunk.end);
++  if (!found && m_module_source.host_call_range_contains)
+   {
+     found = m_module_source.host_call_range_contains(
+         chunk.start, chunk.end, m_module_source.host_call_user);
+   }
+-  else
++  else if (!found && m_module_source.host_call_contains)
+   {
+     for (u32 address = chunk.start; address < chunk.end; address += 4)
+     {
+@@ -339,6 +380,7 @@ void StaticRecompCore::OnICacheInvalidate(u32 address, u32 length)
  
    if (!m_module_active || length == 0)
      return;
@@ -2374,7 +2497,7 @@ index 91ba870..3eecaa6 100644
    // Can be used for presentation of ImmediateXFB swaps which don't have timing information.
    u64 m_next_swap_estimated_ticks = 0;
 diff --git a/Source/Core/VideoCommon/TextureCacheBase.cpp b/Source/Core/VideoCommon/TextureCacheBase.cpp
-index c5d6096..dca6e0e 100644
+index c5d6096..14a5bb9 100644
 --- a/Source/Core/VideoCommon/TextureCacheBase.cpp
 +++ b/Source/Core/VideoCommon/TextureCacheBase.cpp
 @@ -7,6 +7,7 @@
@@ -2385,15 +2508,16 @@ index c5d6096..dca6e0e 100644
  #include <memory>
  #include <string>
  #include <utility>
-@@ -47,6 +48,7 @@
+@@ -47,6 +48,8 @@
  #include "VideoCommon/OpcodeDecoding.h"
  #include "VideoCommon/PixelShaderManager.h"
  #include "VideoCommon/Present.h"
 +#include "VideoCommon/TurbulencePromptTextures.h"
++#include "VideoCommon/TurbulenceMenuArtwork.h"
  #include "VideoCommon/Resources/CustomResourceManager.h"
  #include "VideoCommon/ShaderCache.h"
  #include "VideoCommon/Statistics.h"
-@@ -57,6 +59,7 @@
+@@ -57,6 +60,7 @@
  #include "VideoCommon/VertexManagerBase.h"
  #include "VideoCommon/VideoCommon.h"
  #include "VideoCommon/VideoConfig.h"
@@ -2401,7 +2525,7 @@ index c5d6096..dca6e0e 100644
  
  static const u64 TEXHASH_INVALID = 0;
  // Sonic the Fighters (inside Sonic Gems Collection) loops a 64 frames animation
-@@ -1233,6 +1236,30 @@ private:
+@@ -1233,6 +1237,41 @@ private:
  
  TCacheEntry* TextureCacheBase::Load(u32 stage)
  {
@@ -2429,10 +2553,21 @@ index c5d6096..dca6e0e 100644
 +    }
 +  }
 +
++  if (TurbulenceNativeMenu::art_changed.exchange(false))
++  {
++    const auto matches=[](const RcTcacheEntry& t) {
++      return t && !t->IsCopy() && t->native_width==512 && t->native_height==512 &&
++             t->format.texfmt==TextureFormat::C8;
++    };
++    for(auto& bound:m_bound_textures) if(matches(bound)) bound.reset();
++    for(auto iter=m_textures_by_address.begin();iter!=m_textures_by_address.end();)
++      if(matches(iter->second)) iter=InvalidateTexture(iter); else ++iter;
++  }
++
    if (auto entry = LoadImpl(stage, false))
    {
      if (!DidLinkedAssetsChange(*entry))
-@@ -1262,14 +1289,15 @@ TCacheEntry* TextureCacheBase::LoadImpl(u32 stage, bool force_reload)
+@@ -1262,14 +1301,15 @@ TCacheEntry* TextureCacheBase::LoadImpl(u32 stage, bool force_reload)
      //
      // Spyro: A Hero's Tail is known for (deliberately?) using such overwritten textures
      // in it's bloom effect, which breaks without giving it the invalidated texture.
@@ -2450,7 +2585,7 @@ index c5d6096..dca6e0e 100644
      {
        return entry;
      }
-@@ -1463,11 +1491,14 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
+@@ -1463,11 +1503,14 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
      else
      {
        // For normal textures, all texture parameters need to match
@@ -2466,7 +2601,7 @@ index c5d6096..dca6e0e 100644
          entry = DoPartialTextureUpdates(iter->second, texture_info.GetTlutAddress(),
                                          texture_info.GetTlutFormat());
          if (entry)
-@@ -1583,6 +1614,16 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
+@@ -1583,6 +1626,19 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
      }
    }
  
@@ -2480,10 +2615,13 @@ index c5d6096..dca6e0e 100644
 +    }
 +  }
 +
++  if (!custom_texture_data)
++    custom_texture_data = TurbulenceMenuArtwork::Find(texture_info);
++
    std::string texture_name = "";
  
    if (g_ActiveConfig.bGraphicMods)
-@@ -1602,6 +1643,18 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
+@@ -1602,8 +1658,46 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
        CreateTextureEntry(TextureCreationInfo{base_hash, full_hash, bytes_per_block, palette_size},
                           texture_info, textureCacheSafetyColorSampleSize, custom_texture_data.get(),
                           has_arbitrary_mipmaps, skip_texture_dump);
@@ -2495,14 +2633,42 @@ index c5d6096..dca6e0e 100644
 +       texture_info.GetTextureFormat() == TextureFormat::CMPR))
 +  {
 +    const auto name = texture_info.CalculateTextureName();
++    if (name.texture_name == "0a503a7ee2456e29" || name.texture_name == "3bf9cc2e344cce2b")
++      texture_name = name.GetFullName();
 +    entry->turbulence_aspect_locked_art = name.texture_name == "306cc14cb2da5cdf" ||
 +                                        name.texture_name == "0a503a7ee2456e29" ||
 +                                        name.texture_name == "bcbaa36c9296931c";
 +  }
++  if (texture_info.GetRawWidth()==1024 &&
++      (texture_info.GetRawHeight()==512 || texture_info.GetRawHeight()==64) &&
++      texture_info.GetTextureFormat()==TextureFormat::C4)
++  {
++    const auto name=texture_info.CalculateTextureName();
++    if(name.texture_name=="5ee41778907d02cb" || name.texture_name=="4ddbae84febca1cd" ||
++       name.texture_name=="bfd10fb02856aa95") texture_name=name.GetFullName();
++  }
++  if(texture_info.GetRawWidth()==512 && texture_info.GetRawHeight()==128 &&
++     texture_info.GetTextureFormat()==TextureFormat::C4) {
++    const auto name=texture_info.CalculateTextureName();
++    if(name.texture_name=="ba16db485da31f40") texture_name=name.GetFullName();
++  }
++  if (texture_info.GetRawWidth() == 256 && texture_info.GetRawHeight() == 256 &&
++      texture_info.GetTextureFormat() == TextureFormat::C8)
++    entry->turbulence_rider_marker_atlas =
++        texture_info.CalculateTextureName().texture_name == "d8d7b29f19324bf2";
    entry->hires_texture = std::move(hires_texture);
    entry->last_load_time = load_time;
++  if (std::getenv("TURBULENCE_WS_TRACE") ||
++      (texture_info.GetRawWidth() == 128 && texture_info.GetRawHeight() == 128 &&
++       texture_info.GetTextureFormat() == TextureFormat::C8) ||
++      (texture_info.GetRawHeight() == 64 &&
++       (texture_info.GetRawWidth() == 256 || texture_info.GetRawWidth() == 512) &&
++       texture_info.GetTextureFormat() == TextureFormat::C4))
++    texture_name = texture_info.CalculateTextureName().GetFullName();
    entry->texture_info_name = std::move(texture_name);
-@@ -1759,7 +1812,14 @@ RcTcacheEntry TextureCacheBase::CreateTextureEntry(
+   return entry;
+ }
+@@ -1759,7 +1853,14 @@ RcTcacheEntry TextureCacheBase::CreateTextureEntry(
  
      entry->has_arbitrary_mips = arbitrary_mip_detector.HasArbitraryMipmaps(dst_buffer);
  
@@ -2518,7 +2684,7 @@ index c5d6096..dca6e0e 100644
      {
        const std::string basename = texture_info.CalculateTextureName().GetFullName();
        if (g_ActiveConfig.bDumpBaseTextures)
-@@ -2209,8 +2269,8 @@ void TextureCacheBase::CopyRenderTargetToTexture(
+@@ -2209,8 +2310,8 @@ void TextureCacheBase::CopyRenderTargetToTexture(
    {
      tex_w /= 2;
      tex_h /= 2;
@@ -2530,21 +2696,23 @@ index c5d6096..dca6e0e 100644
  
    if (!is_xfb_copy && !g_ActiveConfig.bCopyEFBScaled)
 diff --git a/Source/Core/VideoCommon/TextureCacheBase.h b/Source/Core/VideoCommon/TextureCacheBase.h
-index d596f84..f85eabd 100644
+index d596f84..fc548b3 100644
 --- a/Source/Core/VideoCommon/TextureCacheBase.h
 +++ b/Source/Core/VideoCommon/TextureCacheBase.h
-@@ -131,6 +131,7 @@ struct TCacheEntry
+@@ -131,6 +131,8 @@ struct TCacheEntry
    u32 memory_stride = 0;
    bool is_efb_copy = false;
    bool is_custom_tex = false;
++  bool turbulence_rider_marker_atlas = false;
 +  bool turbulence_aspect_locked_art = false;
    bool may_have_overlapping_textures = true;
    // indicates that the mips in this texture are arbitrary content, aren't just downscaled
    bool has_arbitrary_mips = false;
-@@ -180,6 +181,7 @@ struct TCacheEntry
+@@ -180,6 +182,8 @@ struct TCacheEntry
    void SetGeneralParameters(u32 _addr, u32 _size, TextureAndTLUTFormat _format,
                              bool force_safe_hashing)
    {
++    turbulence_rider_marker_atlas = false;
 +    turbulence_aspect_locked_art = false;
      addr = _addr;
      size_in_bytes = _size;
@@ -2599,10 +2767,10 @@ index 0000000..1c6b83d
 +}  // namespace TurbulencePresentTimes
 diff --git a/Source/Core/VideoCommon/TurbulencePromptTextures.cpp b/Source/Core/VideoCommon/TurbulencePromptTextures.cpp
 new file mode 100644
-index 0000000..828b395
+index 0000000..cfc972a
 --- /dev/null
 +++ b/Source/Core/VideoCommon/TurbulencePromptTextures.cpp
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,160 @@
 +// Turbulence: switch texture-baked button prompts between console styles.
 +
 +#include "VideoCommon/TurbulencePromptTextures.h"
@@ -2630,6 +2798,8 @@ index 0000000..828b395
 +{
 +std::mutex s_mutex;
 +std::vector<Recipe> s_recipes;
++struct Artwork { u32 width, height; std::vector<u8> rgba; };
++std::map<std::string, Artwork> s_artwork;
 +// Patched textures by (texture name incl. palette, style).
 +std::map<std::pair<std::string, int>, std::shared_ptr<VideoCommon::CustomTextureData>> s_built;
 +std::atomic<int> s_style{GameCube};
@@ -2646,6 +2816,16 @@ index 0000000..828b395
 +{
 +  std::lock_guard lock(s_mutex);
 +  s_recipes.push_back(std::move(recipe));
++}
++
++void RegisterArtwork(std::string name, u32 width, u32 height, std::vector<u8> rgba)
++{
++  if (!width || !height || rgba.size() != size_t(width) * height * 4)
++    return;
++  std::lock_guard lock(s_mutex);
++  s_artwork.insert_or_assign(std::move(name), Artwork{width, height, std::move(rgba)});
++  s_built.clear();
++  s_changed = true;
 +}
 +
 +void SetStyle(Style style)
@@ -2725,6 +2905,13 @@ index 0000000..828b395
 +                      rgba.data(), Common::ImageByteFormat::RGBA, width, height, width * 4);
 +  }
 +  Detail::ApplyCells(rgba, width, height, decoded, ew, *recipe, static_cast<Style>(style));
++  for (const CellCopy& cell : recipe->cells)
++  {
++    const auto found = s_artwork.find(cell.artwork[style]);
++    if (found != s_artwork.end())
++      Detail::ApplyArtwork(rgba, width, height, cell, found->second.rgba,
++                           found->second.width, found->second.height);
++  }
 +  if (dump_dir && *dump_dir)
 +    Common::SavePNG((std::filesystem::path(dump_dir) /
 +                     ((style == Xbox ? "xbox-" : "playstation-") + full_name + ".png")).string(),
@@ -2746,10 +2933,10 @@ index 0000000..828b395
 +}  // namespace TurbulencePromptTextures
 diff --git a/Source/Core/VideoCommon/TurbulencePromptTextures.h b/Source/Core/VideoCommon/TurbulencePromptTextures.h
 new file mode 100644
-index 0000000..978b191
+index 0000000..daf97b2
 --- /dev/null
 +++ b/Source/Core/VideoCommon/TurbulencePromptTextures.h
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,73 @@
 +// Turbulence: switch texture-baked button prompts between console styles
 +// (generalised from ReFare's RefarePromptTextures).
 +//
@@ -2794,6 +2981,8 @@ index 0000000..978b191
 +  // Optional caption inside the game's rectangular trigger keycap. Used
 +  // where this platform's label is absent from the original texture atlas.
 +  std::array<std::string, StyleCount> labels{};
++  // Original platform artwork when it lives outside this GameCube atlas.
++  std::array<std::string, StyleCount> artwork{};
 +};
 +
 +struct Recipe
@@ -2807,6 +2996,7 @@ index 0000000..978b191
 +
 +// Call before rendering starts.
 +void Register(Recipe recipe);
++void RegisterArtwork(std::string name, u32 width, u32 height, std::vector<u8> rgba);
 +
 +// Any thread. Takes effect on the next texture lookup.
 +void SetStyle(Style style);
@@ -2837,14 +3027,15 @@ index 98eb651..41e7102 100644
  
    if (loader_type == VertexLoaderType::Software)
 diff --git a/Source/Core/VideoCommon/VertexManagerBase.cpp b/Source/Core/VideoCommon/VertexManagerBase.cpp
-index 2bc6d58..df99704 100644
+index 2bc6d58..519bad9 100644
 --- a/Source/Core/VideoCommon/VertexManagerBase.cpp
 +++ b/Source/Core/VideoCommon/VertexManagerBase.cpp
-@@ -2,9 +2,15 @@
+@@ -2,9 +2,16 @@
  // SPDX-License-Identifier: GPL-2.0-or-later
  
  #include "VideoCommon/VertexManagerBase.h"
 +#include "VideoCommon/TurbulenceViewport.h"
++#include "VideoCommon/TurbulenceNativeMenu.h"
  
  #include <array>
 +#include <algorithm>
@@ -2856,7 +3047,7 @@ index 2bc6d58..df99704 100644
  #include <memory>
  
  #include "Common/ChunkFile.h"
-@@ -36,6 +42,7 @@
+@@ -36,6 +43,7 @@
  #include "VideoCommon/PixelShaderManager.h"
  #include "VideoCommon/Statistics.h"
  #include "VideoCommon/TextureCacheBase.h"
@@ -2864,7 +3055,7 @@ index 2bc6d58..df99704 100644
  #include "VideoCommon/VertexLoaderManager.h"
  #include "VideoCommon/VertexShaderManager.h"
  #include "VideoCommon/VideoBackendBase.h"
-@@ -432,6 +439,59 @@ BitSet32 VertexManagerBase::UsedTextures() const
+@@ -432,6 +440,59 @@ BitSet32 VertexManagerBase::UsedTextures() const
    return usedtextures;
  }
  
@@ -2924,7 +3115,7 @@ index 2bc6d58..df99704 100644
  void VertexManagerBase::Flush()
  {
    if (m_is_flushed)
-@@ -562,6 +622,13 @@ void VertexManagerBase::Flush()
+@@ -562,6 +623,13 @@ void VertexManagerBase::Flush()
    std::vector<std::string> texture_names;
    Common::SmallVector<u32, 8> texture_units;
    std::array<SamplerState, 8> samplers;
@@ -2938,7 +3129,7 @@ index 2bc6d58..df99704 100644
    if (!m_cull_all)
    {
      if (!g_ActiveConfig.bGraphicMods)
-@@ -571,6 +638,8 @@ void VertexManagerBase::Flush()
+@@ -571,6 +639,8 @@ void VertexManagerBase::Flush()
          const auto cache_entry = g_texture_cache->Load(i);
          if (!cache_entry)
            continue;
@@ -2947,7 +3138,7 @@ index 2bc6d58..df99704 100644
          const float custom_tex_scale = cache_entry->GetWidth() / float(cache_entry->native_width);
          samplers[i] = TextureCacheBase::GetSamplerState(
              i, custom_tex_scale, cache_entry->is_custom_tex, cache_entry->has_arbitrary_mips);
-@@ -583,6 +652,8 @@ void VertexManagerBase::Flush()
+@@ -583,6 +653,8 @@ void VertexManagerBase::Flush()
          const auto cache_entry = g_texture_cache->Load(i);
          if (cache_entry)
          {
@@ -2956,7 +3147,7 @@ index 2bc6d58..df99704 100644
            if (!Common::Contains(texture_names, cache_entry->texture_info_name))
            {
              texture_names.push_back(cache_entry->texture_info_name);
-@@ -596,6 +667,63 @@ void VertexManagerBase::Flush()
+@@ -596,6 +668,398 @@ void VertexManagerBase::Flush()
        }
      }
    }
@@ -2970,7 +3161,7 @@ index 2bc6d58..df99704 100644
 +    for (const auto* t : draw_textures)
 +      if (t)
 +        signature += fmt::format(" {}x{}:{}:copy{}", t->native_width, t->native_height,
-+                                 static_cast<int>(t->format.texfmt), t->IsCopy());
++                                 static_cast<int>(t->format.texfmt), t->IsCopy()) + " " + t->texture_info_name;
 +    static std::set<std::string> seen_textures;
 +    if (seen_textures.size() < 200 && seen_textures.insert(signature).second)
 +      std::fprintf(stderr, "[ws-textures]%s\n", signature.c_str());
@@ -3005,9 +3196,20 @@ index 2bc6d58..df99704 100644
 +      {
 +        const auto& decl = VertexLoaderManager::GetCurrentVertexFormat()->GetVertexDeclaration();
 +        const size_t vertex_count = (m_cur_buffer_pointer - m_base_buffer_pointer) / decl.stride;
++        if (trace_textures)
++        {
++          static std::set<std::string> seen_draws;
++          std::string key = fmt::format("{:.3f},{:.3f},{:.3f},{:.3f},{}", min_x,max_x,min_y,max_y,vertex_count);
++          for (const auto* t : draw_textures) if(t) key += " " + t->texture_info_name;
++          if (seen_draws.size()<4000 && seen_draws.insert(key).second)
++            std::fprintf(stderr,"[ui-draw] %s\n",key.c_str());
++        }
 +        if (TurbulenceViewport::IsFullscreenBackground(min_x, max_x, min_y, max_y,
 +                                                       static_cast<u32>(vertex_count)))
 +          draw.mode = movie_texture ? TurbulenceDraw2D::Movie4x3 : TurbulenceDraw2D::Stretch;
++        else if (TurbulenceViewport::IsFullWidthPanel(min_x, max_x,
++                     static_cast<u32>(vertex_count), used_textures.Count() != 0))
++          draw.mode = TurbulenceDraw2D::Stretch;
 +      }
 +    }
 +    if (xfmem.projection.type == ProjectionType::Orthographic && !m_cull_all &&
@@ -3016,6 +3218,330 @@ index 2bc6d58..df99704 100644
 +        }))
 +      draw.mode = TurbulenceDraw2D::AspectLockedArt;
 +    g_turbulence_draw_2d = draw;
++  }
++  // The guest projects each rider into the widened camera before drawing
++  // the COM arrow. Preserve that screen position when centering the HUD.
++  if (draw_textures[0] && draw_textures[0]->turbulence_rider_marker_atlas &&
++      g_ActiveConfig.bWidescreenHack && !g_turbulence_hud_stretched && !m_cull_all &&
++      xfmem.projection.type == ProjectionType::Orthographic &&
++      g_turbulence_draw_2d.mode == TurbulenceDraw2D::Center)
++  {
++    const auto& decl = VertexLoaderManager::GetCurrentVertexFormat()->GetVertexDeclaration();
++    const auto& uv = decl.texcoords[0];
++    const float w = g_ActiveConfig.fAspectRatioHackW;
++    const float h = g_ActiveConfig.fAspectRatioHackH;
++    if (uv.enable && uv.type == ComponentFormat::Float && uv.components >= 2 &&
++        decl.position.type == ComponentFormat::Float && decl.position.components >= 2 &&
++        w > 0 && h > 0 && (w != 1 || h != 1))
++    {
++      const auto& raw = xfmem.projection.rawProjection;
++      const size_t count = (m_cur_buffer_pointer - m_base_buffer_pointer) / decl.stride;
++      for (size_t first = 0; first + 4 <= count; first += 4)
++      {
++        float positions[4][3]{};
++        const float* matrices[4];
++        float center_x = 0, tip_y = std::numeric_limits<float>::max();
++        bool marker = true;
++        for (size_t i = 0; i < 4; ++i)
++        {
++          const auto* vertex = m_base_buffer_pointer + (first + i) * decl.stride;
++          float st[2];
++          std::memcpy(st, vertex + uv.offset, sizeof(st));
++          // Exact authored COM cell, excluding portraits and minimap icons.
++          if ((st[0] != 220.f/256 && st[0] != 1.f) ||
++              (st[1] != 60.f/256 && st[1] != 90.f/256))
++          {
++            marker = false;
++            break;
++          }
++          std::memcpy(positions[i], vertex + decl.position.offset,
++                      sizeof(float) * std::min(decl.position.components, 3));
++          const auto index = decl.posmtx.enable ? vertex[decl.posmtx.offset] :
++                                                  g_main_cp_state.matrix_index_a.PosNormalMtxIdx;
++          const float* m = matrices[i] = &xfmem.posMatrices[(index & 63) * 4];
++          const auto& p = positions[i];
++          center_x += .25f * (raw[0]*(p[0]*m[0]+p[1]*m[1]+p[2]*m[2]+m[3])+raw[1]);
++          tip_y = std::min(tip_y, raw[2]*(p[0]*m[4]+p[1]*m[5]+p[2]*m[6]+m[7])+raw[3]);
++        }
++        if (!marker) continue;
++        const float dx = center_x * (1.f/w - 1.f);
++        const float dy = tip_y * (1.f/h - 1.f);
++        for (size_t i = 0; i < 4; ++i)
++        {
++          const auto* m = matrices[i];
++          const float a=raw[0]*m[0], b=raw[0]*m[1], c=raw[2]*m[4], d=raw[2]*m[5];
++          const float det = a*d-b*c;
++          if (!std::isfinite(det) || std::abs(det) < 1e-12f)
++          {
++            marker = false;
++            break;
++          }
++          positions[i][0] += (d*dx-b*dy)/det;
++          positions[i][1] += (a*dy-c*dx)/det;
++        }
++        if (marker)
++        {
++          for (size_t i = 0; i < 4; ++i)
++            std::memcpy(m_base_buffer_pointer + (first + i) * decl.stride + decl.position.offset,
++                        positions[i], 2 * sizeof(float));
++        }
++      }
++    }
++  }
++  // Recomp Settings keeps the native Language Setting frames. Its text is
++  // supplied separately with the original game's bitmap glyphs.
++  if (TurbulenceNativeMenu::settings_page.load(std::memory_order_relaxed) &&
++      xfmem.projection.type==ProjectionType::Orthographic &&
++      std::any_of(draw_textures.begin(),draw_textures.end(),[](const TCacheEntry* t) {
++        return t && (t->texture_info_name.find("_5ee41778907d02cb")!=std::string::npos ||
++                     t->texture_info_name.find("_4ddbae84febca1cd")!=std::string::npos ||
++                     t->texture_info_name.find("_bfd10fb02856aa95")!=std::string::npos ||
++                     t->texture_info_name.find("_ba16db485da31f40")!=std::string::npos);
++      })) m_cull_all=true;
++  // The fifth Options row is drawn by the original game's pill renderer.
++  // Point just its caption quad at lettering composed in an unused atlas cell.
++  if (TurbulenceNativeMenu::options_visible.load(std::memory_order_relaxed) &&
++      xfmem.projection.type == ProjectionType::Orthographic && !m_cull_all &&
++      std::any_of(draw_textures.begin(),draw_textures.end(),[](const TCacheEntry* t) {
++        return t && t->texture_info_name.find("_3bf9cc2e344cce2b")!=std::string::npos;
++      }))
++  {
++    auto* format=VertexLoaderManager::GetCurrentVertexFormat();
++    const auto& decl=format->GetVertexDeclaration();
++    float left,right,bottom,top;
++    const size_t count=decl.stride?(m_cur_buffer_pointer-m_base_buffer_pointer)/decl.stride:0;
++    const auto& uv=decl.texcoords[0];
++    if (count==4 && uv.enable && uv.type==ComponentFormat::Float && uv.components>=2 &&
++        MeasureExtent(format,&left,&right,&bottom,&top) && bottom>-.18f && bottom<-.14f &&
++        top>-.08f && top<-.04f && GetRemainingSize()>=u32(4*decl.stride) &&
++        GetRemainingIndices(Primitive::GX_DRAW_QUADS)>=4 &&
++        m_index_generator.GetRemainingIndices(Primitive::GX_DRAW_QUADS)>=4)
++    {
++      std::vector<u8> original(m_base_buffer_pointer,m_cur_buffer_pointer);
++      float st[4][2],xy[4][2],p[4][3]{};const float* matrices[4];
++      const auto& raw=xfmem.projection.rawProjection;
++      float min_u=1e9f,max_u=-1e9f,min_v=1e9f,max_v=-1e9f;
++      for(size_t i=0;i<4;++i) {
++        const u8* v=original.data()+i*decl.stride;
++        std::memcpy(st[i],v+uv.offset,sizeof(st[i]));
++        std::memcpy(p[i],v+decl.position.offset,sizeof(float)*std::min(decl.position.components,3));
++        const u32 index=decl.posmtx.enable?v[decl.posmtx.offset]:g_main_cp_state.matrix_index_a.PosNormalMtxIdx;
++        matrices[i]=&xfmem.posMatrices[(index&0x3f)*4];const float* m=matrices[i];
++        xy[i][0]=raw[0]*(p[i][0]*m[0]+p[i][1]*m[1]+p[i][2]*m[2]+m[3])+raw[1];
++        xy[i][1]=raw[2]*(p[i][0]*m[4]+p[i][1]*m[5]+p[i][2]*m[6]+m[7])+raw[3];
++        min_u=std::min(min_u,st[i][0]);max_u=std::max(max_u,st[i][0]);
++        min_v=std::min(min_v,st[i][1]);max_v=std::max(max_v,st[i][1]);
++      }
++      const float unit=(max_v-min_v)/24.f;
++      if(unit>0 && max_u>min_u) {
++        const float ratio=88.f*unit/(max_u-min_u);
++        for(int i=0;i<4;++i) {
++          u8* v=m_base_buffer_pointer+i*decl.stride;
++          float out[3];std::memcpy(out,p[i],sizeof(out));
++          TurbulenceViewport::SetClipX(out,matrices[i],raw.data(),left+(xy[i][0]-left)*ratio);
++          std::memcpy(v+decl.position.offset,out,sizeof(float)*2);
++          const float tex[]={ (400.f+88.f*(st[i][0]-min_u)/(max_u-min_u))*unit,
++                              (372.f+24.f*(st[i][1]-min_v)/(max_v-min_v))*unit };
++          std::memcpy(v+uv.offset,tex,sizeof(tex));
++        }
++        // Choose a conventional quad order with the source draw's winding.
++        const float winding=(xy[1][0]-xy[0][0])*(xy[2][1]-xy[0][1])-
++                            (xy[1][1]-xy[0][1])*(xy[2][0]-xy[0][0]);
++        int corners[4]{};
++        for(int i=0;i<4;++i) {
++          const bool r=xy[i][0]>(left+right)*.5f, t=xy[i][1]>(bottom+top)*.5f;
++          corners[t?(r?1:0):(r?2:3)]=i;
++        }
++        const int clockwise[]={0,1,2,3}, counter[]={0,3,2,1};
++        const int* order=winding<0?clockwise:counter;
++        for(int i=0;i<4;++i) {
++          const int j=corners[order[i]];
++          u8* v=m_cur_buffer_pointer+i*decl.stride;
++          std::memcpy(v,original.data()+j*decl.stride,decl.stride);
++          float out[3];std::memcpy(out,p[j],sizeof(out));
++          TurbulenceViewport::SetClipX(out,matrices[j],raw.data(),
++            left+(right-left)*ratio+(xy[j][0]-left)*ratio);
++          std::memcpy(v+decl.position.offset,out,sizeof(float)*2);
++          const float tex[]={ (400.f+88.f*(st[j][0]-min_u)/(max_u-min_u))*unit,
++                              (396.f+24.f*(st[j][1]-min_v)/(max_v-min_v))*unit };
++          std::memcpy(v+uv.offset,tex,sizeof(tex));
++        }
++        m_cur_buffer_pointer+=4*decl.stride;
++        m_index_generator.AddIndices(Primitive::GX_DRAW_QUADS,4);
++      }
++    }
++  }
++
++  // Continue only the flat ends of menu dividers/footer trim. Keep the
++  // authored vertices/UVs unchanged so curves, bevels and text never stretch.
++  if (g_ActiveConfig.bWidescreenHack && !g_turbulence_hud_stretched &&
++      g_ActiveConfig.fAspectRatioHackW > 0.0f && g_ActiveConfig.fAspectRatioHackW < 1.0f &&
++      !m_cull_all && xfmem.projection.type == ProjectionType::Orthographic &&
++      (used_textures.Count() == 0 ||
++       std::any_of(draw_textures.begin(), draw_textures.end(), [](const TCacheEntry* t) {
++        return t && (t->texture_info_name.find("_8ef9802115e76654") != std::string::npos ||
++                     t->texture_info_name.find("_549fadeb773fc748") != std::string::npos ||
++                     t->texture_info_name.find("_0406bb54a29b5554") != std::string::npos);
++      })))
++  {
++    auto* format = VertexLoaderManager::GetCurrentVertexFormat();
++    const auto& decl = format->GetVertexDeclaration();
++    const auto& raw = xfmem.projection.rawProjection;
++    const size_t count = decl.stride ? (m_cur_buffer_pointer-m_base_buffer_pointer)/decl.stride : 0;
++    if(count == 4 && decl.position.enable && decl.position.type == ComponentFormat::Float &&
++       decl.position.components >= 2 && m_index_generator.GetNumVerts() == 4)
++    {
++      float positions[4][2];
++      auto point = [&](u8* v, float* p, const float** m) {
++        std::fill_n(p,3,0.0f);
++        std::memcpy(p,v+decl.position.offset,sizeof(float)*std::min(decl.position.components,3));
++        const u32 index=decl.posmtx.enable?v[decl.posmtx.offset]:g_main_cp_state.matrix_index_a.PosNormalMtxIdx;
++        *m=&xfmem.posMatrices[(index&0x3f)*4];
++      };
++      float left=2,right=-2;
++      for(int i=0;i<4;++i)
++      {
++        float p[3];const float* m;point(m_base_buffer_pointer+i*decl.stride,p,&m);
++        positions[i][0]=raw[0]*(p[0]*m[0]+p[1]*m[1]+p[2]*m[2]+m[3])+raw[1];
++        positions[i][1]=raw[2]*(p[0]*m[4]+p[1]*m[5]+p[2]*m[6]+m[7])+raw[3];
++        left=std::min(left,positions[i][0]);right=std::max(right,positions[i][0]);
++      }
++      // The untextured half-width gradients belong to the footer panel.
++      const bool footer_gradient = used_textures.Count() == 0 &&
++          std::all_of(std::begin(positions), std::end(positions), [](const auto& p) {
++            return p[1] >= -.89f && p[1] <= -.52f;
++          });
++      const float winding=(positions[1][0]-positions[0][0])*(positions[2][1]-positions[0][1])-
++                           (positions[1][1]-positions[0][1])*(positions[2][0]-positions[0][0]);
++      const float limit=1.0f/g_ActiveConfig.fAspectRatioHackW;
++      for(bool right_side : {false,true})
++      {
++        const float inner=right_side?right:left, outer=right_side?limit:-limit;
++        if (used_textures.Count() == 0 && !footer_gradient) continue;
++        if (!TurbulenceViewport::NeedsMenuBarPadding(inner, g_ActiveConfig.fAspectRatioHackW,
++                                                    right_side)) continue;
++        if(GetRemainingSize()<4*decl.stride || GetRemainingIndices(Primitive::GX_DRAW_QUADS)<4 ||
++           m_index_generator.GetRemainingIndices(Primitive::GX_DRAW_QUADS)<4) continue;
++        int low=-1,high=-1;
++        for(int i=0;i<4;++i) if(std::abs(positions[i][0]-inner)<.005f)
++        {
++          if(low<0 || positions[i][1]<positions[low][1])low=i;
++          if(high<0 || positions[i][1]>positions[high][1])high=i;
++        }
++        if(low<0 || high<0 || low==high)continue;
++        // Keep the added quad's winding equal to the original draw.
++        if ((winding>0) != right_side) std::swap(low,high);
++        const int sources[]={low,low,high,high};
++        // Cover the atlas's one-pixel transparent boundary to avoid a seam.
++        const float join = used_textures.Count() == 0 ? inner :
++                           inner + (right_side ? -.006f : .006f);
++        const float targets[]={join,outer,outer,join};
++        bool valid=true;
++        for(int i=0;i<4;++i)
++        {
++          u8* v=m_cur_buffer_pointer+i*decl.stride;
++          std::memcpy(v,m_base_buffer_pointer+sources[i]*decl.stride,decl.stride);
++          // Sample just inside the edge: atlas boundary texels can be transparent.
++          // Only the added strip uses this column; authored artwork stays intact.
++          for (const auto& uv : decl.texcoords)
++          {
++            if (!uv.enable || uv.type != ComponentFormat::Float || uv.components < 2) continue;
++            int opposite = -1;
++            for (int j = 0; j < 4; ++j)
++              if (std::abs(positions[j][0]-inner) > .005f &&
++                  std::abs(positions[j][1]-positions[sources[i]][1]) < .005f)
++                opposite = j;
++            if (opposite >= 0)
++            {
++              float edge_uv[2], inside_uv[2];
++              std::memcpy(edge_uv, v+uv.offset, sizeof(edge_uv));
++              std::memcpy(inside_uv, m_base_buffer_pointer+opposite*decl.stride+uv.offset,
++                          sizeof(inside_uv));
++              for (int k = 0; k < 2; ++k)
++                edge_uv[k] += .02f*(inside_uv[k]-edge_uv[k]);
++              std::memcpy(v+uv.offset, edge_uv, sizeof(edge_uv));
++            }
++          }
++          float p[3];const float* m;point(v,p,&m);
++          valid &= TurbulenceViewport::SetClipX(p,m,raw.data(),targets[i]);
++          std::memcpy(v+decl.position.offset,p,sizeof(float)*2);
++        }
++        if(valid)
++        {
++          m_cur_buffer_pointer+=4*decl.stride;
++          m_index_generator.AddIndices(Primitive::GX_DRAW_QUADS,4);
++        }
++      }
++    }
++  }
++  // Widen only the three horizontal scanline strips. Their vertical UVs
++  // and positions are unchanged, preserving line pitch; their horizontal
++  // fade spans the screen. Circle artwork is in separate, untouched draws.
++  if (g_ActiveConfig.bWidescreenHack && g_ActiveConfig.fAspectRatioHackW > 0.0f &&
++      g_ActiveConfig.fAspectRatioHackW < 1.0f && !m_cull_all &&
++      xfmem.projection.type == ProjectionType::Orthographic &&
++      std::any_of(draw_textures.begin(), draw_textures.end(), [](const TCacheEntry* t) {
++        return t && t->texture_info_name.find("_0a503a7ee2456e29") != std::string::npos;
++      }))
++  {
++    auto* format = VertexLoaderManager::GetCurrentVertexFormat();
++    const auto& decl = format->GetVertexDeclaration();
++    float left, right, top, bottom;
++    const size_t count = decl.stride ? (m_cur_buffer_pointer-m_base_buffer_pointer)/decl.stride : 0;
++    if (decl.position.components >= 2 && MeasureExtent(format, &left, &right, &top, &bottom) &&
++        TurbulenceViewport::IsMenuScanlineQuad(left, right, top, bottom, static_cast<u32>(count)))
++    {
++      const auto& raw = xfmem.projection.rawProjection;
++      const float edge = 1.0f/g_ActiveConfig.fAspectRatioHackW;
++      for (size_t i=0; i<count; ++i)
++      {
++        u8* vertex = m_base_buffer_pointer+i*decl.stride;
++        float p[3]{};
++        std::memcpy(p,vertex+decl.position.offset,sizeof(float)*std::min(decl.position.components,3));
++        const u32 index = decl.posmtx.enable ? vertex[decl.posmtx.offset] :
++                                             g_main_cp_state.matrix_index_a.PosNormalMtxIdx;
++        const float* m = &xfmem.posMatrices[(index&0x3f)*4];
++        const float x = raw[0]*(p[0]*m[0]+p[1]*m[1]+p[2]*m[2]+m[3])+raw[1];
++        if(TurbulenceViewport::SetClipX(p,m,raw.data(),edge*(2*x+1)))
++          std::memcpy(vertex+decl.position.offset,p,sizeof(float)*2);
++      }
++    }
++  }
++  // Results silver wedges and their portrait sockets share an atlas. Move
++  // only vertices at the original LEFT screen boundary. An affine transform
++  // of the whole batch would stretch the circular sockets and move the ranks.
++  if (g_ActiveConfig.bWidescreenHack && !g_turbulence_hud_stretched &&
++      g_ActiveConfig.fAspectRatioHackW < 1.0f &&
++      xfmem.projection.type == ProjectionType::Orthographic && !m_cull_all &&
++      std::any_of(draw_textures.begin(), draw_textures.end(), [](const TCacheEntry* t) {
++        return t && t->native_width == 128 && t->native_height == 128 &&
++               t->texture_info_name.find("_46f9f97b69e89d02") != std::string::npos;
++      }))
++  {
++    auto* format = VertexLoaderManager::GetCurrentVertexFormat();
++    const auto& decl = format->GetVertexDeclaration();
++    const auto& raw = xfmem.projection.rawProjection;
++    if (decl.position.enable && decl.position.type == ComponentFormat::Float &&
++        decl.position.components >= 2 && decl.stride)
++    {
++      const size_t count = (m_cur_buffer_pointer - m_base_buffer_pointer) / decl.stride;
++      for (size_t i = 0; i < count; ++i)
++      {
++        u8* vertex = m_base_buffer_pointer + i * decl.stride;
++        float p[3]{};
++        std::memcpy(p, vertex + decl.position.offset,
++                    sizeof(float) * std::min(decl.position.components, 3));
++        const u32 index = decl.posmtx.enable ? vertex[decl.posmtx.offset] :
++                                             g_main_cp_state.matrix_index_a.PosNormalMtxIdx;
++        const float* m = &xfmem.posMatrices[(index & 0x3f) * 4];
++        const float clip_x = raw[0] * (p[0]*m[0]+p[1]*m[1]+p[2]*m[2]+m[3]) + raw[1];
++        const float extended = TurbulenceViewport::ExtendSilverLeft(
++            clip_x, g_ActiveConfig.fAspectRatioHackW, false);
++        if (extended == clip_x) continue;
++        if (!TurbulenceViewport::SetClipX(p, m, raw.data(), extended)) continue;
++        std::memcpy(vertex + decl.position.offset, p, sizeof(float)*2);
++      }
++    }
 +  }
    vertex_shader_manager.SetConstants(texture_names, xf_state_manager);
    if (!bpmem.genMode.zfreeze)
@@ -3204,6 +3730,17 @@ index 6d69803..b4a6922 100644
    {
      xf_state_manager.ResetProjection();
      m_projection_graphics_mod_change = !projection_actions.empty();
+diff --git a/Source/Core/VideoCommon/VertexShaderManager.h b/Source/Core/VideoCommon/VertexShaderManager.h
+index 600ba3b..e8f90dd 100644
+--- a/Source/Core/VideoCommon/VertexShaderManager.h
++++ b/Source/Core/VideoCommon/VertexShaderManager.h
+@@ -85,3 +85,6 @@ private:
+ 
+   Common::Matrix44 LoadProjectionMatrix();
+ };
++
++// Shared centered/stretched UI selection.
++extern bool g_turbulence_hud_stretched;
 diff --git a/Source/Core/VideoCommon/VideoEvents.h b/Source/Core/VideoCommon/VideoEvents.h
 index fe30aa2..e3da818 100644
 --- a/Source/Core/VideoCommon/VideoEvents.h
@@ -3235,7 +3772,7 @@ index 7e909a3..acae63b 100644
  add_library(build_pch pch.h pch.cpp)
  
 diff --git a/module-template/CMakeLists.txt b/module-template/CMakeLists.txt
-index dac92e8..a1f592a 100644
+index dac92e8..d12392c 100644
 --- a/module-template/CMakeLists.txt
 +++ b/module-template/CMakeLists.txt
 @@ -39,16 +39,32 @@ set(MODULE_NAME "g${GAME_ID}_recomp")
@@ -3325,13 +3862,35 @@ index dac92e8..a1f592a 100644
  if(NOT WIN32)
    target_link_libraries(${MODULE_NAME} PRIVATE m)
  endif()
-@@ -172,3 +223,14 @@ elseif(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+@@ -159,11 +210,19 @@ if(RECOMPCORE_MODULE_ENABLE_IPO AND CMAKE_C_COMPILER_ID MATCHES "Clang")
+   endif()
+ endif()
+ 
++# clang-cl reports MSVC, but /fp:strict there means -ffp-model=strict (rounding-
++# math, strict FP exceptions, constrained intrinsics): a large slowdown with no
++# accuracy gain over the -ffp-contract=off -fno-fast-math used elsewhere.
++if(MSVC AND CMAKE_C_COMPILER_ID MATCHES "Clang")
++  set(_module_fp_flags /fp:precise /clang:-ffp-contract=off /clang:-fno-fast-math)
++else()
++  set(_module_fp_flags /fp:strict)
++endif()
+ if(MSVC)
+   if(RECOMPCORE_MODULE_OPT_LEVEL STREQUAL "0")
+-    target_compile_options(${MODULE_NAME} PRIVATE /Od /fp:strict)
++    target_compile_options(${MODULE_NAME} PRIVATE /Od ${_module_fp_flags})
+   else()
+-    target_compile_options(${MODULE_NAME} PRIVATE /O2 /fp:strict)
++    target_compile_options(${MODULE_NAME} PRIVATE /O2 ${_module_fp_flags})
+   endif()
+ elseif(CMAKE_C_COMPILER_ID MATCHES "Clang")
+   target_compile_options(${MODULE_NAME} PRIVATE
+@@ -172,3 +231,14 @@ elseif(CMAKE_C_COMPILER_ID STREQUAL "GNU")
    target_compile_options(${MODULE_NAME} PRIVATE
      -O${RECOMPCORE_MODULE_OPT_LEVEL} -ffp-contract=off -fno-fast-math)
  endif()
 +if(REL_GENERATED_DIR)
 +  if(MSVC)
-+    target_compile_options(${MODULE_NAME}_rel PRIVATE /O2 /fp:strict)
++    target_compile_options(${MODULE_NAME}_rel PRIVATE /O2 ${_module_fp_flags})
 +  else()
 +    target_compile_options(${MODULE_NAME}_rel PRIVATE
 +      -O${RECOMPCORE_MODULE_OPT_LEVEL} -ffp-contract=off -fno-fast-math)
@@ -3541,35 +4100,66 @@ index baeffe2..78eeb2b 100644
      return 0
  
 diff --git a/module-template/module_export.c b/module-template/module_export.c
-index 04bce0b..756e872 100644
+index 04bce0b..38cd7ac 100644
 --- a/module-template/module_export.c
 +++ b/module-template/module_export.c
-@@ -62,13 +62,24 @@ static int host_has_x86_64_v3(void)
+@@ -8,6 +8,8 @@
+ 
+ #include "StaticRecompABI.h"
+ 
++#include <stdlib.h>
++
+ #if defined(DOLRECOMP_MODULE_HAVE_X86_64_V3) && defined(_MSC_VER)
+ #include <intrin.h>
+ #elif defined(DOLRECOMP_MODULE_HAVE_X86_64_V3) && defined(__x86_64__) && \
+@@ -62,13 +64,43 @@ static int host_has_x86_64_v3(void)
  }
  #endif
  
++#if defined(DOLRECOMP_MODULE_HAVE_X86_64_V3)
++// The x86-64-v3 (AVX2) copy diverges from the GameCube in gameplay on Windows
++// (Ryzen 7 8845HS: "Invalid read from 0x38" at REL PC 0x8044B134 after
++// starting a race; v2 is fine). Off until that is found; opt in with
++// TURBULENCE_X86_64_V3=1.
++static int force_baseline_code(void)
++{
++    static int forced = -1;
++    if (forced < 0)
++    {
++        const char* value = getenv("TURBULENCE_X86_64_V3");
++        forced = !(value && value[0] && value[0] != '0');
++    }
++    return forced;
++}
++#endif
++
 +#if defined(MODULE_HAVE_REL)
 +int turbulence_rel_call(CPUState* ctx, u32 address);
 +#endif
 +
  static int selected_dispatch(CPUState* ctx, u32 address)
  {
++    int handled;
  #if defined(DOLRECOMP_MODULE_HAVE_X86_64_V3)
-     if (host_has_x86_64_v3())
-         return dolrecomp_call__x86_64_v3(ctx, address);
- #endif
-+#if defined(MODULE_HAVE_REL)
-+    // Turbulence: the DOL's dispatcher first, then the recompiled REL's.
-+    if (dolrecomp_call(ctx, address))
-+        return 1;
-+    return turbulence_rel_call(ctx, address);
-+#else
-     return dolrecomp_call(ctx, address);
+-    if (host_has_x86_64_v3())
+-        return dolrecomp_call__x86_64_v3(ctx, address);
++    if (host_has_x86_64_v3() && !force_baseline_code())
++        handled = dolrecomp_call__x86_64_v3(ctx, address);
++    else
 +#endif
++        handled = dolrecomp_call(ctx, address);
++#if defined(MODULE_HAVE_REL)
++    // Turbulence: the DOL's dispatcher first, then the recompiled REL's. This
++    // must also run after the x86-64-v3 copy, which only covers main.dol.
++    if (!handled)
++        handled = turbulence_rel_call(ctx, address);
+ #endif
+-    return dolrecomp_call(ctx, address);
++    return handled;
  }
  
  void dolrecomp_indirect_dispatch(CPUState* ctx, u32 address)
-@@ -104,6 +115,10 @@ static const StaticRecompModuleDesc s_desc = {
+@@ -104,6 +136,10 @@ static const StaticRecompModuleDesc s_desc = {
      s_chunk_ranges,
      MODULE_CHUNK_RANGE_COUNT,
      s_chunk_hashes,
@@ -3922,6 +4512,98 @@ index 0000000..95d4388
 +  return result.get();
 +}
 +}
+diff --git a/Source/Core/VideoCommon/TurbulenceMenuArtwork.h b/Source/Core/VideoCommon/TurbulenceMenuArtwork.h
+new file mode 100644
+index 0000000..8e3cda4
+--- /dev/null
++++ b/Source/Core/VideoCommon/TurbulenceMenuArtwork.h
+@@ -0,0 +1,86 @@
++#pragma once
++#include <cstring>
++#include <memory>
++#include <vector>
++#include "VideoCommon/Assets/CustomTextureData.h"
++#include "VideoCommon/TextureDecoder.h"
++#include "VideoCommon/TextureInfo.h"
++#include "VideoCommon/TurbulenceNativeMenu.h"
++
++namespace TurbulenceMenuArtwork {
++inline std::shared_ptr<std::vector<u8>> font_atlases[3];
++constexpr unsigned CaptionX=400, CaptionY=372, CaptionWidth=176, CaptionHeight=24;
++// Compose the new caption from the disc's own menu lettering. No substituted
++// system font or replacement menu artwork is bundled with the recomp.
++inline std::shared_ptr<VideoCommon::CustomTextureData> Find(const TextureInfo& info) {
++  if(info.GetRawWidth()==512 && info.GetRawHeight()==512 &&
++     info.GetTextureFormat()==TextureFormat::C8 &&
++     TurbulenceNativeMenu::settings_page.load() &&
++     info.CalculateTextureName().texture_name=="45189e6458d8ae97") {
++    std::vector<u8> rgba(512*512*4);
++    TexDecoder_Decode(rgba.data(),info.GetData(),512,512,info.GetTextureFormat(),
++                      info.GetTlutAddress(),info.GetTlutFormat());
++    // Continue a native blank map-edge column across the green preview.
++    for(unsigned y=220;y<364;++y) for(unsigned x=0;x<229;++x)
++      std::memcpy(&rgba[(y*512+x)*4],&rgba[(y*512+2)*4],4);
++    // Globe and the language-specific A pictograms are omitted on this page.
++    for(unsigned y=17;y<75;++y) for(unsigned x=224;x<285;++x)
++      rgba[(y*512+x)*4+3]=0;
++    for(unsigned y=155;y<178;++y) for(unsigned x=271;x<294;++x)
++      rgba[(y*512+x)*4+3]=0;
++    auto data=std::make_shared<VideoCommon::CustomTextureData>();
++    auto& level=data->m_slices.emplace_back().m_levels.emplace_back();
++    level.width=512;level.height=512;level.row_length=512;
++    level.format=AbstractTextureFormat::RGBA8;
++    level.data=Common::UniqueBuffer<u8>(rgba.size());
++    std::memcpy(level.data.data(),rgba.data(),rgba.size());
++    return data;
++  }
++  if(info.GetRawWidth()==1024 && info.GetRawHeight()==64 &&
++     info.GetTextureFormat()==TextureFormat::C4) {
++    const auto name=info.CalculateTextureName().texture_name;
++    if(name=="4ddbae84febca1cd" || name=="bfd10fb02856aa95") {
++      auto pixels=std::make_shared<std::vector<u8>>(1024*64*4);
++      TexDecoder_Decode(pixels->data(),info.GetData(),1024,64,info.GetTextureFormat(),
++                        info.GetTlutAddress(),info.GetTlutFormat());
++      font_atlases[name=="4ddbae84febca1cd"?1:2]=std::move(pixels);
++    }
++    return {};
++  }
++  if(info.GetRawWidth()!=512 || info.GetRawHeight()!=512 ||
++     info.GetTextureFormat()!=TextureFormat::C4 ||
++     info.CalculateTextureName().texture_name!="3bf9cc2e344cce2b") return {};
++  const unsigned width=info.GetExpandedWidth(),height=info.GetExpandedHeight();
++  std::vector<u8> source(size_t(width)*height*4);
++  TexDecoder_Decode(source.data(),info.GetData(),width,height,info.GetTextureFormat(),
++                    info.GetTlutAddress(),info.GetTlutFormat());
++  font_atlases[0]=std::make_shared<std::vector<u8>>(source);
++  auto rgba=source;
++  std::vector<u8> caption(176*24*4,0);
++  struct Glyph {unsigned x,y,w,advance;};
++  constexpr Glyph glyphs[]={{87,0,18,15},{130,0,16,13},{116,0,15,12},
++    {18,0,16,13},{43,0,20,17},{45,120,17,14},{258,72,76,76},{69,336,14,14}};
++  unsigned dx=0;
++  for(unsigned g=0;g<8;++g) {
++    if(g==6) dx+=2;
++    const auto glyph=glyphs[g];
++    for(unsigned y=0;y<24;++y) for(unsigned x=0;x<glyph.w && dx+x<176;++x) {
++      const auto* src=&source[((glyph.y+y)*width+glyph.x+x)*4];
++      auto* dst=&caption[(y*176+dx+x)*4];
++      if(src[3]>=dst[3]) std::memcpy(dst,src,4);
++    }
++    dx+=glyph.advance;
++  }
++  // Split the caption into two unused cells outside every original label's UV rectangle.
++  for(unsigned half=0;half<2;++half) for(unsigned y=0;y<24;++y)
++    std::memcpy(&rgba[((372+24*half+y)*width+400)*4],
++                &caption[(y*176+88*half)*4],88*4);
++  auto data=std::make_shared<VideoCommon::CustomTextureData>();
++  auto& level=data->m_slices.emplace_back().m_levels.emplace_back();
++  level.width=512;level.height=512;level.row_length=512;
++  level.format=AbstractTextureFormat::RGBA8;
++  level.data=Common::UniqueBuffer<u8>(rgba.size());
++  std::memcpy(level.data.data(),rgba.data(),rgba.size());
++  return data;
++}
++}
 diff --git a/Source/Core/VideoCommon/TurbulenceMetalFX.h b/Source/Core/VideoCommon/TurbulenceMetalFX.h
 new file mode 100644
 index 0000000..ecf456d
@@ -3940,12 +4622,201 @@ index 0000000..ecf456d
 +const AbstractTexture* Upscale(const AbstractTexture* source, const MathUtil::Rectangle<int>& region,
 +                              unsigned width, unsigned height);
 +}
+diff --git a/Source/Core/VideoCommon/TurbulenceNativeMenu.h b/Source/Core/VideoCommon/TurbulenceNativeMenu.h
+new file mode 100644
+index 0000000..e021a68
+--- /dev/null
++++ b/Source/Core/VideoCommon/TurbulenceNativeMenu.h
+@@ -0,0 +1,183 @@
++#pragma once
++#include <atomic>
++#include <cstring>
++#include <cstdlib>
++#include "Common/Swap.h"
++
++namespace TurbulenceNativeMenu {
++inline std::atomic<bool> host_ui_available{false};
++inline bool IsAvailable() {
++  static const bool test=std::getenv("TURBULENCE_NATIVE_MENU_TEST")!=nullptr;
++  return host_ui_available.load(std::memory_order_relaxed)||test;
++}
++inline std::atomic<bool> options_visible{false};
++constexpr unsigned HookAddresses[]={0x804f3d38,0x804f41f8,0x8050edb8,0x8050f8bc,0x80511f1c,0x805135b0,0x80511824,0x80585aa4,0x80511790,0x805134a4,0x804f43b8};
++inline bool Handles(unsigned address) {
++  for(auto pc:HookAddresses) if(pc==address) return true;
++  return false;
++}
++inline bool HandlesRange(unsigned start,unsigned end) {
++  for(auto pc:HookAddresses) if(pc>=start && pc<end) return true;
++  return false;
++}
++inline std::atomic<bool> request_settings{false};
++inline std::atomic<bool> settings_page{false};
++inline std::atomic<bool> close_settings{false};
++inline std::atomic<bool> art_changed{false};
++inline bool page_notified=false;
++inline std::atomic<unsigned> settings_selection{0};
++// These addresses identify GXEE8P's original front-end definitions. The
++// constructor copies each 8-byte item into its own job pool; a temporary
++// stack list adds one item without overwriting adjacent game definitions.
++template<class CPU, class Memory>
++bool BeforeDispatch(CPU& cpu, Memory& memory, unsigned pc) {
++  if(!IsAvailable()) return false;
++  static unsigned saved_stack=0, return_pc=0;
++  static unsigned moved_item=0,moved_work=0;
++  static u8 saved_selection=0;
++  const auto ptr=[&](unsigned a,unsigned n){return memory.GetPointerForRange(a,n);};
++  if(saved_stack && pc==return_pc) {
++    cpu.gpr[1]=saved_stack; saved_stack=0; return_pc=0;
++    const auto* kind=ptr(cpu.gpr[31]+0x39,1);
++    cpu.gpr[0]=kind?*kind:0;
++    cpu.pc=pc+4;
++    return true;
++  }
++  if(pc==0x804f3d38 && cpu.gpr[4]==0x805edbf4 && cpu.gpr[5]==7) {
++    const auto* source=ptr(0x805edbf4,56);
++    if(!source || Common::swap32(source)!=0x80534a84 || cpu.gpr[1]<0x80000100) return false;
++    auto* list=ptr(cpu.gpr[1]-0x80+0x30,64);
++    auto* count=ptr(0x805ce502,1);
++    if(!list || !count || (*count!=4 && *count!=5)) return false;
++    std::memcpy(list,source,48);
++    std::memcpy(list+48,source+40,8); // native pill, new row index
++    list[55]=4;
++    std::memcpy(list+56,source+48,8); // original footer after the new row
++    saved_stack=cpu.gpr[1]; return_pc=cpu.lr;
++    cpu.gpr[1]-=0x80; cpu.gpr[4]=cpu.gpr[1]+0x30; cpu.gpr[5]=8;
++    *count=5;
++    // Consume the original stwu here so argument changes take effect before
++    // resuming the guest, including native backends with cached registers.
++    const unsigned caller_stack=cpu.gpr[1];
++    cpu.gpr[1]-=0x70;
++    auto* frame=ptr(cpu.gpr[1],4);
++    if(frame) {const unsigned be=Common::swap32(caller_stack);std::memcpy(frame,&be,4);}
++    cpu.pc=pc+4;
++    return true;
++  }
++  if(pc==0x8050edb8) {
++    const auto* current=ptr(0x8021c314,4);
++    const unsigned task_address=current?Common::swap32(current):0;
++    const auto* task=ptr(task_address,0x15);
++    const unsigned work=task?Common::swap32(task+0x10):0;
++    const auto* kind=ptr(work+0x39,1);
++    const bool visible=task && kind && *kind==2 && (task[0x14]==14 || task[0x14]==15);
++    options_visible=visible;
++    if(settings_page.load() && task && kind) {
++      if(task[0x14]==15 && *kind==2) {
++        auto* selection=ptr(work+0xd,1);if(selection) *selection=4;
++        settings_page=false;art_changed=true;page_notified=false;
++      }
++    }
++
++  }
++  if(pc==0x805134a4 && options_visible.load()) {
++    auto* item=ptr(cpu.gpr[3],0x96);
++    if(item && item[0x37]==4) {
++      const auto* pool_ptr=ptr(0x80682ef8,4);
++      const unsigned pool=pool_ptr?Common::swap32(pool_ptr):0;
++      const auto* work_ptr=ptr(pool+0x6020,4);
++      moved_work=work_ptr?Common::swap32(work_ptr):0;
++      auto* selection=ptr(moved_work+0xd,1);
++      if(selection) {
++        saved_selection=*selection;
++        // Evaluate the fourth authored pill's animation with the new row's
++        // focus state, then restore the real cursor before the next job.
++        *selection=saved_selection==4?3:(saved_selection==3?4:saved_selection);
++      }
++      item[0x37]=3;
++      moved_item=cpu.gpr[3];
++    }
++  }
++  // Apply the extra row offset after the native animation matrices have
++  // been combined, so the highlight and lettering move by the same amount.
++  if(pc==0x804f43b8 && options_visible.load()) {
++    const auto* job=ptr(cpu.gpr[25],0x62);
++    const auto* pool_ptr=ptr(0x80682ef8,4);
++    const unsigned pool=pool_ptr?Common::swap32(pool_ptr):0;
++    const auto* work_ptr=ptr(pool+0x6020,4);
++    const unsigned work=work_ptr?Common::swap32(work_ptr):0;
++    const auto* selection=ptr(work+0xd,1);
++    const bool extra_highlight=job && Common::swap32(job+0x30)==0x80512b24 &&
++                              job[0x4e]==4 && selection && *selection==4;
++    if((!moved_item || cpu.gpr[25]!=moved_item) && !extra_highlight) return false;
++    auto* y_ptr=ptr(cpu.gpr[1]+0x11c,4);
++    if(y_ptr) {
++      unsigned bits=Common::swap32(y_ptr);float y;
++      std::memcpy(&y,&bits,4);y+=38.f;std::memcpy(&bits,&y,4);
++      bits=Common::swap32(bits);std::memcpy(y_ptr,&bits,4);
++    }
++  }
++  if(pc==0x805135b0 && moved_item) {
++    auto* item=ptr(moved_item,0x38);
++    if(item) {item[0x37]=4;}
++    auto* selection=ptr(moved_work+0xd,1);
++    if(selection) *selection=saved_selection;
++    moved_item=0;moved_work=0;
++  }
++  if(pc==0x80511790 && options_visible.load()) {
++    const auto* selection=ptr(cpu.gpr[31]+0xd,1);
++    if(selection && *selection==4) {
++      auto* help=ptr(0x805eda20,4);
++      if(help) std::memset(help,0xff,4);
++    }
++  }
++  if(pc==0x804f41f8 && cpu.lr==0x80512c8c && options_visible.load()) {
++    auto* item=ptr(cpu.gpr[3],0x64);
++    const auto* current=ptr(0x80682ef8,4);
++    const unsigned pool=current?Common::swap32(current):0;
++    const auto* work=ptr(pool+0x6020,4);
++    const unsigned address=work?Common::swap32(work):0;
++    const auto* selection=ptr(address+0xd,1);
++    if(item && selection && item[0x4e]==4 && *selection==4) item[0x61]=3;
++  }
++  if(pc==0x80511f1c) {
++    auto* selection=ptr(cpu.gpr[3]+0xd,1);
++    if(selection && *selection==4 && options_visible.load()) {
++      // Reuse the game's Language Setting frame group. Its input handler
++      // is intercepted below so the real language preference stays intact.
++      settings_page=true;art_changed=true;page_notified=false;
++      *selection=2;
++    }
++  }
++  if(pc==0x80511824 && cpu.gpr[3]==0x80585aa4 && settings_page.load()) {
++    const auto* current=ptr(0x8021c314,4);
++    const unsigned task=current?Common::swap32(current):0;
++    const auto* parent=ptr(task,0x18);
++    if(parent) {
++      const unsigned work=Common::swap32(parent+0x10);
++      auto* selection=ptr(work+0xd,1);
++      if(selection) *selection=4;
++    }
++  }
++  if(pc==0x80585aa4 && settings_page.load()) {
++    const auto* current=ptr(0x8021c314,4);
++    const unsigned address=current?Common::swap32(current):0;
++    auto* task=ptr(address,0x18);
++    const unsigned work_address=task?Common::swap32(task+0x10):0;
++    auto* work=ptr(work_address,9);
++    if(task && work && task[0x14]==4) {
++      work[5]=static_cast<u8>(settings_selection.load()%6);
++      if(!page_notified) {request_settings=true;page_notified=true;}
++      if(close_settings.exchange(false)) {
++        work[4]=3;task[0x14]=6; // the child's ordinary Back animation/cleanup
++      }
++      // Preserve the real language preference: this page owns host settings,
++      // while the original task still animates and cleans up its frame group.
++      cpu.pc=cpu.lr;
++      return true;
++    }
++  }
++  return false;
++}
++}
 diff --git a/Source/Core/VideoCommon/TurbulenceTriggerCaption.h b/Source/Core/VideoCommon/TurbulenceTriggerCaption.h
 new file mode 100644
-index 0000000..0691896
+index 0000000..50511c8
 --- /dev/null
 +++ b/Source/Core/VideoCommon/TurbulenceTriggerCaption.h
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,94 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +#pragma once
 +#include "VideoCommon/TurbulencePromptTextures.h"
@@ -3953,6 +4824,22 @@ index 0000000..0691896
 +#include <cstring>
 +namespace TurbulencePromptTextures::Detail
 +{
++// Replace the complete sampled cell, including transparent pixels at its rim.
++// A 64px original stick also supplies the smaller 48px shake animation cell.
++inline void ApplyArtwork(std::span<u8> rgba, u32 width, u32 height, const CellCopy& cell,
++                         std::span<const u8> artwork, u32 source_width, u32 source_height)
++{
++  if (!source_width || !source_height || cell.x > width || cell.y > height ||
++      cell.width > width - cell.x || cell.height > height - cell.y ||
++      rgba.size() < size_t(width) * height * 4 ||
++      artwork.size() < size_t(source_width) * source_height * 4)
++    return;
++  for (u32 y = 0; y < cell.height; ++y)
++    for (u32 x = 0; x < cell.width; ++x)
++      std::memcpy(&rgba[(size_t(cell.y + y) * width + cell.x + x) * 4],
++                  &artwork[(size_t(y * source_height / cell.height) * source_width +
++                            x * source_width / cell.width) * 4], 4);
++}
 +inline std::string RecipePrefix(std::string base_name, const std::string& texture_hash)
 +{
 +  // The game can bind the same HUD atlas with mipmaps enabled or disabled.
@@ -3985,20 +4872,19 @@ index 0000000..0691896
 +    p[0] = p[1] = p[2] = value;
 +    p[3] = 255;
 +  };
++  // Keep the original PS2 L/R glyph, keycap, shading and transparency.
++  // Only its "1" changes to "2" to match Turbulence's analog-trigger binding.
 +  for (u32 y = 17; y < 50; ++y)
-+    for (u32 x = 8; x < 56; ++x)
++    for (u32 x = 35; x < 56; ++x)
 +      pixel(x, y, 0);
 +  constexpr u32 scale = 3;
-+  for (u32 character = 0; character < 2; ++character)
-+  {
-+    const auto glyph = TriggerGlyph(label[character]);
-+    for (u32 y = 0; y < glyph.size(); ++y)
-+      for (u32 x = 0; x < 5; ++x)
-+        if (glyph[y] & (1u << (4 - x)))
-+          for (u32 sy = 0; sy < scale; ++sy)
-+            for (u32 sx = 0; sx < scale; ++sx)
-+              pixel(15 + character * 18 + x * scale + sx, 23 + y * scale + sy, 224);
-+  }
++  const auto glyph = TriggerGlyph(label[1]);
++  for (u32 y = 0; y < glyph.size(); ++y)
++    for (u32 x = 0; x < 5; ++x)
++      if (glyph[y] & (1u << (4 - x)))
++        for (u32 sy = 0; sy < scale; ++sy)
++          for (u32 sx = 0; sx < scale; ++sx)
++            pixel(36 + x * scale + sx, 23 + y * scale + sy, 224);
 +}
 +
 +// Read every source cell from the immutable decoded atlas: source cells may
@@ -4027,10 +4913,10 @@ index 0000000..0691896
 +}  // namespace TurbulencePromptTextures::Detail
 diff --git a/Source/Core/VideoCommon/TurbulenceViewport.h b/Source/Core/VideoCommon/TurbulenceViewport.h
 new file mode 100644
-index 0000000..d6e84c0
+index 0000000..6976675
 --- /dev/null
 +++ b/Source/Core/VideoCommon/TurbulenceViewport.h
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,112 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +#pragma once
 +
@@ -4066,6 +4952,52 @@ index 0000000..d6e84c0
 +  constexpr float edge = 0.05f;
 +  return vertices == 4 && left <= -1.0f + edge && right >= 1.0f - edge &&
 +         top <= -1.0f + edge && bottom >= 1.0f - edge;
++}
++
++// Menus build their solid background from several full-width horizontal
++// panels, rather than one full-screen quad. Textured foreground is excluded.
++inline bool IsFullWidthPanel(float left, float right, std::uint32_t vertices, bool textured)
++{
++  return !textured && vertices == 4 && std::abs(left + 1.0f) < 0.005f &&
++         std::abs(right - 1.0f) < 0.005f;
++}
++
++inline float ExtendSilverLeft(float x, float width_scale, bool stretched)
++{
++  if (!stretched && width_scale > 0.0f && width_scale < 1.0f &&
++      std::abs(x + 1.0f) < 0.005f)
++    return -1.0f / width_scale;
++  return x;
++}
++
++inline bool IsMenuScanlineQuad(float left, float right, float top, float bottom,
++                               std::uint32_t vertices)
++{
++  return vertices == 4 && std::abs(left + 1.0f) < .005f &&
++         std::abs(right) < .005f && std::abs(bottom - top - 128.0f / 240.0f) < .005f;
++}
++
++inline bool NeedsMenuBarPadding(float edge, float width_scale, bool right)
++{
++  if (!(width_scale > 0.0f && width_scale < 1.0f) || !std::isfinite(edge))
++    return false;
++  // Only outer endpoints, never an internal join between the bar's pieces.
++  return right ? edge >= .995f && edge * width_scale < .999f :
++                 edge <= -.995f && edge * width_scale > -.999f;
++}
++
++// Move horizontally in projected space without disturbing projected Y.
++inline bool SetClipX(float* p, const float* m, const float* raw, float target)
++{
++  const float a = raw[0]*m[0], b = raw[0]*m[1];
++  const float c = raw[2]*m[4], d = raw[2]*m[5];
++  const float determinant = a*d-b*c;
++  if (!std::isfinite(determinant) || std::abs(determinant) < 1e-12f)
++    return false;
++  const float current = raw[0]*(p[0]*m[0]+p[1]*m[1]+p[2]*m[2]+m[3])+raw[1];
++  p[0] += (target-current)*d/determinant;
++  p[1] -= (target-current)*c/determinant;
++  return true;
 +}
 +
 +// The game's perspective wrapper takes aspect in f1 and vertical FOV in
