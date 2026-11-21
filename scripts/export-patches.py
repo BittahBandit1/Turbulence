@@ -3,7 +3,7 @@
 from pathlib import Path
 import subprocess
 ROOT=Path(__file__).resolve().parents[1]
-REPOS=[('lib/ModernGekko','moderngekko'),('lib/ModernGekko/vendor/dolphin','dolphin'),
+REPOS=[('lib/DolRecomp','dolrecomp-host'),('lib/ModernGekko','moderngekko'),('lib/ModernGekko/vendor/dolphin','dolphin'),
        ('lib/ModernGekko/vendor/dolphin/DolRecomp','dolrecomp'),
        ('lib/ModernGekko/vendor/dolphin/Externals/watcher/watcher','watcher-mobile'),
        ('lib/ModernGekko/vendor/dolphin/Externals/libspng/libspng','libspng-windows')]

@@ -15,6 +15,7 @@
 #include "InputCommon/ControllerInterface/ControllerInterface.h"
 #include "VideoCommon/PerformanceMetrics.h"
 #include "VideoCommon/Present.h"
+#include "VideoCommon/VideoBackendBase.h"
 #include "VideoCommon/VideoConfig.h"
 #include "VideoCommon/VideoEvents.h"
 #include "imgui.h"
@@ -31,6 +32,9 @@
 
 // Defined in Dolphin's VideoCommon (HUD layout).
 extern bool g_turbulence_hud_stretched;
+// Defined by the runtime (dolphin_runtime.cpp): asks the desktop platform to
+// enter or leave fullscreen on its own window thread.
+void Host_RequestFullscreen(bool fullscreen);
 
 namespace turbulence {
 namespace {
@@ -93,12 +97,22 @@ constexpr std::array<Aspect, 6> aspects = {{{"Match window / display",AspectMode
 // Button prompt preference, as saved in Turbulence.ini and shown in the menu.
 constexpr const char* kPromptNames[] = {"auto", "gamecube", "xbox", "playstation"};
 constexpr const char* kPromptLabels[] = {"Automatic", "GameCube", "Xbox", "PlayStation"};
+// Graphics API row: Dolphin backend names (config.ini [Video] backend) and labels.
+constexpr const char* kApiBackends[] = {"Vulkan", "D3D"};
+constexpr const char* kApiLabels[] = {"Vulkan", "Direct3D 11"};
 // Dolphin post-processing shader shipped in Sys/Shaders/FXAA.glsl.
 constexpr const char* kFXAAShader = "FXAA";
 
-enum class Row { Scale, Aspect, HudLayout, FXAA, VSync, MetalHUD, PerfOverlay, Prompts, MenuButton, Exit };
+enum class Row { Scale, Aspect, Fullscreen, GraphicsApi, HudLayout, FXAA, VSync, MetalHUD, PerfOverlay, Prompts, MenuButton, Exit };
 const std::vector<Row>& Rows() {
-  static const std::vector<Row> rows = {Row::Scale, Row::Aspect, Row::HudLayout, Row::FXAA,
+  static const std::vector<Row> rows = {Row::Scale, Row::Aspect,
+#if !defined(TURBULENCE_IOS) && !defined(TURBULENCE_ANDROID)
+    Row::Fullscreen,  // desktop only: mobile is always full screen
+#endif
+#if defined(_WIN32)
+    Row::GraphicsApi,  // Vulkan or Direct3D 11, applied at the next launch
+#endif
+    Row::HudLayout, Row::FXAA,
     Row::VSync,
 #ifdef __APPLE__
     Row::MetalHUD,
@@ -112,6 +126,8 @@ const char* RowLabel(Row row) {
   switch (row) {
   case Row::Scale: return "Resolution scale";
   case Row::Aspect: return "Aspect ratio";
+  case Row::Fullscreen: return "Fullscreen";
+  case Row::GraphicsApi: return "Graphics API";
   case Row::HudLayout: return "HUD and menus";
   case Row::FXAA: return "FXAA";
   case Row::VSync: return "V-Sync";
@@ -285,6 +301,11 @@ void DrawPerfOverlay(const FrameIntervals& intervals, int mode) {
   const ImVec4 fps_color = fps >= 59.0 ? ImVec4(0.45f, 0.95f, 0.45f, 1) : fps >= 50.0 ? p.title : p.danger;
   ImGui::TextColored(fps_color, "%.1f FPS", fps);
   ImGui::SameLine(); ImGui::TextColored(p.text_dim, "%.0f%% speed", speed * 100.0);
+  // The video backend actually in use (Vulkan, Direct3D 11, Metal...), to
+  // confirm a backend change took effect.
+  if (g_video_backend) {
+    ImGui::SameLine(); ImGui::TextColored(p.text_dim, "%s", g_video_backend->GetDisplayName().c_str());
+  }
   if (mode >= 2) {
     ImGui::TextColored(p.text, "Frame %.2f ms  (min %.2f / max %.2f)", avg, recent ? low : 0.0f, high);
     ImGui::TextColored(over ? p.title : p.text_dim, "VPS %.1f   hitches >25 ms: %d / %ds", vps, over, FrameIntervals::kSize / 60);
@@ -325,6 +346,9 @@ struct OptionsMenu::Impl {
   bool stretch_hud = false;
   bool fxaa = false;
   bool vsync = true;
+  bool fullscreen = false;
+  int api_choice = 0;       // saved for the next launch: 0 Vulkan, 1 Direct3D 11
+  std::string running_api;  // backend this session started with
   bool metal_hud = true;
   int perf_overlay = 0;  // 0 off, 1 FPS, 2 FPS + frame times
   FrameIntervals intervals;
@@ -367,6 +391,18 @@ struct OptionsMenu::Impl {
     stretch_hud = g_turbulence_hud_stretched;
     fxaa = Config::Get(Config::GFX_ENHANCE_POST_SHADER) == kFXAAShader;
     vsync = Config::Get(Config::GFX_VSYNC);
+    // Alt+Enter / Cmd+Return / the window menu can change it too.
+    fullscreen = Host_RendererIsFullscreen();
+    running_api = g_video_backend ? g_video_backend->GetConfigName() : "";
+    api_choice = running_api == kApiBackends[1] ? 1 : 0;
+    {  // A choice saved earlier this session wins over the running backend.
+      Common::IniFile frontend;
+      std::string saved;
+      if (frontend.Load((directory / "config.ini").string()) &&
+          frontend.GetOrCreateSection("Video")->Get("backend", &saved))
+        for (int i = 0; i < 2; ++i)
+          if (saved == kApiBackends[i]) api_choice = i;
+    }
     const int scale = Config::Get(Config::GFX_EFB_SCALE);
     scale_index = 0;
     for (int i=0; i<static_cast<int>(scales.size()); ++i)
@@ -444,6 +480,22 @@ struct OptionsMenu::Impl {
       ini.GetOrCreateSection("Hardware")->Set("VSync", vsync);
     });
   }
+  // The backend can't change while the game runs: save it for the launcher's
+  // next start (config.ini [Video] backend; --graphics still overrides it).
+  void ApplyGraphicsApi() {
+    Common::IniFile frontend;
+    const auto file = (directory / "config.ini").string();
+    frontend.Load(file);
+    frontend.GetOrCreateSection("Video")->Set("backend", std::string(kApiBackends[api_choice]));
+    save_error = frontend.Save(file) ? "" : "Could not save the graphics API.";
+  }
+  bool RestartPending() const { return !running_api.empty() && running_api != kApiBackends[api_choice]; }
+  void ApplyFullscreen() {
+    Host_RequestFullscreen(fullscreen);
+    save_error = SaveTurbulenceIni(directory, [&](Common::IniFile& ini) {
+      ini.GetOrCreateSection("Video")->Set("Fullscreen", fullscreen);
+    }) ? "" : "Could not save the fullscreen setting; change applies this session.";
+  }
   void ApplyMetalHUD() {
     SetMetalHUDVisible(render_view, metal_hud);
     save_error = SaveTurbulenceIni(directory, [&](Common::IniFile& ini) {
@@ -479,6 +531,8 @@ struct OptionsMenu::Impl {
       aspect_index = (aspect_index + delta + count) % count;
       ApplyAspect(); break;
     }
+    case Row::Fullscreen: fullscreen = !fullscreen; ApplyFullscreen(); break;
+    case Row::GraphicsApi: api_choice = 1 - api_choice; ApplyGraphicsApi(); break;
     case Row::HudLayout: stretch_hud = !stretch_hud; ApplyHudLayout(); break;
     case Row::FXAA: fxaa = !fxaa; ApplyFXAA(); break;
     case Row::VSync: vsync = !vsync; ApplyVSync(); break;
@@ -509,7 +563,7 @@ struct OptionsMenu::Impl {
     switch (CurrentRow()) {
     case Row::Exit: confirm_exit = true; exit_choice = 0; break;
     case Row::MenuButton: StartCapture(); break;
-    case Row::HudLayout: case Row::FXAA: case Row::VSync: case Row::MetalHUD: case Row::PerfOverlay: case Row::Prompts: Step(1); break;
+    case Row::Fullscreen: case Row::GraphicsApi: case Row::HudLayout: case Row::FXAA: case Row::VSync: case Row::MetalHUD: case Row::PerfOverlay: case Row::Prompts: Step(1); break;
     default: break;
     }
   }
@@ -526,6 +580,8 @@ struct OptionsMenu::Impl {
     switch (row) {
     case Row::Scale: return scales[scale_index].label;
     case Row::Aspect: return aspects[aspect_index].label;
+    case Row::Fullscreen: return fullscreen ? "On" : "Off";
+    case Row::GraphicsApi: return kApiLabels[api_choice];
     case Row::HudLayout: return stretch_hud ? "Stretched" : "Centered (4:3)";
     case Row::FXAA: return fxaa ? "On" : "Off";
     case Row::VSync: return vsync ? "On" : "Off";
@@ -739,6 +795,8 @@ struct OptionsMenu::Impl {
       ImGui::TextDisabled("%s", pad.c_str());
       ImGui::TextDisabled("%s", keys.c_str());
     }
+    if (RestartPending())
+      ImGui::TextColored(p.title, "Restart Turbulence to switch to %s.", kApiLabels[api_choice]);
     if (!save_error.empty()) ImGui::TextColored(p.danger, "%s", save_error.c_str());
     if (ImGui::Button("Done",ImVec2(-1,34))) Close();
     ImGui::End();
@@ -791,6 +849,16 @@ int LoadPerfOverlayPreference(const std::filesystem::path& directory) {
   ini.GetOrCreateSection("Video")->Get("FPSCounter", &mode, 0);
   if (const char* forced = std::getenv("TURBULENCE_FPS_COUNTER"); forced && *forced) mode = std::atoi(forced);
   return std::clamp(mode, 0, 2);
+}
+
+int LoadFullscreenPreference(const std::filesystem::path& directory) {
+  Common::IniFile ini;
+  ini.Load(TurbulenceIni(directory));
+  const auto* section = ini.GetSection("Video");
+  bool enabled = false;
+  if (!section || !section->Exists("Fullscreen")) return -1;
+  section->Get("Fullscreen", &enabled, false);
+  return enabled ? 1 : 0;
 }
 
 bool LoadMetalHUDPreference(const std::filesystem::path& directory) {

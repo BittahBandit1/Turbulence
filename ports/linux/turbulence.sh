@@ -4,6 +4,10 @@
 DATA="${XDG_DATA_HOME:-$HOME/.local/share}/turbulence"
 GAME="${TURBULENCE_GAME:-$HOME/Turbulence/game}"
 mkdir -p "$DATA/Config"
+# Handheld input daemons (InputPlumber on ArmadaOS/ChimeraOS/Bazzite, Steam) expose
+# the built-in pad as a Valve "Steam Virtual Gamepad" (28de:11ff). SDL3 hides that
+# device unless this is set, so the game would see no controller at all.
+export SDL_GAMECONTROLLER_ALLOW_STEAM_VIRTUAL_GAMEPAD="${SDL_GAMECONTROLLER_ALLOW_STEAM_VIRTUAL_GAMEPAD:-1}"
 [ -f "$DATA/Config/GCPadNew.ini" ] || cp /app/share/turbulence/GCPadNew.ini "$DATA/Config/"
 if [ ! -f "$GAME/sys/main.dol" ]; then
   echo "Turbulence: no extracted game at $GAME (expected $GAME/sys/main.dol)." >&2

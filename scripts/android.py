@@ -17,7 +17,7 @@ def main():
  parser.add_argument('--sdk',type=Path,default=Path(os.environ.get('ANDROID_HOME',ROOT/'build/android-sdk')))
  parser.add_argument('--jobs',type=int,default=6)
  parser.add_argument('--package-only',action='store_true')
- parser.add_argument('--c-backend',action='store_true',help='use the C backend for main.dol instead of LLVM (the REL is always C)')
+ parser.add_argument('--c-backend',action='store_true',help='use the C backend for main.dol instead of LLVM')
  parser.add_argument('--llvm',action='store_true',help=argparse.SUPPRESS)  # now the default
  args=parser.parse_args()
  sdk=args.sdk.resolve();build=ROOT/'build/ports/android-arm64';tools=sdk/'build-tools/35.0.0';ndk=sdk/'ndk/27.3.13750724'

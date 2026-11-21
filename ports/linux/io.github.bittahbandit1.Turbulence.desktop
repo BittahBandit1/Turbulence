@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Turbulence
+Comment=Sonic Riders (GameCube), recompiled for PC
+Exec=turbulence
+Icon=io.github.bittahbandit1.Turbulence
+Terminal=false
+Categories=Game;ArcadeGame;
+StartupNotify=true

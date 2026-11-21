@@ -18,3 +18,5 @@ apply lib/ModernGekko/vendor/dolphin/DolRecomp dolrecomp
 
 apply lib/ModernGekko/vendor/dolphin/Externals/watcher/watcher watcher-mobile
 apply lib/ModernGekko/vendor/dolphin/Externals/libspng/libspng libspng-windows
+
+apply lib/DolRecomp dolrecomp-host

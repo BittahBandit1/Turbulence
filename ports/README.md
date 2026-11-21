@@ -24,7 +24,14 @@ Android requires JDK, SDK platform/build tools 35, and NDK 27.3.13750724:
 python3 scripts/android.py --sdk "$ANDROID_HOME"
 ```
 
-main.dol is built with DolRecomp's LLVM backend by default (the REL stays C);
+Android groups LLVM output at guest-function boundaries (up to 4096
+instructions) to keep hot loops together and reduce dispatch/state-transfer
+costs. These exact-semantics objects use a separate
+`build/llvm-android-functions-v2-<compiler-hash>` cache from older Android
+output. A cache is reusable only after generation completes successfully.
+
+main.dol is built with DolRecomp's LLVM backend by default. The supplied REL
+output may use C or LLVM objects generated for the same target platform;
 pass `--c-backend` to either script for the older C output. LLVM output needs
 DolRecomp built with LLVM 19/20 in lib/DolRecomp/build-llvm.
 
@@ -90,3 +97,8 @@ tests/mobile_touch_test.swift, and tests/mobile_build_test.py. The importer
 checks run with synthetic images and do not need a game disc. Physical-device
 playback and thermal/frame-pacing behavior must be checked separately from
 successful cross-compilation and package validation.
+
+The iOS Metal HUD includes the device's live thermal state, including Nominal
+while cool. Its metric list is configured before the first Metal device is
+created, and the thermal row is retained when toggling the HUD. This uses the
+system HUD's thermal metric on supported OS versions.

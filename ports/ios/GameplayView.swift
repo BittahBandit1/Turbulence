@@ -18,6 +18,7 @@ final class GameSurface: UIView {
         metal.drawableSize = CGSize(width: bounds.width * scale, height: bounds.height * scale)
         if started { TurbulenceResize() }
         guard !started, window != nil, bounds.width > bounds.height, bounds.height > 0 else { return }
+        TurbulencePrepareMetalHUD(Unmanaged.passUnretained(metal).toOpaque())
         guard MTLCreateSystemDefaultDevice() != nil else { return }
         started = true
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]

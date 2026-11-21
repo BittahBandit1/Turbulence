@@ -63,3 +63,13 @@ modules:
       - type: dir
         path: @REL@
         dest: rel
+  - name: desktop-entry
+    buildsystem: simple
+    build-commands:
+      - install -Dm644 io.github.bittahbandit1.Turbulence.desktop /app/share/applications/io.github.bittahbandit1.Turbulence.desktop
+      - install -Dm644 io.github.bittahbandit1.Turbulence.svg /app/share/icons/hicolor/scalable/apps/io.github.bittahbandit1.Turbulence.svg
+    sources:
+      - type: file
+        path: @ROOT@/ports/linux/io.github.bittahbandit1.Turbulence.desktop
+      - type: file
+        path: @ROOT@/ports/linux/io.github.bittahbandit1.Turbulence.svg

@@ -11,6 +11,8 @@ int TurbulenceMenuOpen(void);
 void TurbulenceMenuButtons(uint32_t mask);
 void TurbulenceMenuPointer(double x, double y, int down, double scroll);
 void TurbulenceDisplayRate(double rate);
+// Configure the native Metal HUD, including thermal state, before device creation.
+void TurbulencePrepareMetalHUD(void* layer);
 void TurbulenceControllerStyle(int style);
 void TurbulenceResize(void);
 void TurbulencePause(int paused);

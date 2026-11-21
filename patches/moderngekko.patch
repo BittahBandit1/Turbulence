@@ -182,7 +182,7 @@ index 0adc855..8f7e888 100644
    bool fullscreen = false;
    bool allow_interpreter = false;
 diff --git a/src/runtime/dolphin_runtime.cpp b/src/runtime/dolphin_runtime.cpp
-index f9b5405..9f319ce 100644
+index f9b5405..3b036e2 100644
 --- a/src/runtime/dolphin_runtime.cpp
 +++ b/src/runtime/dolphin_runtime.cpp
 @@ -1,8 +1,14 @@
@@ -276,7 +276,7 @@ index f9b5405..9f319ce 100644
  void Host_Message(HostMessageID id) {
    if (id == HostMessageID::WMUserStop && s_platform)
      s_platform->Stop();
-@@ -134,7 +186,7 @@ void Host_JitCacheInvalidation() {}
+@@ -134,12 +186,17 @@ void Host_JitCacheInvalidation() {}
  void Host_JitProfileDataWiped() {}
  void Host_RequestRenderWindowSize(int, int) {}
  bool Host_RendererHasFocus() {
@@ -285,7 +285,17 @@ index f9b5405..9f319ce 100644
  }
  bool Host_RendererHasFullFocus() { return Host_RendererHasFocus(); }
  bool Host_RendererIsFullscreen() {
-@@ -193,6 +245,9 @@ void MarkAutomationCommand(RuntimeAutomationState& state, std::string command_na
+   return s_platform && s_platform->IsWindowFullscreen();
+ }
++// Turbulence: the options menu's Fullscreen row (render thread).
++void Host_RequestFullscreen(bool fullscreen) {
++  if (s_platform)
++    s_platform->RequestFullscreen(fullscreen);
++}
+ bool Host_TASInputHasFocus() { return false; }
+ void Host_YieldToUI() {}
+ void Host_TitleChanged() {}
+@@ -193,6 +250,9 @@ void MarkAutomationCommand(RuntimeAutomationState& state, std::string command_na
  
  void ClearAutomationPad(int port)
  {
@@ -295,7 +305,7 @@ index f9b5405..9f319ce 100644
    for (int control = static_cast<int>(ciface::Touch::FIRST_GC_CONTROL);
         control <= static_cast<int>(ciface::Touch::LAST_WII_CONTROL); ++control)
    {
-@@ -203,7 +258,24 @@ void ClearAutomationPad(int port)
+@@ -203,7 +263,24 @@ void ClearAutomationPad(int port)
  
  void ApplyAutomationPad(const automation::PadState& pad)
  {
@@ -320,7 +330,7 @@ index f9b5405..9f319ce 100644
    for (std::size_t index = 0; index < pad.controls.size(); ++index)
    {
      ciface::Touch::SetControlState(
-@@ -547,6 +619,9 @@ ModuleSource::AttachedDescriptor(const ModernGekkoModuleDesc *descriptor) {
+@@ -547,6 +624,9 @@ ModuleSource::AttachedDescriptor(const ModernGekkoModuleDesc *descriptor) {
  Runtime::Runtime(std::unique_ptr<Impl> impl) : m_impl(std::move(impl)) {}
  
  RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
@@ -330,7 +340,7 @@ index f9b5405..9f319ce 100644
    std::lock_guard lock(s_runtime_mutex);
    if (s_runtime_active)
      return {
-@@ -609,6 +684,10 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -609,13 +689,26 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
  
    if (!s_external_ui_common) {
      UICommon::SetUserDirectory(impl->config.user_directory.string());
@@ -341,7 +351,14 @@ index f9b5405..9f319ce 100644
      UICommon::Init();
      impl->ui_initialized = true;
    }
-@@ -616,6 +695,9 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+-  Config::SetBase(Config::MAIN_FULLSCREEN, impl->config.fullscreen);
++  bool fullscreen = impl->config.fullscreen;
++#if defined(TURBULENCE_OPTIONS_MENU) && !defined(TURBULENCE_IOS) && !defined(TURBULENCE_ANDROID)
++  // A launcher/command-line request wins; otherwise the menu's saved choice.
++  if (!fullscreen)
++    fullscreen = turbulence::LoadFullscreenPreference(impl->config.user_directory) == 1;
++#endif
++  Config::SetBase(Config::MAIN_FULLSCREEN, fullscreen);
  
    if (impl->config.headless)
      impl->platform = Platform::CreateHeadlessPlatform();
@@ -351,7 +368,7 @@ index f9b5405..9f319ce 100644
  #ifdef _WIN32
    else
      impl->platform = Platform::CreateWin32Platform();
-@@ -658,13 +740,80 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -658,13 +751,80 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
    impl->platform->SetTitle(impl->title);
  
    Config::SetBase(Config::MAIN_CPU_CORE, SelectCPUCore());
@@ -432,7 +449,7 @@ index f9b5405..9f319ce 100644
    Config::SetBase(Config::GFX_SHADER_CACHE, true);
    Config::SetBase(Config::GFX_SHADER_COMPILATION_MODE,
                    ShaderCompilationMode::AsynchronousUberShaders);
-@@ -687,9 +836,8 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -687,9 +847,8 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
    }
    Config::SetBase(Config::MAIN_AUDIO_BACKEND, impl->config.audio.backend);
    if (impl->config.audio.mute)
@@ -444,7 +461,7 @@ index f9b5405..9f319ce 100644
  
    auto &jit = Core::System::GetInstance().GetJitInterface();
    StaticRecompModuleSource recomp_source;
-@@ -700,14 +848,21 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -700,14 +859,21 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
      recomp_source = StaticRecompModuleSource::Attached(
          reinterpret_cast<const StaticRecompModuleDesc *>(
              impl->config.module.descriptor));
@@ -471,7 +488,7 @@ index f9b5405..9f319ce 100644
    s_platform = impl->platform.get();
    s_window_title = impl->title;
    s_show_fps_in_title = impl->config.show_fps_in_title;
-@@ -739,6 +894,7 @@ Runtime::~Runtime() {
+@@ -739,6 +905,7 @@ Runtime::~Runtime() {
    s_window_title.clear();
    s_show_fps_in_title = true;
    s_runtime_active = false;
@@ -479,7 +496,7 @@ index f9b5405..9f319ce 100644
  }
  
  void Runtime::StopAutomation() {
-@@ -790,6 +946,19 @@ RuntimeRunResult Runtime::Run() {
+@@ -790,6 +957,19 @@ RuntimeRunResult Runtime::Run() {
                           "Dolphin could not boot sys/main.dol"}};
    }
    m_impl->booted = true;
@@ -513,10 +530,10 @@ index 4b2345f..185bd55 100644
    return !m_impl->patches.empty() || !m_impl->hooks.empty() ||
           !m_impl->pending_returns.empty();
 diff --git a/tools/frontend_config.cpp b/tools/frontend_config.cpp
-index 03740d4..0724326 100644
+index 03740d4..0c8a8c1 100644
 --- a/tools/frontend_config.cpp
 +++ b/tools/frontend_config.cpp
-@@ -36,6 +36,8 @@ bool ValidNetplayAddress(std::string_view value) {
+@@ -36,10 +36,17 @@ bool ValidNetplayAddress(std::string_view value) {
  
  std::string NormalizeGraphicsBackend(std::string value) {
    const std::string lower = Lower(Trim(std::move(value)));
@@ -525,7 +542,16 @@ index 03740d4..0724326 100644
    if (lower == "vulkan")
      return "Vulkan";
    if (lower == "opengl" || lower == "ogl")
-@@ -85,6 +87,9 @@ const std::vector<ResolutionOption> &SupportedResolutions() {
+     return "OGL";
++#if defined(_WIN32)
++  // Turbulence: the options menu saves "D3D" (Direct3D 11) on Windows.
++  if (lower == "d3d" || lower == "d3d11" || lower == "dx11" || lower == "direct3d 11")
++    return "D3D";
++#endif
+   return {};
+ }
+ 
+@@ -85,6 +92,9 @@ const std::vector<ResolutionOption> &SupportedResolutions() {
  
  const std::vector<GraphicsBackendOption> &SupportedGraphicsBackends() {
    static const std::vector<GraphicsBackendOption> backends = {
@@ -535,12 +561,12 @@ index 03740d4..0724326 100644
        {"Vulkan", "Vulkan"},
        {"OpenGL", "OGL"},
    };
-@@ -124,7 +129,7 @@ ConfigResult LoadConfig(const fs::path &user_directory,
+@@ -124,7 +134,7 @@ ConfigResult LoadConfig(const fs::path &user_directory,
      else if (key == "backend" || key == "graphics_backend") {
        config.graphics_backend = NormalizeGraphicsBackend(raw_value);
        if (config.graphics_backend.empty())
 -        return {.error = "graphics backend must be Vulkan or OpenGL"};
-+        return {.error = "graphics backend must be Metal, Vulkan, or OpenGL"};
++        return {.error = "graphics backend must be Metal, Vulkan, OpenGL or (Windows) D3D"};
      }
      else if (key == "controller")
        config.controller = raw_value;

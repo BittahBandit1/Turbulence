@@ -1,0 +1,1207 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d65d556..96a6eb5 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -116,6 +116,7 @@ if(DOLRECOMP_ENABLE_LLVM)
+         src/backend/llvm/instructions.cpp
+         src/backend/llvm/runtime.cpp
+         src/backend/llvm/floating_point.cpp
++        src/backend/llvm/scalar_float.cpp
+         src/backend/llvm/fp_fixups.cpp
+         src/backend/llvm/fpr_state.cpp
+         src/backend/llvm/paired_single.cpp
+@@ -225,6 +226,9 @@ file(GLOB DOLRECOMP_CODEGEN_SOURCES CONFIGURE_DEPENDS
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/llvm/*.h"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/ir/*.c"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/ir/*.h")
++# Recompute the digest when an existing emitter changes as well as when
++# files are added/removed. CONFIGURE_DEPENDS on GLOB only tracks the file list.
++set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${DOLRECOMP_CODEGEN_SOURCES})
+ list(SORT DOLRECOMP_CODEGEN_SOURCES)
+ set(DOLRECOMP_CODEGEN_DIGEST "")
+ foreach(_codegen_source IN LISTS DOLRECOMP_CODEGEN_SOURCES)
+diff --git a/src/app/pipeline.c b/src/app/pipeline.c
+index 512d020..1ddfb1f 100644
+--- a/src/app/pipeline.c
++++ b/src/app/pipeline.c
+@@ -55,7 +55,7 @@ static u32 c_chunk_instructions(void) {
+ #define DOLLLVM_DEFAULT_CHUNK_INSTRUCTIONS 128u
+ #define DOLLLVM_DEFAULT_WORKER_BATCH 4u
+ // SSA regions, ABI v4 variants and ThinLTO summaries.
+-#define DOLLLVM_CACHE_VERSION "dolllvm-v23"
++#define DOLLLVM_CACHE_VERSION "dolllvm-v26"
+ 
+ typedef struct {
+     const PPCInst* insts;
+@@ -359,9 +359,15 @@ static int append_llvm_abi_edge(DolLLVMCallEdge** edges, u32* count,
+     return 1;
+ }
+ 
++typedef struct {
++    u32 start; /* first instruction index within the section */
++    u32 count;
++} LLVMPartition;
++
+ static int prepare_llvm_function_abis(
+     const LoadedCodeSection* sections, u32 section_count,
+-    u32 chunk_instructions, DolLLVMFunctionRange* ranges, u32 range_count) {
++    LLVMPartition* const* partitions, const u32* partition_counts,
++    DolLLVMFunctionRange* ranges, u32 range_count) {
+     DolLLVMCallEdge* edges = NULL;
+     u32 edge_count = 0;
+     u32 edge_capacity = 0;
+@@ -370,12 +376,9 @@ static int prepare_llvm_function_abis(
+         const LoadedCodeSection* section = &sections[s];
+         if (!section->data && section->size)
+             goto fail;
+-        u32 instruction_count = section->size / 4u;
+-        for (u32 start = 0; start < instruction_count;
+-             start += chunk_instructions) {
+-            u32 count = instruction_count - start;
+-            if (count > chunk_instructions)
+-                count = chunk_instructions;
++        for (u32 part = 0; part < partition_counts[s]; part++) {
++            const u32 start = partitions[s][part].start;
++            const u32 count = partitions[s][part].count;
+             PPCInst* instructions =
+                 (PPCInst*)malloc((size_t)count * sizeof(*instructions));
+             if (!instructions)
+@@ -477,6 +480,143 @@ static u32* collect_llvm_entry_points(const LoadedCodeSection* sections,
+     return points;
+ }
+ 
++/* DOLRECOMP_LLVM_FUNCTION_CHUNKS=1 aligns LLVM chunk boundaries with guest
++ * function starts instead of cutting every N instructions. Fixed-size chunks
++ * split hot functions (and the loops inside them) across native functions, so
++ * every iteration pays cross-chunk call/budget/state-sync costs. */
++static int llvm_function_chunks_enabled(void) {
++    const char* configured = getenv("DOLRECOMP_LLVM_FUNCTION_CHUNKS");
++    return configured && !strcmp(configured, "1");
++}
++
++static u32 llvm_function_chunk_max(u32 minimum) {
++    const char* configured = getenv("DOLRECOMP_LLVM_FUNCTION_CHUNK_MAX");
++    unsigned long value = 1024u;
++    if (configured && configured[0]) {
++        char* end = NULL;
++        errno = 0;
++        value = strtoul(configured, &end, 10);
++        if (errno || !end || *end || value < 128u || value > 4096u) {
++            fprintf(stderr,
++                    "warning: DOLRECOMP_LLVM_FUNCTION_CHUNK_MAX must be "
++                    "128..4096; using 1024\n");
++            value = 1024u;
++        }
++    }
++    return value < minimum ? minimum : (u32)value;
++}
++
++/* Function starts: program entry, symbols, bl targets and stwu r1 prologues. */
++static u32* collect_llvm_function_starts(const LoadedCodeSection* sections,
++                                         u32 section_count, u32 program_entry,
++                                         const DolRecompSymbolMap* symbols,
++                                         u32* result_count) {
++    size_t capacity = 1u + (symbols ? symbols->count : 0u);
++    for (u32 i = 0; i < section_count; i++)
++        capacity += sections[i].size / 4u * 2u;
++    u32* points = (u32*)malloc(capacity * sizeof(*points));
++    if (!points)
++        return NULL;
++    u32 count = 0;
++    if (llvm_code_address(sections, section_count, program_entry))
++        points[count++] = program_entry;
++    if (symbols) {
++        for (u32 i = 0; i < symbols->count; i++) {
++            u32 address = symbols->symbols[i].address;
++            if (llvm_code_address(sections, section_count, address))
++                points[count++] = address;
++        }
++    }
++    for (u32 section_index = 0; section_index < section_count;
++         section_index++) {
++        const LoadedCodeSection* section = &sections[section_index];
++        for (u32 offset = 0; section->data && offset + 4u <= section->size;
++             offset += 4u) {
++            u32 address = section->address + offset;
++            u32 raw = read_be32(section->data + offset);
++            if ((raw >> 16) == 0x9421u) /* stwu r1, -N(r1) */
++                points[count++] = address;
++            PPCInst inst = ppc_decode(raw, address);
++            if ((inst.op == PPC_OP_B || inst.op == PPC_OP_BC) && inst.lk &&
++                llvm_code_address(sections, section_count, inst.branch_target))
++                points[count++] = inst.branch_target;
++        }
++    }
++    qsort(points, count, sizeof(*points), compare_u32);
++    u32 unique = 0;
++    for (u32 i = 0; i < count; i++) {
++        if (!unique || points[i] != points[unique - 1u])
++            points[unique++] = points[i];
++    }
++    *result_count = unique;
++    return points;
++}
++
++/* Index of the first value >= address, or count. */
++static u32 lower_bound_u32(const u32* values, u32 count, u32 address) {
++    u32 lo = 0, hi = count;
++    while (lo < hi) {
++        u32 mid = lo + (hi - lo) / 2u;
++        if (values[mid] < address)
++            lo = mid + 1u;
++        else
++            hi = mid;
++    }
++    return lo;
++}
++
++static LLVMPartition* partition_llvm_section(const LoadedCodeSection* section,
++                                             u32 chunk_instructions,
++                                             int function_chunks, u32 maximum,
++                                             const u32* starts,
++                                             u32 start_count,
++                                             u32* result_count) {
++    const u32 n = section->size / 4u;
++    LLVMPartition* parts =
++        (LLVMPartition*)malloc(((size_t)n + 1u) * sizeof(*parts));
++    if (!parts)
++        return NULL;
++    u32 count = 0;
++    u32 s = 0;
++    while (s < n) {
++        u32 cut;
++        if (!function_chunks) {
++            cut = n - s > chunk_instructions ? s + chunk_instructions : n;
++        } else {
++            const u32 target = s + chunk_instructions;
++            const u32 limit = n - s > maximum ? s + maximum : n;
++            if (target >= n) {
++                cut = n;
++            } else {
++                u32 first = lower_bound_u32(starts, start_count,
++                                            section->address + target * 4u);
++                u32 first_index =
++                    first < start_count && starts[first] >= section->address
++                        ? (starts[first] - section->address) / 4u
++                        : n + 1u;
++                if (first_index < n && first_index <= limit) {
++                    cut = first_index;
++                } else if (limit == n) {
++                    cut = n;
++                } else {
++                    /* Nothing to cut at before the size cap: start the big
++                     * function at its own chunk boundary if it began after s. */
++                    cut = limit;
++                    if (first > 0u &&
++                        starts[first - 1u] > section->address + s * 4u)
++                        cut = (starts[first - 1u] - section->address) / 4u;
++                }
++            }
++        }
++        parts[count].start = s;
++        parts[count].count = cut - s;
++        count++;
++        s = cut;
++    }
++    *result_count = count;
++    return parts;
++}
++
+ static int llvm_cache_dir(char* path, size_t size) {
+     const char* configured = getenv("DOLRECOMP_LLVM_CACHE");
+     if (configured && (!configured[0] || strcmp(configured, "off") == 0))
+@@ -863,6 +1003,8 @@ static int emit_code_sections_llvm(const LoadedCodeSection* sections,
+     FunctionList funcs = {0};
+     SMCAnalysis smc = {0};
+     DolLLVMFunctionRange* ranges = NULL;
++    LLVMPartition* partitions[64] = {0};
++    u32 partition_counts[64] = {0};
+     u32 entry_point_count = 0;
+     u32* entry_points = collect_llvm_entry_points(
+         sections, section_count, entry_point, symbols, &entry_point_count);
+@@ -873,10 +1015,35 @@ static int emit_code_sections_llvm(const LoadedCodeSection* sections,
+     const u32 chunk_instructions = options->partition_instructions
+                                        ? options->partition_instructions
+                                        : llvm_chunk_instructions();
+-    for (u32 s = 0; s < section_count; s++)
+-        range_count +=
+-            ((sections[s].size / 4u) + chunk_instructions - 1u) /
+-            chunk_instructions;
++    const int function_chunks =
++        !options->partition_instructions && llvm_function_chunks_enabled();
++    u32 function_start_count = 0;
++    u32* function_starts =
++        function_chunks
++            ? collect_llvm_function_starts(sections, section_count,
++                                           entry_point, symbols,
++                                           &function_start_count)
++            : NULL;
++    if (function_chunks && !function_starts)
++        goto fail;
++    if (section_count > 64u) {
++        free(function_starts);
++        goto fail;
++    }
++    for (u32 s = 0; s < section_count; s++) {
++        partitions[s] = partition_llvm_section(
++            &sections[s], chunk_instructions, function_chunks,
++            llvm_function_chunk_max(chunk_instructions), function_starts,
++            function_start_count, &partition_counts[s]);
++        if (!partitions[s]) {
++            free(function_starts);
++            goto fail;
++        }
++        range_count += partition_counts[s];
++    }
++    free(function_starts);
++    if (function_chunks)
++        printf("  function-aligned LLVM chunks: %u ranges\n", range_count);
+     ranges = (DolLLVMFunctionRange*)calloc(range_count, sizeof(*ranges));
+     if (!ranges)
+         goto fail;
+@@ -885,18 +1052,16 @@ static int emit_code_sections_llvm(const LoadedCodeSection* sections,
+         cache_dir[0] = '\0';
+     u32 range_index = 0;
+     for (u32 s = 0; s < section_count; s++) {
+-        u32 instructions = sections[s].size / 4u;
+-        for (u32 start = 0; start < instructions; start += chunk_instructions) {
+-            u32 count = instructions - start;
+-            if (count > chunk_instructions)
+-                count = chunk_instructions;
++        for (u32 part = 0; part < partition_counts[s]; part++) {
++            const u32 start = partitions[s][part].start;
++            const u32 count = partitions[s][part].count;
+             ranges[range_index].start = sections[s].address + start * 4u;
+             ranges[range_index].end = ranges[range_index].start + count * 4u;
+             range_index++;
+         }
+     }
+-    if (!prepare_llvm_function_abis(sections, section_count,
+-                                    chunk_instructions, ranges, range_count))
++    if (!prepare_llvm_function_abis(sections, section_count, partitions,
++                                    partition_counts, ranges, range_count))
+         goto fail;
+     if (getenv("DOLRECOMP_LLVM_ABI_STATS")) {
+         for (u32 variant = 0; variant < profile_count; variant++) {
+@@ -941,8 +1106,7 @@ static int emit_code_sections_llvm(const LoadedCodeSection* sections,
+             }
+         }
+ 
+-        u32 chunk_total =
+-            (num_insts + chunk_instructions - 1u) / chunk_instructions;
++        u32 chunk_total = partition_counts[s];
+         u32 job_total = chunk_total * profile_count;
+         LLVMChunkJob* chunk_jobs =
+             (LLVMChunkJob*)calloc(job_total, sizeof(*chunk_jobs));
+@@ -950,12 +1114,10 @@ static int emit_code_sections_llvm(const LoadedCodeSection* sections,
+             free(insts);
+             goto fail;
+         }
+-        for (u32 start = 0; start < num_insts; start += chunk_instructions) {
+-            u32 chunk_count = num_insts - start;
+-            if (chunk_count > chunk_instructions)
+-                chunk_count = chunk_instructions;
++        for (u32 chunk_index = 0; chunk_index < chunk_total; chunk_index++) {
++            const u32 start = partitions[s][chunk_index].start;
++            const u32 chunk_count = partitions[s][chunk_index].count;
+             u32 function_address = section->address + start * 4u;
+-            u32 chunk_index = start / chunk_instructions;
+             u32 output_index = file_count / profile_count;
+             LLVMChunkJob* job = &chunk_jobs[chunk_index * profile_count];
+             for (u32 variant = 0; variant < profile_count; variant++) {
+@@ -1124,6 +1286,8 @@ static int emit_code_sections_llvm(const LoadedCodeSection* sections,
+     smc_analysis_free(&smc);
+     function_list_free(&funcs);
+     free(ranges);
++    for (u32 part = 0; part < 64u; part++)
++        free(partitions[part]);
+     free(entry_points);
+     printf("done!\n  header: %s\n  objects: %s (%u files)\n",
+            header_path, chunks_dir, file_count);
+@@ -1133,6 +1297,8 @@ fail:
+     smc_analysis_free(&smc);
+     function_list_free(&funcs);
+     free(ranges);
++    for (u32 part = 0; part < 64u; part++)
++        free(partitions[part]);
+     free(entry_points);
+     fclose(header);
+     fclose(manifest);
+diff --git a/src/backend/dispatch.c b/src/backend/dispatch.c
+index 14c7045..26dc213 100644
+--- a/src/backend/dispatch.c
++++ b/src/backend/dispatch.c
+@@ -8,6 +8,7 @@ typedef enum {
+ } DispatchLookupMode;
+ 
+ #define DISPATCH_PAGE_SHIFT 12u
++#define DISPATCH_FINE_PAGE_SHIFT 9u
+ #define DISPATCH_MAX_INDEX_PAGES 65536u
+ 
+ static DispatchLookupMode dispatch_lookup_mode(void) {
+@@ -166,9 +167,19 @@ static int emit_lookup_indexed(FILE* out, const FunctionList* funcs) {
+         }
+     }
+ 
+-    base = sorted[0].start & ~((1u << DISPATCH_PAGE_SHIFT) - 1u);
++    /* Small pages keep the per-lookup run walk to one or two runs even when
++     * chunks are variable-sized (function-aligned partitions make every chunk
++     * its own run); fall back to 4 KiB pages if the table would be too big. */
++    u32 page_shift = DISPATCH_FINE_PAGE_SHIFT;
+     limit = sorted[sorted_count - 1].end;
+-    page_count = ((limit - base) >> DISPATCH_PAGE_SHIFT) + 1u;
++    for (;;) {
++        base = sorted[0].start & ~((1u << page_shift) - 1u);
++        page_count = ((limit - base) >> page_shift) + 1u;
++        if (page_count <= DISPATCH_MAX_INDEX_PAGES ||
++            page_shift >= DISPATCH_PAGE_SHIFT)
++            break;
++        page_shift = DISPATCH_PAGE_SHIFT;
++    }
+     if (page_count > DISPATCH_MAX_INDEX_PAGES) {
+         free(sorted);
+         return 0;
+@@ -195,7 +206,7 @@ static int emit_lookup_indexed(FILE* out, const FunctionList* funcs) {
+     {
+         u32 run = 0;
+         for (u32 page = 0; page < page_count; page++) {
+-            u32 page_start = base + (page << DISPATCH_PAGE_SHIFT);
++            u32 page_start = base + (page << page_shift);
+             while (run < run_count &&
+                    sorted[run_first[run + 1u] - 1u].end <= page_start)
+                 run++;
+@@ -204,7 +215,7 @@ static int emit_lookup_indexed(FILE* out, const FunctionList* funcs) {
+     }
+ 
+     for (u32 page = 0; page < page_count; page++) {
+-        u32 page_end = base + ((page + 1u) << DISPATCH_PAGE_SHIFT);
++        u32 page_end = base + ((page + 1u) << page_shift);
+         u32 here = 0;
+         for (u32 run = page_first[page];
+              run < run_count && sorted[run_first[run]].start < page_end;
+@@ -214,11 +225,20 @@ static int emit_lookup_indexed(FILE* out, const FunctionList* funcs) {
+             max_per_page = here;
+     }
+ 
++    /* Coverage for tools that parse the dispatcher (the chassis module
++     * template's gen_module_tables.py), same form as the linear guards. */
++    for (u32 i = 0; i < sorted_count;) {
++        u32 j = i;
++        while (j + 1u < sorted_count && sorted[j + 1u].start == sorted[j].end)
++            j++;
++        fprintf(out, "/* coverage: address >= 0x%08Xu && address < 0x%08Xu */\n",
++                sorted[i].start, sorted[j].end);
++        i = j + 1u;
++    }
+     fprintf(out, "\n#define DOLRECOMP_LOOKUP_RUNS %uu\n", run_count);
+     fprintf(out, "#define DOLRECOMP_LOOKUP_BASE 0x%08Xu\n", base);
+     fprintf(out, "#define DOLRECOMP_LOOKUP_PAGES %uu\n", page_count);
+-    fprintf(out, "#define DOLRECOMP_LOOKUP_PAGE_SHIFT %uu\n",
+-            DISPATCH_PAGE_SHIFT);
++    fprintf(out, "#define DOLRECOMP_LOOKUP_PAGE_SHIFT %uu\n", page_shift);
+ 
+     fprintf(out,
+             "\nstatic const u32 dolrecomp_run_start[DOLRECOMP_LOOKUP_RUNS] "
+@@ -316,6 +336,19 @@ void emit_function_lookup(FILE* out, const FunctionList* funcs,
+     fprintf(out, "}\n");
+ }
+ 
++/* Unset DOLRECOMP_DISPATCH_LOOKUP: linear while the lookup is a handful of
++ * uniform runs (fixed-size chunks), indexed once it would be a long if-chain
++ * (variable-size, e.g. function-aligned, chunks: one run per chunk). */
++static int dispatch_use_indexed(const FunctionList* funcs) {
++    const char* configured = getenv("DOLRECOMP_DISPATCH_LOOKUP");
++    if (configured && configured[0])
++        return dispatch_lookup_mode() == DISPATCH_LOOKUP_INDEXED;
++    u32 runs = 0;
++    for (u32 first = 0; first < funcs->count; runs++)
++        first = uniform_run_end(funcs, first);
++    return runs > 8u;
++}
++
+ void emit_dispatch_helpers(FILE* out, const FunctionList* funcs, u32 entry_point) {
+     fprintf(out, "\n#define DOLRECOMP_ENTRY_POINT 0x%08Xu\n", entry_point);
+     fprintf(out, "\ntypedef void (*DolRecompFunction)(CPUState* ctx);\n");
+@@ -333,8 +366,7 @@ void emit_dispatch_helpers(FILE* out, const FunctionList* funcs, u32 entry_point
+     fprintf(out, "    return 0;\n");
+     fprintf(out, "}\n");
+     fprintf(out, "#endif\n");
+-    if (dispatch_lookup_mode() != DISPATCH_LOOKUP_INDEXED ||
+-        !emit_lookup_indexed(out, funcs))
++    if (!dispatch_use_indexed(funcs) || !emit_lookup_indexed(out, funcs))
+         emit_function_lookup(out, funcs, "");
+     fprintf(out, "\nstatic inline int dolrecomp_call_original(CPUState* ctx, u32 address) {\n");
+     fprintf(out, "    DolRecompFunction fn = dolrecomp_find_original(address);\n");
+diff --git a/src/backend/llvm/emitter.h b/src/backend/llvm/emitter.h
+index 9263c79..c5ce63a 100644
+--- a/src/backend/llvm/emitter.h
++++ b/src/backend/llvm/emitter.h
+@@ -162,6 +162,7 @@ private:
+   void emitLSWX(const DolIRInstruction &instruction);
+   llvm::Value *emitRuntimeBoundary(const DolIRInstruction &instruction);
+   void emitExactFloat(u64 descriptor);
++  void emitExactFloatSlow(u64 descriptor);
+   void emitExactPaired(u64 descriptor);
+   llvm::Value *emitPSQ(const DolIRInstruction &instruction);
+   llvm::Value *emitKnownPSQ(const DolIRInstruction &instruction, u32 type,
+diff --git a/src/backend/llvm/floating_point.cpp b/src/backend/llvm/floating_point.cpp
+index 5064636..52d03db 100644
+--- a/src/backend/llvm/floating_point.cpp
++++ b/src/backend/llvm/floating_point.cpp
+@@ -12,7 +12,7 @@ namespace dolllvm {
+ using namespace llvm;
+ 
+ 
+-void FunctionEmitter::emitExactFloat(u64 descriptor) {
++void FunctionEmitter::emitExactFloatSlow(u64 descriptor) {
+   auto op = static_cast<DolIRExactFloat>(descriptor & 0xFFu);
+   u32 d = (descriptor >> 8) & 0xFFu;
+   u32 a = (descriptor >> 16) & 0xFFu;
+diff --git a/src/backend/llvm/fp_fixups.cpp b/src/backend/llvm/fp_fixups.cpp
+index 4376667..b6a90eb 100644
+--- a/src/backend/llvm/fp_fixups.cpp
++++ b/src/backend/llvm/fp_fixups.cpp
+@@ -5,6 +5,7 @@
+ #include <llvm/IR/IRBuilder.h>
+ #include <llvm/IR/Intrinsics.h>
+ #include <llvm/IR/Module.h>
++#include <llvm/TargetParser/Triple.h>
+ 
+ #include "common/types.h"
+ 
+@@ -18,7 +19,10 @@ static void markColdFixup(Function *function) {
+   function->addFnAttr(Attribute::NoInline);
+   function->addFnAttr(Attribute::NoUnwind);
+   function->addFnAttr(Attribute::WillReturn);
+-  function->setSection(".text.unlikely." + function->getName().str());
++  // ELF section name; Mach-O (macOS/iOS) and COFF reject this form, and the
++  // Cold attribute already lets them place the function out of the hot path.
++  if (Triple(function->getParent()->getTargetTriple()).isOSBinFormatELF())
++    function->setSection(".text.unlikely." + function->getName().str());
+ }
+ 
+ Function *getPairNaNFixup(Module &module, Type *pairType) {
+diff --git a/src/backend/llvm/memory.cpp b/src/backend/llvm/memory.cpp
+index a3b90cf..168f3ef 100644
+--- a/src/backend/llvm/memory.cpp
++++ b/src/backend/llvm/memory.cpp
+@@ -9,9 +9,7 @@
+ #include <llvm/Support/Alignment.h>
+ 
+ namespace dolllvm {
+-
+ using namespace llvm;
+-
+ Value *FunctionEmitter::normalizeAddress(Value *address) {
+   return builder_.CreateAnd(address, builder_.getInt32(~0x40000000u));
+ }
+@@ -168,7 +166,7 @@ void FunctionEmitter::clearReservation(Value *address) {
+                                         state_[DOLIR_STATE_RESERVE_ADDR]);
+   Value *differentLine = builder_.CreateICmpNE(
+       builder_.CreateAnd(builder_.CreateXor(reserved, address),
+-                         builder_.getInt32(~31u)),
++                         builder_.getInt32(~(31u | 0x40000000u))),
+       builder_.getInt32(0));
+   builder_.CreateStore(builder_.CreateAnd(valid, differentLine),
+                        state_[DOLIR_STATE_RESERVE_VALID]);
+@@ -223,7 +221,9 @@ void FunctionEmitter::externalWrite(Value *address, Value *value, u32 width) {
+   builder_.CreateCall(
+       functionType, fn,
+       {ctx_, address,
+-       builder_.CreateZExtOrTrunc(value, Type::getInt64Ty(context_)),
++       builder_.CreateZExtOrTrunc(
++           builder_.CreateZExtOrTrunc(value, IntegerType::get(context_, width * 8)),
++           Type::getInt64Ty(context_)),
+        builder_.getInt8(width)});
+   Value *exception =
+       loadOffset(Type::getInt32Ty(context_), offsetof(CPUState, exception));
+@@ -252,7 +252,8 @@ void FunctionEmitter::emitGuestStore(const DolIRInstruction &instruction,
+     return;
+   }
+   materializeFPRF();
+-  clearReservation(address);
++  // External writes delegate side effects to the host, matching mem_write*.
++  // Clear reservations only after a RAM mapping succeeds.
+   Value *normalized = normalizeAddress(address);
+   BasicBlock *mem1Block = BasicBlock::Create(context_, "store_mem1", function_);
+   BasicBlock *checkMem2 =
+@@ -265,6 +266,7 @@ void FunctionEmitter::emitGuestStore(const DolIRInstruction &instruction,
+                         MDBuilder(context_).createBranchWeights(2000, 1));
+ 
+   builder_.SetInsertPoint(mem1Block);
++  clearReservation(address);
+   Value *mem1Offset =
+       builder_.CreateSub(normalized, builder_.getInt32(GC_RAM_BASE));
+   journal(mem1Offset, width);
+@@ -281,6 +283,7 @@ void FunctionEmitter::emitGuestStore(const DolIRInstruction &instruction,
+                         MDBuilder(context_).createBranchWeights(2000, 1));
+ 
+   builder_.SetInsertPoint(mem2Block);
++  clearReservation(address);
+   Value *mem2Offset =
+       builder_.CreateSub(normalized, builder_.getInt32(WII_MEM2_BASE));
+   Value *mem2Ptr =
+@@ -293,5 +296,4 @@ void FunctionEmitter::emitGuestStore(const DolIRInstruction &instruction,
+   builder_.CreateBr(join);
+   builder_.SetInsertPoint(join);
+ }
+-
+ } // namespace dolllvm
+diff --git a/src/backend/llvm/psq.cpp b/src/backend/llvm/psq.cpp
+index 61edb3d..0c763a3 100644
+--- a/src/backend/llvm/psq.cpp
++++ b/src/backend/llvm/psq.cpp
+@@ -53,42 +53,74 @@ Value *FunctionEmitter::emitPSQ(const DolIRInstruction &inst) {
+     bool incomingFPAvailable = fp_available_checked_;
+     Value *loadType = typeValue;
+     Value *unquantized = builder_.CreateICmpEQ(loadType, builder_.getInt32(0));
++    Value *quantized = builder_.CreateAnd(
++        builder_.CreateICmpUGE(loadType, builder_.getInt32(4)),
++        builder_.CreateICmpULE(loadType, builder_.getInt32(7)));
+     Value *enabled = psqEnabled(indexed);
+-    Value *aligned =
+-        builder_.CreateICmpEQ(builder_.CreateAnd(address, builder_.getInt32(3)),
+-                              builder_.getInt32(0));
+-    enabled = builder_.CreateAnd(enabled, aligned);
++    Value *aligned = builder_.CreateICmpEQ(
++        builder_.CreateAnd(address, builder_.getInt32(3)), builder_.getInt32(0));
++    Value *supported = builder_.CreateOr(unquantized, quantized);
++    Value *alignmentValid = builder_.CreateOr(quantized, aligned);
+ 
+-    BasicBlock *fast = BasicBlock::Create(context_, "psq_f32", function_);
++    BasicBlock *dispatch = BasicBlock::Create(context_, "psq_load_dispatch", function_);
+     BasicBlock *slow = BasicBlock::Create(context_, "psq_helper", function_);
+     BasicBlock *join = BasicBlock::Create(context_, "psq_join", function_);
+-    builder_.CreateCondBr(builder_.CreateAnd(unquantized, enabled), fast, slow);
+-
+-    builder_.SetInsertPoint(fast);
+-    Value *lane0Bits =
+-        emitGuestLoad(address, Type::getInt32Ty(context_), 4, false);
+-    Value *lane0 = extendPSQFloat(builder_, module_, lane0Bits);
+-    Value *lane0Single =
+-        builder_.CreateBitCast(lane0Bits, Type::getFloatTy(context_));
+-    Value *lane1 = ConstantFP::get(Type::getDoubleTy(context_), 1.0);
+-    Value *lane1Single = ConstantFP::get(Type::getFloatTy(context_), 1.0);
+-    if (!w) {
+-      Value *lane1Bits =
+-          emitGuestLoad(builder_.CreateAdd(address, builder_.getInt32(4)),
+-                        Type::getInt32Ty(context_), 4, false);
+-      lane1 = extendPSQFloat(builder_, module_, lane1Bits);
+-      lane1Single =
+-          builder_.CreateBitCast(lane1Bits, Type::getFloatTy(context_));
+-    }
+-    builder_.CreateStore(lane0, state_[DOLIR_STATE_FPR0 + reg]);
+-    builder_.CreateStore(lane1, state_[DOLIR_STATE_PS1_0 + reg]);
+-    Type *pairType = FixedVectorType::get(Type::getFloatTy(context_), 2);
+-    Value *pair = PoisonValue::get(pairType);
+-    pair = builder_.CreateInsertElement(pair, lane0Single, uint64_t{0});
+-    pair = builder_.CreateInsertElement(pair, lane1Single, 1u);
+-    builder_.CreateStore(pair, pair_f32_[reg]);
+-    builder_.CreateBr(join);
+-    BasicBlock *fastEnd = builder_.GetInsertBlock();
++    builder_.CreateCondBr(
++        builder_.CreateAnd(builder_.CreateAnd(supported, enabled), alignmentValid),
++        dispatch, slow, MDBuilder(context_).createBranchWeights(1000, 1));
++    builder_.SetInsertPoint(dispatch);
++    SwitchInst *typeSwitch = builder_.CreateSwitch(loadType, slow, 5);
++    SmallVector<BasicBlock *, 5> fastEnds;
++    auto emitLoads = [&](u32 type, u32 width, bool isSigned) {
++      // Match the direct quantized-store path: dispatch once for both lanes,
++      // keeping guest registers local instead of materializing/reloading the
++      // entire CPU state for an ordinary quantized RAM load.
++      fp_rep_ = incomingRepresentations;
++      fp_exact_single_ = incomingExactSingles;
++      fp_denormal_safe_ = incomingDenormalSafety;
++      fp_value_class_ = incomingValueClasses;
++      known_state_ = incomingKnownState;
++      fp_available_checked_ = incomingFPAvailable;
++      BasicBlock *block = BasicBlock::Create(context_, "psq_load_type", function_);
++      typeSwitch->addCase(builder_.getInt32(type), block);
++      builder_.SetInsertPoint(block);
++      auto loadLane = [&](Value *ea) {
++        Value *bits = emitGuestLoad(ea, IntegerType::get(context_, width * 8), width, false);
++        if (type == 0)
++          return std::pair<Value *, Value *>(
++              builder_.CreateBitCast(bits, Type::getFloatTy(context_)),
++              extendPSQFloat(builder_, module_, bits));
++        Value *single = dequantizePSQInteger(builder_, bits, scaleValue, isSigned);
++        return std::pair<Value *, Value *>(
++            single, builder_.CreateFPExt(single, Type::getDoubleTy(context_)));
++      };
++      auto lane0 = loadLane(address);
++      std::pair<Value *, Value *> lane1(
++          ConstantFP::get(Type::getFloatTy(context_), 1.0),
++          ConstantFP::get(Type::getDoubleTy(context_), 1.0));
++      if (!w)
++        lane1 = loadLane(builder_.CreateAdd(address, builder_.getInt32(width)));
++      Type *pairType = FixedVectorType::get(Type::getFloatTy(context_), 2);
++      Value *pair = PoisonValue::get(pairType);
++      pair = builder_.CreateInsertElement(pair, lane0.first, uint64_t{0});
++      pair = builder_.CreateInsertElement(pair, lane1.first, 1u);
++      builder_.CreateStore(pair, pair_f32_[reg]);
++      builder_.CreateStore(lane0.second, state_[DOLIR_STATE_FPR0 + reg]);
++      builder_.CreateStore(lane1.second, state_[DOLIR_STATE_PS1_0 + reg]);
++      builder_.CreateBr(join);
++      fastEnds.push_back(builder_.GetInsertBlock());
++    };
++    emitLoads(0, 4, false);
++    emitLoads(4, 1, false);
++    emitLoads(5, 2, false);
++    emitLoads(6, 1, true);
++    emitLoads(7, 2, true);
++    fp_rep_ = incomingRepresentations;
++    fp_exact_single_ = incomingExactSingles;
++    fp_denormal_safe_ = incomingDenormalSafety;
++    fp_value_class_ = incomingValueClasses;
++    known_state_ = incomingKnownState;
++    fp_available_checked_ = incomingFPAvailable;
+ 
+     builder_.SetInsertPoint(slow);
+     materialize(inst.guest_pc);
+@@ -108,8 +140,9 @@ Value *FunctionEmitter::emitPSQ(const DolIRInstruction &inst) {
+     builder_.CreateBr(join);
+ 
+     builder_.SetInsertPoint(join);
+-    PHINode *result = builder_.CreatePHI(Type::getInt1Ty(context_), 2);
+-    result->addIncoming(ConstantInt::getTrue(context_), fastEnd);
++    PHINode *result = builder_.CreatePHI(Type::getInt1Ty(context_), fastEnds.size() + 1);
++    for (BasicBlock *fastEnd : fastEnds)
++      result->addIncoming(ConstantInt::getTrue(context_), fastEnd);
+     result->addIncoming(success, resume);
+     fp_rep_ = incomingRepresentations;
+     fp_exact_single_ = incomingExactSingles;
+diff --git a/src/backend/llvm/psq_convert.cpp b/src/backend/llvm/psq_convert.cpp
+index 457af51..febb6eb 100644
+--- a/src/backend/llvm/psq_convert.cpp
++++ b/src/backend/llvm/psq_convert.cpp
+@@ -67,20 +67,31 @@ Value *dequantizePSQInteger(IRBuilder<> &builder, Value *value, Value *scale,
+ }
+ 
+ Value *truncatePSQFloat(IRBuilder<> &builder, Value *value) {
+-  Value *single = value;
+   if (!value->getType()->isFloatTy()) {
+-    single = builder.CreateConstrainedFPCast(
+-        Intrinsic::experimental_constrained_fptrunc, value,
+-        builder.getFloatTy(), nullptr, "psq.single", nullptr,
+-        RoundingMode::Dynamic, fp::ebIgnore);
++    // Hardware PSQ conversion is a bit extraction, not a host FP cast.
++    // This also avoids FP rounding-mode/NaN changes on the store fast path.
++    Value *bits = builder.CreateBitCast(value, builder.getInt64Ty());
++    Value *exponent = builder.CreateAnd(builder.CreateLShr(bits, 52),
++                                        builder.getInt64(0x7ff));
++    Value *regular = builder.CreateOr(
++        builder.CreateAnd(builder.CreateLShr(bits, 32), builder.getInt64(0xc0000000)),
++        builder.CreateAnd(builder.CreateLShr(bits, 29), builder.getInt64(0x3fffffff)));
++    Value *keep = builder.CreateOr(
++        builder.CreateICmpUGT(exponent, builder.getInt64(896)),
++        builder.CreateICmpEQ(builder.CreateAnd(bits, builder.getInt64(0x7fffffffffffffffULL)),
++                             builder.getInt64(0)));
++    Value *sign = builder.CreateAnd(builder.CreateLShr(bits, 32), builder.getInt64(0x80000000));
++    return builder.CreateTrunc(builder.CreateSelect(keep, regular, sign), builder.getInt32Ty());
+   }
+-  Value *bits = builder.CreateBitCast(single, builder.getInt32Ty());
++  Value *bits = builder.CreateBitCast(value, builder.getInt32Ty());
+   Value *exponent = builder.CreateAnd(bits, builder.getInt32(0x7f800000));
+   Value *fraction = builder.CreateAnd(bits, builder.getInt32(0x007fffff));
+   Value *denormal =
+       builder.CreateAnd(builder.CreateICmpEQ(exponent, builder.getInt32(0)),
+                         builder.CreateICmpNE(fraction, builder.getInt32(0)));
+-  return builder.CreateSelect(denormal, builder.getInt32(0), bits);
++  // PSQ stores flush a subnormal to zero without discarding its sign.
++  return builder.CreateSelect(
++      denormal, builder.CreateAnd(bits, builder.getInt32(0x80000000u)), bits);
+ }
+ 
+ Value *quantizePSQFloat(IRBuilder<> &builder, Value *value, Value *scale,
+diff --git a/src/backend/llvm/special_instructions.cpp b/src/backend/llvm/special_instructions.cpp
+index e12bbfc..c1b1c2f 100644
+--- a/src/backend/llvm/special_instructions.cpp
++++ b/src/backend/llvm/special_instructions.cpp
+@@ -6,6 +6,7 @@
+ #include <llvm/IR/Function.h>
+ #include <llvm/IR/Intrinsics.h>
+ #include <llvm/IR/Module.h>
++#include <llvm/IR/MDBuilder.h>
+ 
+ namespace dolllvm {
+ 
+@@ -72,7 +73,8 @@ Value *FunctionEmitter::emitFPAvailable(u32 pc) {
+   BasicBlock *fast = builder_.GetInsertBlock();
+   BasicBlock *good = BasicBlock::Create(context_, "fp_ok", function_);
+   BasicBlock *cold = BasicBlock::Create(context_, "fp_check", function_);
+-  builder_.CreateCondBr(enabled, good, cold);
++  builder_.CreateCondBr(enabled, good, cold,
++                        MDBuilder(context_).createBranchWeights(2000, 1));
+   builder_.SetInsertPoint(cold);
+   materialize(pc);
+   auto callee = module_.getOrInsertFunction(
+@@ -87,13 +89,13 @@ Value *FunctionEmitter::emitFPAvailable(u32 pc) {
+   builder_.SetInsertPoint(bad);
+   returnFromBody();
+   builder_.SetInsertPoint(reload);
+-  for (u32 slot = 0; slot < DOLIR_STATE_COUNT; slot++) {
+-    if (used_[slot]) {
+-      auto stateSlot = static_cast<DolIRStateSlot>(slot);
+-      Value *reloaded = loadContext(stateSlot);
+-      builder_.CreateStore(reloaded, state_[slot]);
+-    }
+-  }
++  // A successful availability check is read-only in both CPU runtimes.
++  // Only the false path raises an exception, and that path already exits.
++  // Reusing our local registers avoids a reload/PHI for every used state slot
++  // at every FP gate, including on the overwhelmingly common enabled path.
++  // materialize() itself changes PC, so preserve that part of the old reload.
++  if (used_[DOLIR_STATE_PC])
++    builder_.CreateStore(loadContext(DOLIR_STATE_PC), state_[DOLIR_STATE_PC]);
+   builder_.CreateBr(good);
+   builder_.SetInsertPoint(good);
+   PHINode *checked = builder_.CreatePHI(Type::getInt1Ty(context_), 2);
+diff --git a/src/cpu/cpu.c b/src/cpu/cpu.c
+index 27297aa..7f99530 100644
+--- a/src/cpu/cpu.c
++++ b/src/cpu/cpu.c
+@@ -642,15 +642,16 @@ static f64 extend_f32_bits(u32 bits) {
+     return value;
+ }
+ 
+-static u32 f32_bits(f32 value) {
+-    u32 bits;
++/* Match Dolphin's ConvertToSingleFTZ and the linked GXRuntime. PSQ type 0
++ * stores extract the architectural bits, preserving signed zero/NaN payloads;
++ * they do not perform a host floating-point rounding operation. */
++static u32 psq_single_store_bits(f64 value) {
++    u64 bits;
+     memcpy(&bits, &value, sizeof(bits));
+-    return bits;
+-}
+-
+-static bool f32_is_denormal(f32 value) {
+-    u32 bits = f32_bits(value);
+-    return (bits & 0x7F800000u) == 0 && (bits & 0x007FFFFFu) != 0;
++    u32 exponent = (u32)((bits >> 52) & 0x7ffu);
++    if (exponent > 896u || (bits & 0x7fffffffffffffffull) == 0)
++        return (u32)(((bits >> 32) & 0xc0000000u) | ((bits >> 29) & 0x3fffffffu));
++    return (u32)((bits >> 32) & 0x80000000u);
+ }
+ 
+ static s32 gqr_scale(u32 value) {
+@@ -716,8 +717,7 @@ static s64 psq_quantize_int(f64 value, s64 min_value, s64 max_value, s32 scale)
+ static void psq_store_value(CPUState* cpu, u32 ea, u8 type, s32 scale, f64 value) {
+     switch (type) {
+     case 0: {
+-        f32 single = (f32)value;
+-        mem_write32(cpu, ea, f32_is_denormal(single) ? 0u : f32_bits(single));
++        mem_write32(cpu, ea, psq_single_store_bits(value));
+         break;
+     }
+     case 4:
+diff --git a/src/frontend/container/rel.c b/src/frontend/container/rel.c
+index b894a36..b67431b 100644
+--- a/src/frontend/container/rel.c
++++ b/src/frontend/container/rel.c
+@@ -3,6 +3,7 @@
+ 
+ #include "rel.h"
+ #include <stdio.h>
++#include <errno.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+@@ -181,9 +182,9 @@ static int relocation_target(const RELFile* rel, const RELModuleMap* modules,
+     return section_address_at(rel, section_index, symbol_offset, target);
+ }
+ 
+-static int require_patch_range(const RELSection* section, u32 offset) {
++static int require_patch_range(const RELSection* section, u32 offset, u32 width) {
+     if (!section_has_file_data(section) || offset > section->size ||
+-        section->size - offset < 4) {
++        section->size - offset < width) {
+         fprintf(stderr, "error: REL relocation patch is outside section %u\n",
+                 section->index);
+         return 0;
+@@ -205,11 +206,13 @@ static int apply_relocation(RELSection* section, u32 offset, u32 patch_address,
+     if (type == R_PPC_NONE)
+         return 1;
+ 
+-    if (!require_patch_range(section, offset))
++    const bool halfword = type == R_PPC_ADDR16 || type == R_PPC_ADDR16_LO ||
++                          type == R_PPC_ADDR16_HI || type == R_PPC_ADDR16_HA;
++    if (!require_patch_range(section, offset, halfword ? 2 : 4))
+         return 0;
+ 
+     u8* patch = section->owned_data + offset;
+-    u32 word = read_be32(patch);
++    u32 word = halfword ? 0 : read_be32(patch);
+ 
+     switch (type) {
+     case R_PPC_ADDR32:
+@@ -224,13 +227,13 @@ static int apply_relocation(RELSection* section, u32 offset, u32 patch_address,
+         return 1;
+     case R_PPC_ADDR16:
+     case R_PPC_ADDR16_LO:
+-        write_be16(patch + 2, (u16)target);
++        write_be16(patch, (u16)target);
+         return 1;
+     case R_PPC_ADDR16_HI:
+-        write_be16(patch + 2, (u16)(target >> 16));
++        write_be16(patch, (u16)(target >> 16));
+         return 1;
+     case R_PPC_ADDR16_HA:
+-        write_be16(patch + 2, (u16)((target + 0x8000u) >> 16));
++        write_be16(patch, (u16)((target + 0x8000u) >> 16));
+         return 1;
+     case R_PPC_ADDR14:
+     case R_PPC_ADDR14_BRTAKEN:
+@@ -386,10 +389,19 @@ bool rel_load_image(RELFile* rel, const char* path, u32 base_address) {
+     rel->prolog_offset = read_be32(h + 0x34);
+     rel->epilog_offset = read_be32(h + 0x38);
+     rel->unresolved_offset = read_be32(h + 0x3C);
+-    u32 section_alignment = rel->file_size >= 0x44 ? read_be32(h + 0x40) : 4;
+-    u32 bss_alignment = rel->file_size >= 0x48 ? read_be32(h + 0x44) : 4;
++    u32 module_alignment = rel->version >= 2 && rel->file_size >= 0x44 ? read_be32(h + 0x40) : 4;
++    u32 bss_alignment = rel->version >= 2 && rel->file_size >= 0x48 ? read_be32(h + 0x44) : 4;
+     rel->base_address = base_address;
+ 
++    /* OSLink checks the module load address against header.align. Individual
++       executable sections only need instruction alignment; their offsets need
++       not be multiples of the module's allocation alignment. */
++    if (module_alignment > 1 && base_address % module_alignment != 0) {
++        fprintf(stderr, "error: REL module base address is not aligned\n");
++        rel_free(rel);
++        return false;
++    }
++
+     if (rel->section_count == 0 ||
+         rel->section_count > REL_MAX_SECTION_COUNT ||
+         !range_fits(section_info_offset,
+@@ -416,6 +428,21 @@ bool rel_load_image(RELFile* rel, const char* path, u32 base_address) {
+     }
+     u32 bss_cursor = align_up_u32(bss_start,
+                                   bss_alignment ? bss_alignment : 4, &ok);
++    // The host port pins BSS separately because OSLink allocates it independently
++    // of the REL file. Preserve the automatic layout unless explicitly pinned.
++    const char* pinned_bss = getenv("DOLRECOMP_REL_BSS");
++    if (rel->bss_size && pinned_bss && pinned_bss[0]) {
++        char* end = NULL;
++        errno = 0;
++        unsigned long parsed = strtoul(pinned_bss, &end, 0);
++        if (errno || end == pinned_bss || *end || parsed > 0xFFFFFFFFul ||
++            (bss_alignment > 1 && parsed % bss_alignment != 0)) {
++            fprintf(stderr, "error: invalid or misaligned DOLRECOMP_REL_BSS\n");
++            rel_free(rel);
++            return false;
++        }
++        bss_cursor = (u32)parsed;
++    }
+     if (!ok) {
+         fprintf(stderr, "error: REL BSS address overflow\n");
+         rel_free(rel);
+@@ -477,12 +504,6 @@ bool rel_load_image(RELFile* rel, const char* path, u32 base_address) {
+             rel_free(rel);
+             return false;
+         }
+-        if (section_alignment > 1 && executable &&
+-            (section->address % section_alignment) != 0) {
+-            fprintf(stderr, "error: REL executable section %u is not aligned\n", i);
+-            rel_free(rel);
+-            return false;
+-        }
+ 
+         section->owned_data = (u8*)malloc(size);
+         if (!section->owned_data) {
+diff --git a/tests/llvm_semantics_test.c b/tests/llvm_semantics_test.c
+index d8205b7..6055cc1 100644
+--- a/tests/llvm_semantics_test.c
++++ b/tests/llvm_semantics_test.c
+@@ -146,6 +146,20 @@ int main(void) {
+     func_80001000(&cpu);
+     CHECK(fallbacks == 1 && cpu.gpr[3] == 10 && cpu.pc == 0x81234564u);
+ 
++    /* An unavailable FPU must exit before the PSQ load/store, preserving
++       the destination and memory and reporting the faulting guest PC. */
++    prepare(&cpu, 0x80002880u);
++    cpu.msr = 0;
++    cpu.fpr[1] = 123.0;
++    cpu.ps1[1] = -456.0;
++    cpu.gpr[4] = GC_RAM_BASE + 0x340u;
++    mem_write32(&cpu, cpu.gpr[4] + 8u, 0xAABBCCDDu);
++    func_80002880(&cpu);
++    CHECK(cpu.exception & PPC_EXC_FP_UNAVAILABLE);
++    CHECK(cpu.srr0 == 0x80002880u);
++    CHECK(cpu.fpr[1] == 123.0 && cpu.ps1[1] == -456.0);
++    CHECK(mem_read32(&cpu, cpu.gpr[4] + 8u) == 0xAABBCCDDu);
++
+     prepare(&cpu, 0x80002880u);
+     cpu.msr = 1u << 13;
+     cpu.hid2 = PPC_HID2_LSQE | PPC_HID2_PSE;
+diff --git a/tests/test_rel.c b/tests/test_rel.c
+index 3fb9a9e..7cfbe86 100644
+--- a/tests/test_rel.c
++++ b/tests/test_rel.c
+@@ -2,6 +2,7 @@
+ #include "common/types.h"
+ #include <stdio.h>
+ #include <string.h>
++#include <stdlib.h>
+ 
+ #define CHECK(cond, ...) do { \
+     if (!(cond)) { \
+@@ -176,6 +177,109 @@ static int test_unaligned_text_rejected(void) {
+     return 1;
+ }
+ 
++static int test_module_alignment_not_section_alignment(void) {
++    const char* path = "test_module_alignment.rel";
++    CHECK(write_sample_rel(path, 1, R_PPC_ADDR32, 2, 0, 8), "failed to write sample REL");
++    u8 file[0x120];
++    FILE* stream = fopen(path, "rb");
++    CHECK(stream && fread(file, 1, sizeof(file), stream) == sizeof(file), "failed to read fixture");
++    fclose(stream);
++    write_be32(file + 0x40, 32);
++    write_be32(file + 0x58, 0x104 | 1u);
++    write_be32(file + 0x60, 0x10C);
++    write_be32(file + 0x104, 0);
++    write_be32(file + 0x108, 0x4E800020u);
++    write_be32(file + 0x10C, 0x12345678u);
++    stream = fopen(path, "wb");
++    CHECK(stream && fwrite(file, 1, sizeof(file), stream) == sizeof(file), "failed to update fixture");
++    fclose(stream);
++    RELFile rel;
++    CHECK(rel_load(&rel, path, 0x80500000u), "aligned module with a 4-aligned text offset must load");
++    CHECK(rel.sections[1].address == 0x80500104u &&
++          read_be32(rel.sections[1].data) == 0x8050010Cu, "section address/relocation changed");
++    rel_free(&rel);
++    int loaded = rel_load(&rel, path, 0x80500004u);
++    if (loaded) rel_free(&rel);
++    CHECK(!loaded, "misaligned module base should be rejected");
++    // Version 1 has no module-alignment field at 0x40.
++    write_be32(file + 0x1C, 1);
++    stream = fopen(path, "wb");
++    CHECK(stream && fwrite(file, 1, sizeof(file), stream) == sizeof(file), "failed to write v1 fixture");
++    fclose(stream);
++    CHECK(rel_load(&rel, path, 0x80500004u), "v1 must not interpret bytes at 0x40 as alignment");
++    rel_free(&rel);
++    remove(path);
++    return 1;
++}
++
++static int test_halfword_relocation_location(void) {
++    const u8 types[] = {3, 4, 5, 6};
++    const u16 values[] = {0xF678, 0xF678, 0x8123, 0x8124};
++    const char* path = "test_halfword.rel";
++    for (unsigned kind = 0; kind < 4; ++kind) {
++        for (unsigned at_end = 0; at_end < 2; ++at_end) {
++            CHECK(write_sample_rel(path, 0, types[kind], 0, 0x8123F678u, 8), "failed to write REL");
++            FILE* f = fopen(path, "r+b");
++            CHECK(f, "failed to open REL");
++            u8 delta[2]; write_be16(delta, at_end ? 6 : 2);
++            CHECK(fseek(f, 0x88, SEEK_SET) == 0 && fwrite(delta, 1, 2, f) == 2, "failed to patch delta");
++            u8 text[8]; write_be32(text, 0x38630000u); write_be32(text+4, 0x4E800020u);
++            CHECK(fseek(f, 0x100, SEEK_SET) == 0 && fwrite(text, 1, 8, f) == 8, "failed to write text");
++            fclose(f);
++            RELFile rel;
++            CHECK(rel_load(&rel, path, 0x80500000u), "failed to load halfword relocation type %u", types[kind]);
++            write_be16(text + (at_end ? 6 : 2), values[kind]);
++            CHECK(memcmp(rel.sections[1].data, text, 8) == 0,
++                  "halfword relocation changed bytes outside its exact location (type %u)", types[kind]);
++            rel_free(&rel);
++        }
++    }
++    remove(path);
++    return 1;
++}
++
++static int set_bss_environment(const char* value) {
++#ifdef _WIN32
++    return _putenv_s("DOLRECOMP_REL_BSS", value ? value : "");
++#else
++    return value ? setenv("DOLRECOMP_REL_BSS", value, 1) : unsetenv("DOLRECOMP_REL_BSS");
++#endif
++}
++
++static int test_pinned_bss_layout(void) {
++    const char* path = "test_pinned_bss.rel";
++    CHECK(write_sample_rel(path, 1, R_PPC_ADDR32, 2, 0, 8), "failed to write REL");
++    FILE* f = fopen(path, "r+b");
++    CHECK(f, "failed to open BSS fixture");
++    u8 field[4]; write_be32(field, 4);
++    CHECK(fseek(f, 0x20, SEEK_SET) == 0 && fwrite(field, 1, 4, f) == 4, "failed to write BSS size");
++    write_be32(field, 64);
++    CHECK(fseek(f, 0x44, SEEK_SET) == 0 && fwrite(field, 1, 4, f) == 4, "failed to write BSS alignment");
++    write_be32(field, 0);
++    CHECK(fseek(f, 0x60, SEEK_SET) == 0 && fwrite(field, 1, 4, f) == 4, "failed to write BSS section");
++    fclose(f);
++    const char* old = getenv("DOLRECOMP_REL_BSS");
++    char* saved = old ? malloc(strlen(old) + 1) : NULL;
++    CHECK(!old || saved, "failed to preserve environment");
++    if (old) strcpy(saved, old);
++    const char* values[] = {"0x80600000", "0x80600004", "0x100000000", "invalid"};
++    for (unsigned i = 0; i < 4; ++i) {
++        CHECK(set_bss_environment(values[i]) == 0, "failed to set BSS layout");
++        RELFile rel;
++        int loaded = rel_load(&rel, path, 0x80500000u);
++        CHECK(loaded == (i == 0), "unexpected pinned BSS acceptance: %s", values[i]);
++        if (loaded) {
++            CHECK(rel.sections[2].address == 0x80600000u &&
++                  read_be32(rel.sections[1].data) == 0x80600000u, "pinned BSS relocation is wrong");
++            rel_free(&rel);
++        }
++    }
++    CHECK(set_bss_environment(saved) == 0, "failed to restore BSS environment");
++    free(saved);
++    remove(path);
++    return 1;
++}
++
+ int main(void) {
+     int ok = 1;
+     ok &= test_self_relocation();
+@@ -183,6 +287,9 @@ int main(void) {
+     ok &= test_external_import_rejected();
+     ok &= test_external_import_with_map();
+     ok &= test_unaligned_text_rejected();
++    ok &= test_module_alignment_not_section_alignment();
++    ok &= test_halfword_relocation_location();
++    ok &= test_pinned_bss_layout();
+ 
+     if (!ok)
+         return 1;
+diff --git a/src/backend/llvm/scalar_float.cpp b/src/backend/llvm/scalar_float.cpp
+new file mode 100644
+index 0000000..886d6d5
+--- /dev/null
++++ b/src/backend/llvm/scalar_float.cpp
+@@ -0,0 +1,133 @@
++#include "backend/llvm/emitter.h"
++#include "cpu/cpu.h"
++
++#include <llvm/IR/Constants.h>
++#include <llvm/IR/Function.h>
++#include <llvm/IR/Intrinsics.h>
++#include <llvm/IR/MDBuilder.h>
++#include <llvm/IR/Module.h>
++
++namespace dolllvm {
++using namespace llvm;
++
++void FunctionEmitter::emitExactFloat(u64 descriptor) {
++  const auto op = static_cast<DolIRExactFloat>(descriptor & 0xFFu);
++  const bool fused = op >= DOLIR_EXACT_FMADDS && op <= DOLIR_EXACT_FNMSUBS;
++  const bool subtract = op == DOLIR_EXACT_FMSUBS || op == DOLIR_EXACT_FNMSUBS;
++  const bool negate = op == DOLIR_EXACT_FNMADDS || op == DOLIR_EXACT_FNMSUBS;
++  if (!fused && op != DOLIR_EXACT_FADDS && op != DOLIR_EXACT_FSUBS &&
++      op != DOLIR_EXACT_FMULS) {
++    emitExactFloatSlow(descriptor);
++    return;
++  }
++  // Ordinary normal single results need no exception/NI fixups. Keep them
++  // local to the generated function; preserve the exact runtime for all
++  // other results, including underflow, overflow and NaNs.
++  materializeFPRF();
++  const u32 d = (descriptor >> 8) & 0xFFu;
++  const u32 a = (descriptor >> 16) & 0xFFu;
++  const u32 b = (descriptor >> 24) & 0xFFu;
++  const u32 c = (descriptor >> 32) & 0xFFu;
++  const auto incomingRep = fp_rep_;
++  const auto incomingSingle = fp_exact_single_;
++  const auto incomingSafe = fp_denormal_safe_;
++  const auto incomingClass = fp_value_class_;
++  const auto incomingKnown = known_state_;
++  Value *left = stateValue(static_cast<DolIRStateSlot>(DOLIR_STATE_FPR0 + a));
++  Value *right = stateValue(static_cast<DolIRStateSlot>(
++      DOLIR_STATE_FPR0 + (op == DOLIR_EXACT_FMULS || fused ? c : b)));
++  Value *regularMultiplier = builder_.getTrue();
++  if (op == DOLIR_EXACT_FMULS || fused) {
++    Value *bits = builder_.CreateBitCast(right, builder_.getInt64Ty());
++    Value *magnitude = builder_.CreateAnd(bits, builder_.getInt64(0x7FFFFFFFFFFFFFFFull));
++    regularMultiplier = builder_.CreateOr(
++        builder_.CreateICmpEQ(magnitude, builder_.getInt64(0)),
++        builder_.CreateICmpNE(builder_.CreateAnd(bits, builder_.getInt64(0x7FF0000000000000ull)),
++                              builder_.getInt64(0)));
++    Value *rounded = builder_.CreateAdd(
++        builder_.CreateAnd(bits, builder_.getInt64(0xFFFFFFFFF8000000ull)),
++        builder_.CreateAnd(bits, builder_.getInt64(0x0000000008000000ull)));
++    right = builder_.CreateBitCast(rounded, right->getType());
++  }
++  Value *result;
++  if (fused) {
++    Value *addend = stateValue(static_cast<DolIRStateSlot>(DOLIR_STATE_FPR0 + b));
++    if (subtract)
++      addend = builder_.CreateFNeg(addend);
++    Function *fma = Intrinsic::getDeclaration(
++        &module_, Intrinsic::experimental_constrained_fma, {left->getType()});
++    result = builder_.CreateConstrainedFPCall(
++        fma, {left, right, addend}, "scalar.fma", RoundingMode::Dynamic, fp::ebIgnore);
++  } else {
++    const auto intrinsic = op == DOLIR_EXACT_FADDS ? Intrinsic::experimental_constrained_fadd :
++                           op == DOLIR_EXACT_FSUBS ? Intrinsic::experimental_constrained_fsub :
++                                                    Intrinsic::experimental_constrained_fmul;
++    result = builder_.CreateConstrainedFPBinOp(
++        intrinsic, left, right, nullptr, "scalar.math", nullptr,
++        RoundingMode::Dynamic, fp::ebIgnore);
++  }
++  Value *bits = builder_.CreateBitCast(result, builder_.getInt64Ty());
++  Value *magnitude = builder_.CreateAnd(bits, builder_.getInt64(0x7FFFFFFFFFFFFFFFull));
++  Value *normal = builder_.CreateAnd(
++      builder_.CreateICmpUGE(magnitude, builder_.getInt64(0x3810000000000000ull)),
++      builder_.CreateICmpULE(magnitude, builder_.getInt64(0x47EFFFFFE0000000ull)));
++  if (fused) {
++    // The runtime corrects rare double-rounding ties before single rounding.
++    // Those cases retain the full helper, as do special multiplier operands.
++    Value *notTie = builder_.CreateICmpNE(
++        builder_.CreateAnd(bits, builder_.getInt64(0x000000001FFFFFFFull)),
++        builder_.getInt64(0x0000000010000000ull));
++    Value *originalC = stateValue(static_cast<DolIRStateSlot>(DOLIR_STATE_FPR0 + c));
++    Value *cBits = builder_.CreateBitCast(originalC, builder_.getInt64Ty());
++    Value *finiteC = builder_.CreateICmpNE(
++        builder_.CreateAnd(cBits, builder_.getInt64(0x7FF0000000000000ull)),
++        builder_.getInt64(0x7FF0000000000000ull));
++    normal = builder_.CreateAnd(normal, builder_.CreateAnd(notTie, finiteC));
++  }
++  BasicBlock *fast = BasicBlock::Create(context_, "scalar_normal", function_);
++  BasicBlock *slow = BasicBlock::Create(context_, "scalar_exact", function_);
++  BasicBlock *join = BasicBlock::Create(context_, "scalar_join", function_);
++  builder_.CreateCondBr(builder_.CreateAnd(normal, regularMultiplier), fast, slow,
++                        MDBuilder(context_).createBranchWeights(2000, 1));
++  builder_.SetInsertPoint(fast);
++  Value *single = builder_.CreateConstrainedFPCast(
++      Intrinsic::experimental_constrained_fptrunc, result, builder_.getFloatTy(),
++      nullptr, "scalar.round", nullptr, RoundingMode::Dynamic, fp::ebIgnore);
++  if (negate) {
++    single = builder_.CreateFNeg(single);
++    bits = builder_.CreateXor(bits, builder_.getInt64(0x8000000000000000ull));
++  }
++  Value *pair = PoisonValue::get(FixedVectorType::get(builder_.getFloatTy(), 2));
++  pair = builder_.CreateInsertElement(pair, single, uint64_t{0});
++  pair = builder_.CreateInsertElement(pair, single, 1u);
++  writePairF32(d, pair, true, FPValueClass::Finite);
++  Value *fpscr = builder_.CreateLoad(builder_.getInt32Ty(), state_[DOLIR_STATE_FPSCR]);
++  u32 clear = 0x1Fu << 12;
++  if (op == DOLIR_EXACT_FMULS)
++    clear |= 0x00020000u | 0x00040000u;  // FI / FR
++  Value *negative = builder_.CreateICmpNE(
++      builder_.CreateAnd(bits, builder_.getInt64(0x8000000000000000ull)), builder_.getInt64(0));
++  Value *classification = builder_.CreateSelect(negative, builder_.getInt32(0x08u << 12),
++                                                         builder_.getInt32(0x04u << 12));
++  builder_.CreateStore(builder_.CreateOr(
++      builder_.CreateAnd(fpscr, builder_.getInt32(~clear)), classification),
++      state_[DOLIR_STATE_FPSCR]);
++  builder_.CreateBr(join);
++
++  builder_.SetInsertPoint(slow);
++  fp_rep_ = incomingRep;
++  fp_exact_single_ = incomingSingle;
++  fp_denormal_safe_ = incomingSafe;
++  fp_value_class_ = incomingClass;
++  known_state_ = incomingKnown;
++  emitExactFloatSlow(descriptor);
++  builder_.CreateBr(join);
++  builder_.SetInsertPoint(join);
++  known_state_[DOLIR_STATE_FPSCR] = nullptr;
++  fp_rep_[d] = FPRepresentation::PairF32;
++  fp_exact_single_[d] = true;
++  fp_denormal_safe_[d] = true;
++  fp_value_class_[d] = FPValueClass::Unknown;
++}
++
++} // namespace dolllvm

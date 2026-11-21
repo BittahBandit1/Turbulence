@@ -376,15 +376,88 @@ index 345b960..1f77e16 100644
      if (!w)
          psq_store_value(cpu, ea + size, type, scale, cpu->ps1[frS]);
 diff --git a/GXRuntime/src/core/cpu_interpreter_float.c b/GXRuntime/src/core/cpu_interpreter_float.c
-index a73f961..e7177df 100644
+index a73f961..5a98f5d 100644
 --- a/GXRuntime/src/core/cpu_interpreter_float.c
 +++ b/GXRuntime/src/core/cpu_interpreter_float.c
-@@ -1,3 +1,5 @@
+@@ -1,6 +1,17 @@
 +/* Defines the out-of-line ppc_ps_* ops that cpu.h's inline fast paths fall back to. */
 +#define GXRUNTIME_DEFINES_FAST_PATH_OPS 1
  #include "cpu_interpreter_private.h"
  #include <string.h>
  
++/* The REL uses the C backend with ThinLTO. Import these helpers even into
++   large generated functions so constant operands/flags and CPU-state accesses
++   can be optimized together. Keep external definitions for native LLVM calls. */
++#if defined(__ANDROID__) && defined(__clang__)
++#define GXRUNTIME_SCALAR_INLINE __attribute__((always_inline))
++#else
++#define GXRUNTIME_SCALAR_INLINE
++#endif
++
+ f64 ppc_approx_rsqrt(f64 value) {
+     u64 bits = f64_bits(value);
+     u64 mantissa = bits & 0x000FFFFFFFFFFFFFull;
+@@ -283,7 +294,7 @@ f64 force_25_bit(f64 value) {
+     return f64_value(bits);
+ }
+ 
+-bool ppc_fma(CPUState* cpu, f64 a, f64 c, f64 b, bool single,
++GXRUNTIME_SCALAR_INLINE bool ppc_fma(CPUState* cpu, f64 a, f64 c, f64 b, bool single,
+              bool subtract, bool negative, f64* output) {
+     f64 addend = subtract ? -b : b;
+     f64 result;
+@@ -538,20 +549,42 @@ void fp_write_double(CPUState* cpu, u8 d, f64 value) {
+     set_fprf(cpu, classify_f64(value));
+ }
+ 
+-void ppc_fadds(CPUState* cpu, u8 d, u8 a, u8 b) {
++GXRUNTIME_SCALAR_INLINE void ppc_fadds(CPUState* cpu, u8 d, u8 a, u8 b) {
++    /* Finite arithmetic cannot raise the invalid-operation cases handled
++       by ni_add. Keep the same f64 operation, single rounding,
++       NI flush and FPSCR classification, without the exceptional slow path. */
++    const f64 value = cpu->fpr[a] + cpu->fpr[b];
++    if (isfinite(value)) {
++        fp_write_single(cpu, d, force_single(cpu, value));
++        return;
++    }
+     FPRes sum = ni_add(cpu, cpu->fpr[a], cpu->fpr[b]);
+     if (!fp_invalid_gated(cpu, &sum))
+         fp_write_single(cpu, d, force_single(cpu, sum.value));
+ }
+ 
+-void ppc_fsubs(CPUState* cpu, u8 d, u8 a, u8 b) {
++GXRUNTIME_SCALAR_INLINE void ppc_fsubs(CPUState* cpu, u8 d, u8 a, u8 b) {
++    /* Finite arithmetic cannot raise the invalid-operation cases handled
++       by ni_sub. Keep the same f64 operation, single rounding,
++       NI flush and FPSCR classification, without the exceptional slow path. */
++    const f64 value = cpu->fpr[a] - cpu->fpr[b];
++    if (isfinite(value)) {
++        fp_write_single(cpu, d, force_single(cpu, value));
++        return;
++    }
+     FPRes diff = ni_sub(cpu, cpu->fpr[a], cpu->fpr[b]);
+     if (!fp_invalid_gated(cpu, &diff))
+         fp_write_single(cpu, d, force_single(cpu, diff.value));
+ }
+ 
+-void ppc_fmuls(CPUState* cpu, u8 d, u8 a, u8 c) {
++GXRUNTIME_SCALAR_INLINE void ppc_fmuls(CPUState* cpu, u8 d, u8 a, u8 c) {
+     f64 c_value = force_25bit_c(cpu->fpr[c]);
++    const f64 value = cpu->fpr[a] * c_value;
++    if (isfinite(value)) {
++        fp_write_single(cpu, d, force_single(cpu, value));
++        cpu->fpscr &= ~(FPSCR_FI_BIT | FPSCR_FR_BIT);
++        return;
++    }
+     FPRes product = ni_mul(cpu, cpu->fpr[a], c_value);
+     if (!fp_invalid_gated(cpu, &product)) {
+         fp_write_single(cpu, d, force_single(cpu, product.value));
+@@ -959,3 +992,5 @@ bool ppc_fctiw(CPUState* cpu, f64 value, bool toward_zero, u64* output) {
+               ((result == 0 && signbit(value)) ? 0x100000000ull : 0ull);
+     return true;
+ }
++
++#undef GXRUNTIME_SCALAR_INLINE
 diff --git a/Source/CMakeLists.txt b/Source/CMakeLists.txt
 index 7871083..d0e56cc 100644
 --- a/Source/CMakeLists.txt
@@ -909,7 +982,7 @@ index 4a79b90..730c1af 100644
  #include <string>
  
 diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
-index e3581cc..f61077c 100644
+index e3581cc..5ef89d9 100644
 --- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
 +++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
 @@ -2,6 +2,8 @@
@@ -993,17 +1066,19 @@ index e3581cc..f61077c 100644
    m_module_active = (desc != nullptr);
    m_has_rel_modules = desc->num_rel_modules != 0;
    m_chunk_state.assign(desc->num_chunk_ranges, CHUNK_UNVERIFIED);
-@@ -327,7 +344,9 @@ void StaticRecompCore::LoadModule()
+@@ -327,7 +344,11 @@ void StaticRecompCore::LoadModule()
      }
    }
    m_active_rel_sections.clear();
 +  m_rel_addresses_match = true;
++  m_rel_runtime_begin = m_rel_linked_begin = 0x100000000ull;
++  m_rel_runtime_end = m_rel_linked_end = 0;
    m_rel_mapping_generation = 0;
 +  m_rel_scan_dirty = true;
    m_failed_chunks = 0;
    m_lookup_ram_size = 0;
    m_lookup_exram_size = 0;
-@@ -356,6 +375,7 @@ void StaticRecompCore::ClearCache()
+@@ -356,6 +377,7 @@ void StaticRecompCore::ClearCache()
    if (!m_module)
      return;
    std::fill(m_chunk_state.begin(), m_chunk_state.end(), u8{CHUNK_UNVERIFIED});
@@ -1012,7 +1087,7 @@ index e3581cc..f61077c 100644
    ++m_reverify_events;
  }
 diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
-index d084fea..6e5eb38 100644
+index d084fea..88bab8c 100644
 --- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
 +++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
 @@ -3,6 +3,8 @@
@@ -1041,11 +1116,17 @@ index d084fea..6e5eb38 100644
    u32 m_host_call_passthrough_pc = 0;
    bool m_host_call_passthrough = false;
    std::unique_ptr<JitBase> m_fallback_jit;
-@@ -191,9 +194,17 @@ private:
+@@ -191,9 +194,23 @@ private:
      u32 size;
    };
    std::vector<ActiveRelSection> m_active_rel_sections;
 +  bool m_rel_addresses_match = true;
++  // Coarse bounds reject addresses that cannot belong to a loaded REL section.
++  // Keep ends wide so a section ending at 2^32 cannot wrap.
++  u64 m_rel_runtime_begin = 0x100000000ull;
++  u64 m_rel_runtime_end = 0;
++  u64 m_rel_linked_begin = 0x100000000ull;
++  u64 m_rel_linked_end = 0;
    std::vector<int> m_chunk_rel_sections;
    std::vector<u64> m_effective_chunk_hashes;
    u64 m_rel_mapping_generation = 0;
@@ -1059,7 +1140,7 @@ index d084fea..6e5eb38 100644
    u32 m_failed_chunks = 0;    // chunks currently failing verification (real SMC)
    u64 m_verifications = 0;    // chunk hash checks performed
    u64 m_reverify_events = 0;  // invalidations that reset a chunk to Unverified
-@@ -212,6 +223,7 @@ private:
+@@ -212,6 +229,7 @@ private:
    bool m_collect_dispatch_samples = false;
    bool m_has_rel_modules = false;
    u32 m_idle_pc = 0;
@@ -1229,7 +1310,7 @@ index d91ec2d..3e1c76d 100644
  
            // ctx->timebase is refreshed at burst start (SyncIn), and here we
 diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
-index 491c57e..b96afb8 100644
+index 491c57e..a247b75 100644
 --- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
 +++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
 @@ -8,6 +8,8 @@
@@ -1299,7 +1380,7 @@ index 491c57e..b96afb8 100644
          break;
        }
      }
-@@ -87,6 +112,10 @@ void StaticRecompCore::RefreshRelSections()
+@@ -87,7 +112,20 @@ void StaticRecompCore::RefreshRelSections()
                                     });
    if (!changed)
      return;
@@ -1308,9 +1389,28 @@ index 491c57e..b96afb8 100644
 +  m_rel_addresses_match = std::all_of(discovered.begin(), discovered.end(),
 +      [](const ActiveRelSection& section) { return section.linked_start == section.runtime_start; });
    m_active_rel_sections = std::move(discovered);
++  m_rel_runtime_begin = m_rel_linked_begin = 0x100000000ull;
++  m_rel_runtime_end = m_rel_linked_end = 0;
++  for (const ActiveRelSection& section : m_active_rel_sections)
++  {
++    m_rel_runtime_begin = std::min(m_rel_runtime_begin, static_cast<u64>(section.runtime_start));
++    m_rel_runtime_end = std::max(m_rel_runtime_end, static_cast<u64>(section.runtime_start) + section.size);
++    m_rel_linked_begin = std::min(m_rel_linked_begin, static_cast<u64>(section.linked_start));
++    m_rel_linked_end = std::max(m_rel_linked_end, static_cast<u64>(section.linked_start) + section.size);
++  }
    ++m_rel_mapping_generation;
    for (u32 i = 0; i < m_chunk_rel_sections.size(); ++i)
-@@ -132,8 +161,11 @@ bool StaticRecompCore::ResolveNativeAddress(u32 runtime_address, u32* linked_add
+   {
+@@ -104,6 +142,8 @@ bool StaticRecompCore::ResolveNativeAddress(u32 runtime_address, u32* linked_add
+                                             u32* rel_section_index)
+ {
+   const auto resolve_active = [&]() {
++    if (runtime_address < m_rel_runtime_begin || runtime_address >= m_rel_runtime_end)
++      return false;
+     for (u32 i = 0; i < m_active_rel_sections.size(); ++i)
+     {
+       const ActiveRelSection& section = m_active_rel_sections[i];
+@@ -132,12 +172,20 @@ bool StaticRecompCore::ResolveNativeAddress(u32 runtime_address, u32* linked_add
        return true;
      }
    }
@@ -1324,7 +1424,16 @@ index 491c57e..b96afb8 100644
  }
  
  bool StaticRecompCore::ResolveRuntimeAddress(u32 linked_address, u32* runtime_address) const
-@@ -235,8 +267,16 @@ bool StaticRecompCore::DispatchableAt(u32 address)
+ {
++  if (linked_address < m_rel_linked_begin || linked_address >= m_rel_linked_end)
++  {
++    *runtime_address = linked_address;
++    return true;
++  }
+   for (const ActiveRelSection& section : m_active_rel_sections)
+   {
+     if (linked_address >= section.linked_start &&
+@@ -235,8 +283,16 @@ bool StaticRecompCore::DispatchableAt(u32 address)
    return m_chunk_state[index] == CHUNK_VERIFIED;
  }
  
@@ -1342,7 +1451,7 @@ index 491c57e..b96afb8 100644
    for (const StaticRecompRange& range : m_forced_fallback_ranges)
    {
      if (address >= range.start && address < range.end)
-@@ -247,7 +287,7 @@ bool StaticRecompCore::IsForcedFallbackAddress(u32 address) const
+@@ -247,7 +303,7 @@ bool StaticRecompCore::IsForcedFallbackAddress(u32 address) const
  
  bool StaticRecompCore::ChunkContainsHostCall(u32 index) const
  {
@@ -1351,7 +1460,7 @@ index 491c57e..b96afb8 100644
      return false;
  
    u8& state = m_chunk_host_call_state[index];
-@@ -255,13 +295,14 @@ bool StaticRecompCore::ChunkContainsHostCall(u32 index) const
+@@ -255,13 +311,14 @@ bool StaticRecompCore::ChunkContainsHostCall(u32 index) const
      return state == 2;
  
    const auto& chunk = m_module->chunk_ranges[index];
@@ -1369,7 +1478,7 @@ index 491c57e..b96afb8 100644
    {
      for (u32 address = chunk.start; address < chunk.end; address += 4)
      {
-@@ -339,8 +380,10 @@ void StaticRecompCore::OnICacheInvalidate(u32 address, u32 length)
+@@ -339,11 +396,21 @@ void StaticRecompCore::OnICacheInvalidate(u32 address, u32 length)
  
    if (!m_module_active || length == 0)
      return;
@@ -1381,6 +1490,49 @@ index 491c57e..b96afb8 100644
    address = linked_address;
    const u32 last = address + (length - 1u);
  
++  // Data-cache maintenance also reaches this hook. Addresses beyond the
++  // sorted compiled-code ranges cannot invalidate a chunk. Keep REL discovery
++  // dirty above, but avoid a binary search for ordinary data buffers.
++  const u32 range_count = m_module->num_chunk_ranges;
++  if (range_count == 0 || address >= m_module->chunk_ranges[range_count - 1].end ||
++      last < m_module->chunk_ranges[0].start)
++    return;
++
+   // Binary search to find the first chunk index that could possibly overlap (chunk.end > address)
+   u32 lo = 0;
+   u32 hi = m_module->num_chunk_ranges;
+diff --git a/Source/Core/DolphinNoGUI/Platform.h b/Source/Core/DolphinNoGUI/Platform.h
+index 5b0729a..2432818 100644
+--- a/Source/Core/DolphinNoGUI/Platform.h
++++ b/Source/Core/DolphinNoGUI/Platform.h
+@@ -3,6 +3,7 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <memory>
+ #include <string>
+ 
+@@ -36,6 +37,10 @@ public:
+   // Request an immediate shutdown.
+   void Stop();
+ 
++  // Turbulence: enter/leave fullscreen from any thread (the options menu runs
++  // on the render thread); the platform applies it from its own main loop.
++  void RequestFullscreen(bool fullscreen) { m_fullscreen_request.store(fullscreen ? 1 : 0); }
++
+   static std::unique_ptr<Platform> CreateHeadlessPlatform();
+ #ifdef HAVE_WAYLAND
+   static std::unique_ptr<Platform> CreateWaylandPlatform();
+@@ -67,4 +72,8 @@ protected:
+ 
+   bool m_window_focus = true;  // Should be made atomic if actually implemented
+   bool m_window_fullscreen = false;
++
++  // -1 none pending, else the requested state. Take it once per loop.
++  int TakeFullscreenRequest() { return m_fullscreen_request.exchange(-1); }
++  std::atomic<int> m_fullscreen_request{-1};
+ };
 diff --git a/Source/Core/DolphinNoGUI/PlatformMacos.mm b/Source/Core/DolphinNoGUI/PlatformMacos.mm
 index e942282..e1094e6 100644
 --- a/Source/Core/DolphinNoGUI/PlatformMacos.mm
@@ -3078,7 +3230,7 @@ index 98eb651..41e7102 100644
  
    if (loader_type == VertexLoaderType::Software)
 diff --git a/Source/Core/VideoCommon/VertexManagerBase.cpp b/Source/Core/VideoCommon/VertexManagerBase.cpp
-index 2bc6d58..519bad9 100644
+index 2bc6d58..c09fb5d 100644
 --- a/Source/Core/VideoCommon/VertexManagerBase.cpp
 +++ b/Source/Core/VideoCommon/VertexManagerBase.cpp
 @@ -2,9 +2,16 @@
@@ -3106,7 +3258,23 @@ index 2bc6d58..519bad9 100644
  #include "VideoCommon/VertexLoaderManager.h"
  #include "VideoCommon/VertexShaderManager.h"
  #include "VideoCommon/VideoBackendBase.h"
-@@ -432,6 +440,59 @@ BitSet32 VertexManagerBase::UsedTextures() const
+@@ -195,6 +203,7 @@ DataReader VertexManagerBase::PrepareForAdditionalData(OpcodeDecoder::Primitive
+       ResetBuffer(stride);
+     }
+ 
++    m_draw_start_pointer = m_cur_buffer_pointer;
+     remaining_index_generator_indices = m_index_generator.GetRemainingIndices(primitive);
+     remaining_indices = GetRemainingIndices(primitive);
+     m_is_flushed = false;
+@@ -226,6 +235,7 @@ DataReader VertexManagerBase::DisableCullAll(u32 stride)
+   {
+     m_cull_all = false;
+     ResetBuffer(stride);
++    m_draw_start_pointer = m_cur_buffer_pointer;
+   }
+   return DataReader(m_cur_buffer_pointer, m_end_buffer_pointer);
+ }
+@@ -432,6 +442,62 @@ BitSet32 VertexManagerBase::UsedTextures() const
    return usedtextures;
  }
  
@@ -3121,15 +3289,18 @@ index 2bc6d58..519bad9 100644
 +  const PortableVertexDeclaration& decl = format->GetVertexDeclaration();
 +  if (!decl.position.enable || decl.position.type != ComponentFormat::Float || decl.stride == 0)
 +    return false;
-+  const u32 count = static_cast<u32>((m_cur_buffer_pointer - m_base_buffer_pointer) / decl.stride);
-+  if (count == 0)
++  const u8* const start = m_draw_start_pointer ? m_draw_start_pointer : m_base_buffer_pointer;
++  const u32 count = static_cast<u32>((m_cur_buffer_pointer - start) / decl.stride);
++  // IsFullscreenBackground only accepts a single four-vertex quad. Reject
++  // other batches before reading the mapped vertex buffer: on Android those
++  // reads can be very expensive, especially for batched text/menu geometry.
++  if (count != 4)
 +    return false;
 +  const auto& raw = xfmem.projection.rawProjection;  // ortho: x_clip = raw[0] * x + raw[1]
 +  float min_x = 2.0f, max_x = -2.0f, min_y = 2.0f, max_y = -2.0f;
-+  const u32 limit = std::min<u32>(count, 4096);
-+  for (u32 i = 0; i < limit; ++i)
++  for (u32 i = 0; i < count; ++i)
 +  {
-+    const u8* v = m_base_buffer_pointer + size_t(i) * decl.stride;
++    const u8* v = start + size_t(i) * decl.stride;
 +    float p[3] = {0.0f, 0.0f, 0.0f};
 +    std::memcpy(p, v + decl.position.offset, sizeof(float) * std::min(decl.position.components, 3));
 +    u32 mtx = g_main_cp_state.matrix_index_a.PosNormalMtxIdx;
@@ -3166,7 +3337,7 @@ index 2bc6d58..519bad9 100644
  void VertexManagerBase::Flush()
  {
    if (m_is_flushed)
-@@ -562,6 +623,13 @@ void VertexManagerBase::Flush()
+@@ -562,6 +628,13 @@ void VertexManagerBase::Flush()
    std::vector<std::string> texture_names;
    Common::SmallVector<u32, 8> texture_units;
    std::array<SamplerState, 8> samplers;
@@ -3180,7 +3351,7 @@ index 2bc6d58..519bad9 100644
    if (!m_cull_all)
    {
      if (!g_ActiveConfig.bGraphicMods)
-@@ -571,6 +639,8 @@ void VertexManagerBase::Flush()
+@@ -571,6 +644,8 @@ void VertexManagerBase::Flush()
          const auto cache_entry = g_texture_cache->Load(i);
          if (!cache_entry)
            continue;
@@ -3189,7 +3360,7 @@ index 2bc6d58..519bad9 100644
          const float custom_tex_scale = cache_entry->GetWidth() / float(cache_entry->native_width);
          samplers[i] = TextureCacheBase::GetSamplerState(
              i, custom_tex_scale, cache_entry->is_custom_tex, cache_entry->has_arbitrary_mips);
-@@ -583,6 +653,8 @@ void VertexManagerBase::Flush()
+@@ -583,6 +658,8 @@ void VertexManagerBase::Flush()
          const auto cache_entry = g_texture_cache->Load(i);
          if (cache_entry)
          {
@@ -3198,7 +3369,7 @@ index 2bc6d58..519bad9 100644
            if (!Common::Contains(texture_names, cache_entry->texture_info_name))
            {
              texture_names.push_back(cache_entry->texture_info_name);
-@@ -596,6 +668,398 @@ void VertexManagerBase::Flush()
+@@ -596,6 +673,399 @@ void VertexManagerBase::Flush()
        }
      }
    }
@@ -3246,7 +3417,8 @@ index 2bc6d58..519bad9 100644
 +      else if (MeasureExtent(VertexLoaderManager::GetCurrentVertexFormat(), &min_x, &max_x, &min_y, &max_y))
 +      {
 +        const auto& decl = VertexLoaderManager::GetCurrentVertexFormat()->GetVertexDeclaration();
-+        const size_t vertex_count = (m_cur_buffer_pointer - m_base_buffer_pointer) / decl.stride;
++        const u8* const start = m_draw_start_pointer ? m_draw_start_pointer : m_base_buffer_pointer;
++        const size_t vertex_count = (m_cur_buffer_pointer - start) / decl.stride;
 +        if (trace_textures)
 +        {
 +          static std::set<std::string> seen_draws;
@@ -3598,7 +3770,7 @@ index 2bc6d58..519bad9 100644
    if (!bpmem.genMode.zfreeze)
    {
 diff --git a/Source/Core/VideoCommon/VertexManagerBase.h b/Source/Core/VideoCommon/VertexManagerBase.h
-index 715dbee..d8bbbd4 100644
+index 715dbee..b984db1 100644
 --- a/Source/Core/VideoCommon/VertexManagerBase.h
 +++ b/Source/Core/VideoCommon/VertexManagerBase.h
 @@ -20,6 +20,17 @@ class CustomShaderCache;
@@ -3619,7 +3791,7 @@ index 715dbee..d8bbbd4 100644
  class PixelShaderManager;
  class PointerWrap;
  struct PortableVertexDeclaration;
-@@ -192,6 +203,9 @@ protected:
+@@ -192,12 +203,17 @@ protected:
    u32 GetRemainingIndices(OpcodeDecoder::Primitive primitive) const;
  
    void CalculateZSlope(NativeVertexFormat* format);
@@ -3629,6 +3801,14 @@ index 715dbee..d8bbbd4 100644
    void CalculateNormals(NativeVertexFormat* format);
  
    BitSet32 UsedTextures() const;
+ 
+   u8* m_cur_buffer_pointer = nullptr;
+   u8* m_base_buffer_pointer = nullptr;
++  // Beginning of this draw, which may be offset into a shared Vulkan stream.
++  u8* m_draw_start_pointer = nullptr;
+   u8* m_end_buffer_pointer = nullptr;
+ 
+   // Alternative buffers in CPU memory for primitives we are going to discard.
 diff --git a/Source/Core/VideoCommon/VertexShaderManager.cpp b/Source/Core/VideoCommon/VertexShaderManager.cpp
 index 6d69803..b4a6922 100644
 --- a/Source/Core/VideoCommon/VertexShaderManager.cpp
@@ -3823,7 +4003,7 @@ index 7e909a3..acae63b 100644
  add_library(build_pch pch.h pch.cpp)
  
 diff --git a/module-template/CMakeLists.txt b/module-template/CMakeLists.txt
-index dac92e8..d12392c 100644
+index dac92e8..a0c99b4 100644
 --- a/module-template/CMakeLists.txt
 +++ b/module-template/CMakeLists.txt
 @@ -39,16 +39,32 @@ set(MODULE_NAME "g${GAME_ID}_recomp")
@@ -3880,16 +4060,32 @@ index dac92e8..d12392c 100644
    module_export.c
    "${MODULE_TABLES}"
    "${GXRUNTIME_DIR}/src/core/cpu.c"
-@@ -116,6 +141,32 @@ target_include_directories(${MODULE_NAME} PRIVATE
+@@ -116,6 +141,51 @@ target_include_directories(${MODULE_NAME} PRIVATE
    "${CHASSIS_ABI_DIR}"
    "${CMAKE_CURRENT_BINARY_DIR}")
  
 +# Turbulence: the REL's chunks include their own generated.h, so they build as
 +# a separate object library with the REL output first on the include path.
 +if(REL_GENERATED_DIR)
-+  # The REL must be C-backend output; the main executable may be either. Both
-+  # dispatchers share only the CPUState module ABI (module_export.c).
-+  file(GLOB REL_CHUNK_INPUTS CONFIGURE_DEPENDS "${REL_GENERATED_DIR}/chunks/*.c")
++  # Either backend shares the CPUState ABI through its own dispatcher.
++  file(READ "${REL_GENERATED_DIR}/generated.h" REL_HEADER_TEXT)
++  if(REL_HEADER_TEXT MATCHES "DOLRECOMP_BACKEND_LLVM")
++    if(NOT EXISTS "${REL_GENERATED_DIR}/generated.c")
++      message(FATAL_ERROR "REL LLVM object manifest is missing")
++    endif()
++    file(STRINGS "${REL_GENERATED_DIR}/generated.c" REL_OBJECT_LINES REGEX "^// object: ")
++    foreach(REL_OBJECT_LINE IN LISTS REL_OBJECT_LINES)
++      string(REGEX REPLACE "^// object: " "" REL_OBJECT "${REL_OBJECT_LINE}")
++      set(REL_OBJECT_PATH "${REL_GENERATED_DIR}/${REL_OBJECT}")
++      if(NOT EXISTS "${REL_OBJECT_PATH}")
++        message(FATAL_ERROR "REL LLVM object is missing: ${REL_OBJECT_PATH}")
++      endif()
++      list(APPEND REL_CHUNK_INPUTS "${REL_OBJECT_PATH}")
++    endforeach()
++    set_source_files_properties(${REL_CHUNK_INPUTS} PROPERTIES EXTERNAL_OBJECT TRUE)
++  else()
++    file(GLOB REL_CHUNK_INPUTS CONFIGURE_DEPENDS "${REL_GENERATED_DIR}/chunks/*.c")
++  endif()
 +  if(NOT REL_CHUNK_INPUTS)
 +    message(FATAL_ERROR "REL output has no generated chunks in ${REL_GENERATED_DIR}/chunks")
 +  endif()
@@ -3907,13 +4103,16 @@ index dac92e8..d12392c 100644
 +    "${GXRUNTIME_DIR}/include"
 +    "${CHASSIS_ABI_DIR}")
 +  target_sources(${MODULE_NAME} PRIVATE $<TARGET_OBJECTS:${MODULE_NAME}_rel>)
++  if(REL_HEADER_TEXT MATCHES "DOLRECOMP_BACKEND_LLVM")
++    target_sources(${MODULE_NAME} PRIVATE ${REL_CHUNK_INPUTS})
++  endif()
 +  target_compile_definitions(${MODULE_NAME} PRIVATE MODULE_HAVE_REL=1)
 +endif()
 +
  if(NOT WIN32)
    target_link_libraries(${MODULE_NAME} PRIVATE m)
  endif()
-@@ -159,11 +210,19 @@ if(RECOMPCORE_MODULE_ENABLE_IPO AND CMAKE_C_COMPILER_ID MATCHES "Clang")
+@@ -159,11 +229,19 @@ if(RECOMPCORE_MODULE_ENABLE_IPO AND CMAKE_C_COMPILER_ID MATCHES "Clang")
    endif()
  endif()
  
@@ -3935,7 +4134,7 @@ index dac92e8..d12392c 100644
    endif()
  elseif(CMAKE_C_COMPILER_ID MATCHES "Clang")
    target_compile_options(${MODULE_NAME} PRIVATE
-@@ -172,3 +231,14 @@ elseif(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+@@ -172,3 +250,14 @@ elseif(CMAKE_C_COMPILER_ID STREQUAL "GNU")
    target_compile_options(${MODULE_NAME} PRIVATE
      -O${RECOMPCORE_MODULE_OPT_LEVEL} -ffp-contract=off -fno-fast-math)
  endif()

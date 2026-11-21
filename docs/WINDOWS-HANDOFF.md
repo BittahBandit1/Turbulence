@@ -108,3 +108,49 @@ fallback/hook_fb counts on Windows. Start with:
   thread pacing uses sleeps), thread priority/affinity code in
   moderngekko_run.cpp (_WIN32 blocks), and Dolphin's D3D11 EFB access or
   bounding-box paths (character select may read back the EFB).
+
+## Resolved (Nov 12, 2026): locked 60 at character select
+
+Measured on the Ryzen 7 8845HS / Radeon 780M laptop, built natively with
+VS 2022's clang-cl 19 (runtime + module), muted, automation-driven:
+
+| Scene | Before | After |
+| --- | --- | --- |
+| Character select, Vulkan | ~8 fps | 59.8 |
+| Character select, D3D11 | — | 59.9 |
+| Menus (title to Player Entry), D3D11 | — | 59.9 |
+| Intro movie, D3D11 | ~35 | 54-57 |
+
+The Null video backend was as slow as the others, and a sampling profile
+put 85% of the CPU-GPU thread in the module, then (on Vulkan) 82% in a
+12-byte memcpy. Two bugs:
+
+1. module_export.c: `host_has_x86_64_v3()` ran CPUID x3 + XGETBV on every
+   dispatch. The MSVC/clang-cl branch had no caching (the GCC/Clang branch
+   did); CPUID serializes and traps to Windows' hypervisor (VBS). Now
+   detected once, and the v2/v3 choice is cached in `selected_dispatch`.
+2. VertexManagerBase::MeasureExtent (2D/widescreen classification) measured
+   from `m_base_buffer_pointer`. On Vulkan that is the start of the whole
+   mapped stream buffer, so each 2D draw re-read up to 4096 stale vertices
+   of earlier draws from uncached GPU memory (and mixed them into the
+   extent). It now measures from `m_draw_start_pointer`, set after each
+   buffer reset. D3D/Metal were unaffected (their base is the draw start).
+
+Also fixed: crash on exit (PlatformWin32 WndProc ran Config::SetCurrent from
+WM_KILLFOCUS after Config shutdown); implot passed GCC `-include` to clang-cl
+(VS's clang-cl 19 rejects it; now /FI whenever MSVC).
+
+New: Options menu "Fullscreen" row (desktop only), saved as [Video] Fullscreen
+in Turbulence.ini and applied at the next launch. Platform::RequestFullscreen
+is applied by each platform's own loop (Win32, macOS, X11, Wayland). Win32
+now really starts fullscreen when MAIN_FULLSCREEN is set (was a TODO) and
+reports it through Host_RendererIsFullscreen; macOS no longer shadows
+Platform::m_window_fullscreen.
+
+Still open: D3D12 starts but never renders; boot takes 35-60 s; the intro
+movie is not fully locked. Native-build notes: the copied tree lacked tracked
+`build/` folders in several Externals (restore with `git ls-files -d`); after
+VS Build Tools updated the Windows SDK, the runtime needed --clean-first
+(C++/WinRT /failifmismatch). scripts/export-patches.py misbehaves on Windows
+(file-mode noise, drops untracked files), so this commit's patch entries were
+spliced in from per-file `git diff HEAD`.
