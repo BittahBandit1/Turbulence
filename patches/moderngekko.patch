@@ -182,7 +182,7 @@ index 0adc855..8f7e888 100644
    bool fullscreen = false;
    bool allow_interpreter = false;
 diff --git a/src/runtime/dolphin_runtime.cpp b/src/runtime/dolphin_runtime.cpp
-index f9b5405..d87f8c1 100644
+index f9b5405..9f319ce 100644
 --- a/src/runtime/dolphin_runtime.cpp
 +++ b/src/runtime/dolphin_runtime.cpp
 @@ -1,8 +1,14 @@
@@ -351,7 +351,7 @@ index f9b5405..d87f8c1 100644
  #ifdef _WIN32
    else
      impl->platform = Platform::CreateWin32Platform();
-@@ -658,6 +740,16 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -658,13 +740,80 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
    impl->platform->SetTitle(impl->title);
  
    Config::SetBase(Config::MAIN_CPU_CORE, SelectCPUCore());
@@ -368,18 +368,18 @@ index f9b5405..d87f8c1 100644
    if (!impl->config.graphics.backend.empty())
      Config::SetBase(Config::MAIN_GFX_BACKEND, impl->config.graphics.backend);
    else if (impl->config.headless)
-@@ -665,6 +757,63 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
-   if (impl->config.graphics.internal_resolution_scale)
-     Config::SetBase(Config::GFX_EFB_SCALE,
-                     *impl->config.graphics.internal_resolution_scale);
-+  else
-+    Config::SetBase(Config::GFX_EFB_SCALE, 2);
+     Config::SetBase(Config::MAIN_GFX_BACKEND, std::string("Null"));
 +  // Turbulence: first-run defaults only. Once the options menu has saved a
 +  // choice to GFX.ini, that choice wins.
 +  const auto saved = [](const auto& info) {
 +    const auto base = Config::GetLayer(Config::LayerType::Base);
 +    return base && base->Exists(info.GetLocation());
 +  };
+   if (impl->config.graphics.internal_resolution_scale)
+     Config::SetBase(Config::GFX_EFB_SCALE,
+                     *impl->config.graphics.internal_resolution_scale);
++  else if (!saved(Config::GFX_EFB_SCALE))
++    Config::SetBase(Config::GFX_EFB_SCALE, 2);
 +  if (!saved(Config::GFX_ASPECT_RATIO))
 +  {
 +    Config::SetBase(Config::GFX_ASPECT_RATIO, AspectMode::ForceWide);

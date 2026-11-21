@@ -396,9 +396,11 @@ struct OptionsMenu::Impl {
     // The frontend applies this setting at boot; keep it in sync with GFX.ini.
     Common::IniFile frontend;
     const auto file = (directory / "config.ini").string();
-    if (!frontend.Load(file)) { save_error = "Could not read settings; change applies this session."; return; }
-    frontend.GetOrCreateSection("Video")->Set("resolution", std::string(scales[scale_index].resolution));
-    if (!frontend.Save(file)) { save_error = "Could not save resolution; change applies this session."; return; }
+    if (std::filesystem::exists(file)) {
+      if (!frontend.Load(file)) { save_error = "Could not read settings; change applies this session."; return; }
+      frontend.GetOrCreateSection("Video")->Set("resolution", std::string(scales[scale_index].resolution));
+      if (!frontend.Save(file)) { save_error = "Could not save resolution; change applies this session."; return; }
+    }
     SaveGraphics([&](Common::IniFile& ini) {
       ini.GetOrCreateSection("Settings")->Set("InternalResolution", scales[scale_index].value);
     });

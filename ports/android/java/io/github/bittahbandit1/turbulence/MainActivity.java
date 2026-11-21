@@ -66,7 +66,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
   if(driverPath!=null){try(InputStream in=new FileInputStream(driverPath)){String result=installDriver(in);android.util.Log.i("Turbulence","Driver install from "+driverPath+": "+result);}catch(Exception e){android.util.Log.e("Turbulence","Driver install failed",e);}}
   pendingDisc=getIntent().getStringExtra("disc");autoPlay=getIntent().getBooleanExtra("autoplay",false);
   home("Preparing runtime files…");busy=true;
-  new Thread(()->{try{copyAssets("Sys",sys);copyAsset("GFX.ini",new File(getFilesDir(),"GFX.ini"));
+  new Thread(()->{try{copyAssets("Sys",sys);applyDeviceDefaults();copyAsset("GFX.ini",new File(getFilesDir(),"GFX.ini"));
    runOnUiThread(()->{busy=false;home("Choose your Sonic Riders USA revision 0 ISO/CISO.");if(pendingDisc!=null){String disc=pendingDisc;pendingDisc=null;importFile(new File(disc));}else if(autoPlay&&ready())play();});
   }catch(Exception error){runOnUiThread(()->{busy=false;home(error.toString());});}},"Turbulence assets").start();
   handler.post(tick);
@@ -92,6 +92,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
   view.addView(driverRow);
   TextView hint=new TextView(this);hint.setText("Use a controller or the on-screen controls.\nThree-finger tap opens options.");hint.setTextColor(Color.LTGRAY);hint.setGravity(Gravity.CENTER);hint.setPadding(0,12,0,0);view.addView(hint);
   setContentView(view);immersive();
+ }
+ private void applyDeviceDefaults() throws IOException {
+  if ("motorola".equalsIgnoreCase(Build.MANUFACTURER) && "avatrn".equals(Build.DEVICE)) {
+   // Sys was freshly copied above. User game settings take precedence.
+   try (FileWriter defaults = new FileWriter(new File(sys, "GameSettings/GXEE8P.ini"), true)) {
+    defaults.write("\n[Core]\nGPUDeterminismMode = fake-completion\n");
+   }
+  }
  }
  private void copyAsset(String name,File destination)throws Exception{destination.getParentFile().mkdirs();try(InputStream input=getAssets().open(name);OutputStream out=new FileOutputStream(destination)){byte[] buffer=new byte[65536];int n;while((n=input.read(buffer))>=0)out.write(buffer,0,n);}}
  private void copyAssets(String path,File destination)throws Exception {String[] children=getAssets().list(path);if(children!=null&&children.length>0){destination.mkdirs();for(String child:children)copyAssets(path+"/"+child,new File(destination,child));}else copyAsset(path,destination);}

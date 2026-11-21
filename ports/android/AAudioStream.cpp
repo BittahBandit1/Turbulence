@@ -16,9 +16,15 @@ class AndroidSound final : public SoundStream {
     auto* samples=static_cast<short*>(output);
     self.m_mixer->Mix(samples,count);
     const float gain=self.volume.load(std::memory_order_relaxed);
-    int peak=0;
-    for(int i=0;i<count*2;++i){samples[i]=static_cast<short>(samples[i]*gain);peak=std::max(peak,std::abs(int(samples[i])));}
-    if(peak&&!self.sound_reported){self.sound_reported=true;__android_log_print(ANDROID_LOG_INFO,"Turbulence","AAudio is rendering non-silent game audio");}
+    if (gain != 1.0f) {
+      for (int i = 0; i < count * 2; ++i)
+        samples[i] = static_cast<short>(samples[i] * gain);
+    }
+    if (!self.sound_reported && std::any_of(samples, samples + count * 2,
+                                             [](short sample) { return sample != 0; })) {
+      self.sound_reported = true;
+      __android_log_print(ANDROID_LOG_INFO,"Turbulence","AAudio is rendering non-silent game audio");
+    }
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
   }
 public:

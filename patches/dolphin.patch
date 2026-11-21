@@ -487,6 +487,21 @@ index ab31424..81be49f 100644
          Crash();                                                                                   \
      }                                                                                              \
    } while (0)
+diff --git a/Source/Core/Common/BlockingLoop.h b/Source/Core/Common/BlockingLoop.h
+index 472a84b..b14435e 100644
+--- a/Source/Core/Common/BlockingLoop.h
++++ b/Source/Core/Common/BlockingLoop.h
+@@ -162,7 +162,9 @@ public:
+       case STATE_DONE:
+         // We're done now. So time to check if we want to sleep or if we want to stay in a busy
+         // loop.
+-        if (m_may_sleep.TestAndClear())
++        // The idle graphics thread normally observes false. Check with a load
++        // before taking ownership of the cache line for a read-modify-write.
++        if (m_may_sleep.IsSet() && m_may_sleep.TestAndClear())
+         {
+           // Try to set the sleeping state.
+           if (m_running_state-- != STATE_DONE)
 diff --git a/Source/Core/Common/CMakeLists.txt b/Source/Core/Common/CMakeLists.txt
 index 807dca3..8ac4bf8 100644
 --- a/Source/Core/Common/CMakeLists.txt
@@ -894,7 +909,7 @@ index 4a79b90..730c1af 100644
  #include <string>
  
 diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
-index e3581cc..5a6a296 100644
+index e3581cc..f61077c 100644
 --- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
 +++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
 @@ -2,6 +2,8 @@
@@ -910,8 +925,8 @@ index e3581cc..5a6a296 100644
  
  bool StaticRecompCore::IsHostCallAddress(u32 address) const
  {
-+  if (TurbulenceNativeMenu::IsAvailable() && m_module && std::strcmp(m_module->game_id,"GXEE8P")==0 &&
-+      TurbulenceNativeMenu::Handles(address)) return true;
++  if (m_is_sonic_riders && TurbulenceNativeMenu::Handles(address) &&
++      TurbulenceNativeMenu::IsAvailable()) return true;
    if (!m_module_source.host_call_contains)
      return false;
    if (m_module_source.host_call_contains(address, m_module_source.host_call_user))
@@ -954,7 +969,31 @@ index e3581cc..5a6a296 100644
    g_static_recomp_core = nullptr;
    std::fprintf(stderr,
                 "[staticrecomp] shutdown: native=%llu fallback=%llu native_exc=%llu hook_fb=%llu "
-@@ -327,7 +341,9 @@ void StaticRecompCore::LoadModule()
+@@ -229,6 +243,7 @@ void StaticRecompCore::Shutdown()
+   m_lockstep_verifier.reset();
+   m_block_cache.Shutdown();
+   m_module = nullptr;
++  m_is_sonic_riders = false;
+   if (m_library.IsOpen())
+     m_library.Close();
+ 
+@@ -269,6 +284,7 @@ void StaticRecompCore::LoadModule()
+   const auto reject = [&](const std::string& why) {
+     ERROR_LOG_FMT(POWERPC, "StaticRecomp: rejecting module '{}': {}. Interpreter-only.", path, why);
+     m_module = nullptr;
++    m_is_sonic_riders = false;
+     if (m_library.IsOpen())
+       m_library.Close();
+   };
+@@ -303,6 +319,7 @@ void StaticRecompCore::LoadModule()
+     return reject(fmt::format("module game_id '{}' != running game '{}'", desc->game_id, game_id));
+ 
+   m_module = desc;
++  m_is_sonic_riders = desc && std::strcmp(desc->game_id, "GXEE8P") == 0;
+   m_module_active = (desc != nullptr);
+   m_has_rel_modules = desc->num_rel_modules != 0;
+   m_chunk_state.assign(desc->num_chunk_ranges, CHUNK_UNVERIFIED);
+@@ -327,7 +344,9 @@ void StaticRecompCore::LoadModule()
      }
    }
    m_active_rel_sections.clear();
@@ -964,7 +1003,7 @@ index e3581cc..5a6a296 100644
    m_failed_chunks = 0;
    m_lookup_ram_size = 0;
    m_lookup_exram_size = 0;
-@@ -356,6 +372,7 @@ void StaticRecompCore::ClearCache()
+@@ -356,6 +375,7 @@ void StaticRecompCore::ClearCache()
    if (!m_module)
      return;
    std::fill(m_chunk_state.begin(), m_chunk_state.end(), u8{CHUNK_UNVERIFIED});
@@ -973,7 +1012,7 @@ index e3581cc..5a6a296 100644
    ++m_reverify_events;
  }
 diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
-index d084fea..70fb2a2 100644
+index d084fea..6e5eb38 100644
 --- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
 +++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
 @@ -3,6 +3,8 @@
@@ -994,7 +1033,15 @@ index d084fea..70fb2a2 100644
    bool ChunkContainsHostCall(u32 index) const;
    void VerifyChunk(u32 index);
    bool ResolveNativeAddress(u32 runtime_address, u32* linked_address, u32* rel_section_index);
-@@ -191,9 +193,17 @@ private:
+@@ -165,6 +167,7 @@ private:
+   StaticRecompModuleSource m_module_source;
+   const StaticRecompModuleDesc* m_module = nullptr;
+   bool m_module_active = false;
++  bool m_is_sonic_riders = false;
+   u32 m_host_call_passthrough_pc = 0;
+   bool m_host_call_passthrough = false;
+   std::unique_ptr<JitBase> m_fallback_jit;
+@@ -191,9 +194,17 @@ private:
      u32 size;
    };
    std::vector<ActiveRelSection> m_active_rel_sections;
@@ -1012,7 +1059,7 @@ index d084fea..70fb2a2 100644
    u32 m_failed_chunks = 0;    // chunks currently failing verification (real SMC)
    u64 m_verifications = 0;    // chunk hash checks performed
    u64 m_reverify_events = 0;  // invalidations that reset a chunk to Unverified
-@@ -212,6 +222,7 @@ private:
+@@ -212,6 +223,7 @@ private:
    bool m_collect_dispatch_samples = false;
    bool m_has_rel_modules = false;
    u32 m_idle_pc = 0;
@@ -1021,7 +1068,7 @@ index d084fea..70fb2a2 100644
  
  extern StaticRecompCore* g_static_recomp_core;
 diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
-index 7b3d845..e534ac3 100644
+index 7b3d845..e9025c1 100644
 --- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
 +++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
 @@ -3,7 +3,10 @@
@@ -1044,20 +1091,20 @@ index 7b3d845..e534ac3 100644
 +    // LLVM-backend native region entry: blocked only if a mod intercepts an
 +    // address inside [external_addr, external_value).
 +    cpu->external_rid = PPC_NATIVE_REGION_QUERY_HANDLED;
-+    return (TurbulenceNativeMenu::IsAvailable() && core->m_module && std::strcmp(core->m_module->game_id,"GXEE8P")==0 &&
-+            TurbulenceNativeMenu::HandlesRange(cpu->external_addr,cpu->external_value)) ||
++    return (core->m_is_sonic_riders && TurbulenceNativeMenu::HandlesRange(cpu->external_addr, cpu->external_value) &&
++            TurbulenceNativeMenu::IsAvailable()) ||
 +           (core->m_module_source.host_call_range_contains &&
 +            core->m_module_source.host_call_range_contains(
 +               cpu->external_addr, cpu->external_value, core->m_module_source.host_call_user));
 +  }
-+  if (TurbulenceNativeMenu::IsAvailable() && core->m_module && std::strcmp(core->m_module->game_id,"GXEE8P")==0 &&
-+      TurbulenceNativeMenu::Handles(address) &&
++  if (core->m_is_sonic_riders && TurbulenceNativeMenu::Handles(address) &&
++      TurbulenceNativeMenu::IsAvailable() &&
 +      TurbulenceNativeMenu::BeforeDispatch(*cpu,core->m_system.GetMemory(),address)) return true;
    return core->m_module_source.host_call &&
           core->m_module_source.host_call(cpu, address, core->m_module_source.host_call_user);
  }
 diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
-index d91ec2d..d68de4c 100644
+index d91ec2d..3e1c76d 100644
 --- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
 +++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
 @@ -2,6 +2,17 @@
@@ -1110,7 +1157,7 @@ index d91ec2d..d68de4c 100644
 +    // No per-dispatch host hook during racing. The original front-end task
 +    // owns this slot while menus are active; its callback is an identity check.
 +    const auto* menu_task=memory.GetPointerForRange(0x803d9048,4);
-+    const bool native_menu=TurbulenceNativeMenu::IsAvailable() && m_module && std::strcmp(m_module->game_id,"GXEE8P")==0 &&
++    const bool native_menu=m_is_sonic_riders && TurbulenceNativeMenu::IsAvailable() &&
 +      menu_task && Common::swap32(menu_task)==0x8050edb8;
 +    m_guest.host_call=(m_module_source.host_call || native_menu)?HookHostCall:nullptr;
 +
@@ -1182,7 +1229,7 @@ index d91ec2d..d68de4c 100644
  
            // ctx->timebase is refreshed at burst start (SyncIn), and here we
 diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
-index 491c57e..003d267 100644
+index 491c57e..b96afb8 100644
 --- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
 +++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
 @@ -8,6 +8,8 @@
@@ -1284,7 +1331,7 @@ index 491c57e..003d267 100644
 -bool StaticRecompCore::IsForcedFallbackAddress(u32 address) const
 +bool StaticRecompCore::IsForcedFallbackAddress(u32 address)
  {
-+  if (m_guest.host_call && TurbulenceNativeMenu::IsAvailable() && m_module && std::strcmp(m_module->game_id,"GXEE8P")==0) {
++  if (m_guest.host_call && m_is_sonic_riders && TurbulenceNativeMenu::IsAvailable()) {
 +    const int index=ChunkIndexOf(address);
 +    if(index>=0) {
 +      const auto& chunk=m_module->chunk_ranges[index];
@@ -1322,14 +1369,18 @@ index 491c57e..003d267 100644
    {
      for (u32 address = chunk.start; address < chunk.end; address += 4)
      {
-@@ -339,6 +380,7 @@ void StaticRecompCore::OnICacheInvalidate(u32 address, u32 length)
+@@ -339,8 +380,10 @@ void StaticRecompCore::OnICacheInvalidate(u32 address, u32 length)
  
    if (!m_module_active || length == 0)
      return;
 +  m_rel_scan_dirty = true;
    u32 linked_address = address;
-   ResolveNativeAddress(address, &linked_address, nullptr);
+-  ResolveNativeAddress(address, &linked_address, nullptr);
++  if (!m_rel_addresses_match)
++    ResolveNativeAddress(address, &linked_address, nullptr);
    address = linked_address;
+   const u32 last = address + (length - 1u);
+ 
 diff --git a/Source/Core/DolphinNoGUI/PlatformMacos.mm b/Source/Core/DolphinNoGUI/PlatformMacos.mm
 index e942282..e1094e6 100644
 --- a/Source/Core/DolphinNoGUI/PlatformMacos.mm
@@ -4624,12 +4675,14 @@ index 0000000..ecf456d
 +}
 diff --git a/Source/Core/VideoCommon/TurbulenceNativeMenu.h b/Source/Core/VideoCommon/TurbulenceNativeMenu.h
 new file mode 100644
-index 0000000..e021a68
+index 0000000..46df9da
 --- /dev/null
 +++ b/Source/Core/VideoCommon/TurbulenceNativeMenu.h
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,188 @@
 +#pragma once
++#include <algorithm>
 +#include <atomic>
++#include <iterator>
 +#include <cstring>
 +#include <cstdlib>
 +#include "Common/Swap.h"
@@ -4642,11 +4695,14 @@ index 0000000..e021a68
 +}
 +inline std::atomic<bool> options_visible{false};
 +constexpr unsigned HookAddresses[]={0x804f3d38,0x804f41f8,0x8050edb8,0x8050f8bc,0x80511f1c,0x805135b0,0x80511824,0x80585aa4,0x80511790,0x805134a4,0x804f43b8};
++constexpr auto HookBounds = std::minmax_element(std::begin(HookAddresses), std::end(HookAddresses));
 +inline bool Handles(unsigned address) {
++  if (address < *HookBounds.first || address > *HookBounds.second) return false;
 +  for(auto pc:HookAddresses) if(pc==address) return true;
 +  return false;
 +}
 +inline bool HandlesRange(unsigned start,unsigned end) {
++  if (end <= *HookBounds.first || start > *HookBounds.second) return false;
 +  for(auto pc:HookAddresses) if(pc>=start && pc<end) return true;
 +  return false;
 +}
