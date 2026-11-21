@@ -3230,7 +3230,7 @@ index 98eb651..41e7102 100644
  
    if (loader_type == VertexLoaderType::Software)
 diff --git a/Source/Core/VideoCommon/VertexManagerBase.cpp b/Source/Core/VideoCommon/VertexManagerBase.cpp
-index 2bc6d58..c09fb5d 100644
+index 2bc6d58..6b2a2af 100644
 --- a/Source/Core/VideoCommon/VertexManagerBase.cpp
 +++ b/Source/Core/VideoCommon/VertexManagerBase.cpp
 @@ -2,9 +2,16 @@
@@ -3369,7 +3369,7 @@ index 2bc6d58..c09fb5d 100644
            if (!Common::Contains(texture_names, cache_entry->texture_info_name))
            {
              texture_names.push_back(cache_entry->texture_info_name);
-@@ -596,6 +673,399 @@ void VertexManagerBase::Flush()
+@@ -596,6 +673,400 @@ void VertexManagerBase::Flush()
        }
      }
    }
@@ -3442,6 +3442,7 @@ index 2bc6d58..c09fb5d 100644
 +      draw.mode = TurbulenceDraw2D::AspectLockedArt;
 +    g_turbulence_draw_2d = draw;
 +  }
++  u8* const draw_start = m_draw_start_pointer ? m_draw_start_pointer : m_base_buffer_pointer;
 +  // The guest projects each rider into the widened camera before drawing
 +  // the COM arrow. Preserve that screen position when centering the HUD.
 +  if (draw_textures[0] && draw_textures[0]->turbulence_rider_marker_atlas &&
@@ -3458,7 +3459,7 @@ index 2bc6d58..c09fb5d 100644
 +        w > 0 && h > 0 && (w != 1 || h != 1))
 +    {
 +      const auto& raw = xfmem.projection.rawProjection;
-+      const size_t count = (m_cur_buffer_pointer - m_base_buffer_pointer) / decl.stride;
++      const size_t count = (m_cur_buffer_pointer - draw_start) / decl.stride;
 +      for (size_t first = 0; first + 4 <= count; first += 4)
 +      {
 +        float positions[4][3]{};
@@ -3467,7 +3468,7 @@ index 2bc6d58..c09fb5d 100644
 +        bool marker = true;
 +        for (size_t i = 0; i < 4; ++i)
 +        {
-+          const auto* vertex = m_base_buffer_pointer + (first + i) * decl.stride;
++          const auto* vertex = draw_start + (first + i) * decl.stride;
 +          float st[2];
 +          std::memcpy(st, vertex + uv.offset, sizeof(st));
 +          // Exact authored COM cell, excluding portraits and minimap icons.
@@ -3505,7 +3506,7 @@ index 2bc6d58..c09fb5d 100644
 +        if (marker)
 +        {
 +          for (size_t i = 0; i < 4; ++i)
-+            std::memcpy(m_base_buffer_pointer + (first + i) * decl.stride + decl.position.offset,
++            std::memcpy(draw_start + (first + i) * decl.stride + decl.position.offset,
 +                        positions[i], 2 * sizeof(float));
 +        }
 +      }
@@ -3532,7 +3533,7 @@ index 2bc6d58..c09fb5d 100644
 +    auto* format=VertexLoaderManager::GetCurrentVertexFormat();
 +    const auto& decl=format->GetVertexDeclaration();
 +    float left,right,bottom,top;
-+    const size_t count=decl.stride?(m_cur_buffer_pointer-m_base_buffer_pointer)/decl.stride:0;
++    const size_t count=decl.stride?(m_cur_buffer_pointer-draw_start)/decl.stride:0;
 +    const auto& uv=decl.texcoords[0];
 +    if (count==4 && uv.enable && uv.type==ComponentFormat::Float && uv.components>=2 &&
 +        MeasureExtent(format,&left,&right,&bottom,&top) && bottom>-.18f && bottom<-.14f &&
@@ -3540,7 +3541,7 @@ index 2bc6d58..c09fb5d 100644
 +        GetRemainingIndices(Primitive::GX_DRAW_QUADS)>=4 &&
 +        m_index_generator.GetRemainingIndices(Primitive::GX_DRAW_QUADS)>=4)
 +    {
-+      std::vector<u8> original(m_base_buffer_pointer,m_cur_buffer_pointer);
++      std::vector<u8> original(draw_start,m_cur_buffer_pointer);
 +      float st[4][2],xy[4][2],p[4][3]{};const float* matrices[4];
 +      const auto& raw=xfmem.projection.rawProjection;
 +      float min_u=1e9f,max_u=-1e9f,min_v=1e9f,max_v=-1e9f;
@@ -3559,7 +3560,7 @@ index 2bc6d58..c09fb5d 100644
 +      if(unit>0 && max_u>min_u) {
 +        const float ratio=88.f*unit/(max_u-min_u);
 +        for(int i=0;i<4;++i) {
-+          u8* v=m_base_buffer_pointer+i*decl.stride;
++          u8* v=draw_start+i*decl.stride;
 +          float out[3];std::memcpy(out,p[i],sizeof(out));
 +          TurbulenceViewport::SetClipX(out,matrices[i],raw.data(),left+(xy[i][0]-left)*ratio);
 +          std::memcpy(v+decl.position.offset,out,sizeof(float)*2);
@@ -3610,7 +3611,7 @@ index 2bc6d58..c09fb5d 100644
 +    auto* format = VertexLoaderManager::GetCurrentVertexFormat();
 +    const auto& decl = format->GetVertexDeclaration();
 +    const auto& raw = xfmem.projection.rawProjection;
-+    const size_t count = decl.stride ? (m_cur_buffer_pointer-m_base_buffer_pointer)/decl.stride : 0;
++    const size_t count = decl.stride ? (m_cur_buffer_pointer-draw_start)/decl.stride : 0;
 +    if(count == 4 && decl.position.enable && decl.position.type == ComponentFormat::Float &&
 +       decl.position.components >= 2 && m_index_generator.GetNumVerts() == 4)
 +    {
@@ -3624,7 +3625,7 @@ index 2bc6d58..c09fb5d 100644
 +      float left=2,right=-2;
 +      for(int i=0;i<4;++i)
 +      {
-+        float p[3];const float* m;point(m_base_buffer_pointer+i*decl.stride,p,&m);
++        float p[3];const float* m;point(draw_start+i*decl.stride,p,&m);
 +        positions[i][0]=raw[0]*(p[0]*m[0]+p[1]*m[1]+p[2]*m[2]+m[3])+raw[1];
 +        positions[i][1]=raw[2]*(p[0]*m[4]+p[1]*m[5]+p[2]*m[6]+m[7])+raw[3];
 +        left=std::min(left,positions[i][0]);right=std::max(right,positions[i][0]);
@@ -3663,7 +3664,7 @@ index 2bc6d58..c09fb5d 100644
 +        for(int i=0;i<4;++i)
 +        {
 +          u8* v=m_cur_buffer_pointer+i*decl.stride;
-+          std::memcpy(v,m_base_buffer_pointer+sources[i]*decl.stride,decl.stride);
++          std::memcpy(v,draw_start+sources[i]*decl.stride,decl.stride);
 +          // Sample just inside the edge: atlas boundary texels can be transparent.
 +          // Only the added strip uses this column; authored artwork stays intact.
 +          for (const auto& uv : decl.texcoords)
@@ -3678,7 +3679,7 @@ index 2bc6d58..c09fb5d 100644
 +            {
 +              float edge_uv[2], inside_uv[2];
 +              std::memcpy(edge_uv, v+uv.offset, sizeof(edge_uv));
-+              std::memcpy(inside_uv, m_base_buffer_pointer+opposite*decl.stride+uv.offset,
++              std::memcpy(inside_uv, draw_start+opposite*decl.stride+uv.offset,
 +                          sizeof(inside_uv));
 +              for (int k = 0; k < 2; ++k)
 +                edge_uv[k] += .02f*(inside_uv[k]-edge_uv[k]);
@@ -3710,7 +3711,7 @@ index 2bc6d58..c09fb5d 100644
 +    auto* format = VertexLoaderManager::GetCurrentVertexFormat();
 +    const auto& decl = format->GetVertexDeclaration();
 +    float left, right, top, bottom;
-+    const size_t count = decl.stride ? (m_cur_buffer_pointer-m_base_buffer_pointer)/decl.stride : 0;
++    const size_t count = decl.stride ? (m_cur_buffer_pointer-draw_start)/decl.stride : 0;
 +    if (decl.position.components >= 2 && MeasureExtent(format, &left, &right, &top, &bottom) &&
 +        TurbulenceViewport::IsMenuScanlineQuad(left, right, top, bottom, static_cast<u32>(count)))
 +    {
@@ -3718,7 +3719,7 @@ index 2bc6d58..c09fb5d 100644
 +      const float edge = 1.0f/g_ActiveConfig.fAspectRatioHackW;
 +      for (size_t i=0; i<count; ++i)
 +      {
-+        u8* vertex = m_base_buffer_pointer+i*decl.stride;
++        u8* vertex = draw_start+i*decl.stride;
 +        float p[3]{};
 +        std::memcpy(p,vertex+decl.position.offset,sizeof(float)*std::min(decl.position.components,3));
 +        const u32 index = decl.posmtx.enable ? vertex[decl.posmtx.offset] :
@@ -3747,10 +3748,10 @@ index 2bc6d58..c09fb5d 100644
 +    if (decl.position.enable && decl.position.type == ComponentFormat::Float &&
 +        decl.position.components >= 2 && decl.stride)
 +    {
-+      const size_t count = (m_cur_buffer_pointer - m_base_buffer_pointer) / decl.stride;
++      const size_t count = (m_cur_buffer_pointer - draw_start) / decl.stride;
 +      for (size_t i = 0; i < count; ++i)
 +      {
-+        u8* vertex = m_base_buffer_pointer + i * decl.stride;
++        u8* vertex = draw_start + i * decl.stride;
 +        float p[3]{};
 +        std::memcpy(p, vertex + decl.position.offset,
 +                    sizeof(float) * std::min(decl.position.components, 3));
