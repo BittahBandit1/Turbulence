@@ -587,7 +587,7 @@ index 3b18d05..71ef24e 100644
    std::vector<std::string> controllers;
    bool show_fps_in_title = true;
 diff --git a/tools/moderngekko_port.cpp b/tools/moderngekko_port.cpp
-index af1c2a5..8ceba9c 100644
+index af1c2a5..816c317 100644
 --- a/tools/moderngekko_port.cpp
 +++ b/tools/moderngekko_port.cpp
 @@ -670,6 +670,27 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
@@ -650,7 +650,7 @@ index af1c2a5..8ceba9c 100644
 +    const fs::path rel_parent = generated_parent / "rel";
 +    const std::string generate_rel = Quote(dolrecomp) + " -j" +
 +        std::to_string(std::max(1u, std::thread::hardware_concurrency())) +
-+        " --backend=c --cpu gekko --gamecube --rel-base " + rel_base + " " +
++        " --backend=" + options.backend + " --cpu gekko --gamecube --rel-base " + rel_base + " " +
 +        Quote(game.main_rel) + " " + Quote(rel_parent);
 +    std::cout << "recompiling " << game.main_rel << " at " << rel_base
 +              << (rel_bss.empty() ? std::string() : " (bss " + rel_bss + ")") << '\n';

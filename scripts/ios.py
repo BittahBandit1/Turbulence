@@ -15,7 +15,7 @@ import subprocess
 import struct
 import sys
 import zipfile
-from mobile_common import generated_sources, llvm_main
+from mobile_common import generated_sources, llvm_main, llvm_rel
 
 ROOT = Path(__file__).resolve().parent.parent
 CACHE = ROOT / "build/ios-module-cache"
@@ -86,6 +86,7 @@ def main():
         args.generated, args.rel_generated = generated_sources(ROOT, args.generated, args.rel_generated)
         if not args.c_backend and not args.simulator:
             args.generated = llvm_main(ROOT, args.generated, 'arm64-apple-ios15.0', 'ios')
+            args.rel_generated = llvm_rel(ROOT, args.rel_generated, 'arm64-apple-ios15.0', 'ios')
     if args.ipa and (args.target not in ('import-app', 'gameplay-app') or args.simulator or args.team):
         parser.error('--ipa requires an unsigned device app build (no --simulator or --team)')
     if args.target == 'gameplay-app':

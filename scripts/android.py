@@ -3,7 +3,7 @@
 import argparse
 from pathlib import Path
 import os,shutil,subprocess,zipfile
-from mobile_common import generated_sources, llvm_main
+from mobile_common import generated_sources, llvm_main, llvm_rel
 ROOT=Path(__file__).resolve().parents[1]
 # libadrenotools hook libraries: loaded from the APK's native library directory
 # when a custom GPU driver (e.g. Mesa Turnip) is selected.
@@ -25,7 +25,7 @@ def main():
  env=dict(os.environ,JAVA_HOME=str(java))
  if not args.package_only:
   args.generated,args.rel_generated=generated_sources(ROOT,args.generated,args.rel_generated)
-  if not args.c_backend:args.generated=llvm_main(ROOT,args.generated,'aarch64-unknown-linux-android26','android')
+  if not args.c_backend:args.generated=llvm_main(ROOT,args.generated,'aarch64-unknown-linux-android26','android');args.rel_generated=llvm_rel(ROOT,args.rel_generated,'aarch64-unknown-linux-android26','android')
   run('cmake','-S',ROOT/'ports/android','-B',build,'-G','Ninja',
       '-DCMAKE_TOOLCHAIN_FILE='+str(ndk/'build/cmake/android.toolchain.cmake'),
       '-DANDROID_ABI=arm64-v8a','-DANDROID_PLATFORM=android-26','-DCMAKE_BUILD_TYPE=Release',
