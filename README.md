@@ -179,6 +179,12 @@ Android and iOS hosts are adapted from the Crazy Taxi ReFare project (GPL-3.0; s
 *Sonic Riders* and all related artwork are © SEGA. No disc images, extracted game
 data, or keys are included.
 
+## Contributors
+
+- **BittahBandit1** — project author and maintainer
+- **Claude** (Anthropic) — development
+- **DeepSeek** — development
+
 ## Acknowledgments
 
 - [DolRecomp](https://github.com/ExpansionPak/DolRecomp) and
