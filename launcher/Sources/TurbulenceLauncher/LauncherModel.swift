@@ -186,7 +186,11 @@ final class LauncherModel: ObservableObject {
                    FileManager.default.fileExists(atPath: makefile.path) {
                     return d
                 }
-                dir = d.deletingLastPathComponent()
+                let parent = d.deletingLastPathComponent()
+                if parent.path == d.path {
+                    break  // reached the filesystem root
+                }
+                dir = parent
             }
         }
         return nil
