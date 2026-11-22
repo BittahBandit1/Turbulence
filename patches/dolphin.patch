@@ -2614,10 +2614,10 @@ index 451109b..cd89b2c 100644
  
    // Check for font changes
 diff --git a/Source/Core/VideoCommon/Present.cpp b/Source/Core/VideoCommon/Present.cpp
-index 7c62730..51925c7 100644
+index 7c62730..cb33e39 100644
 --- a/Source/Core/VideoCommon/Present.cpp
 +++ b/Source/Core/VideoCommon/Present.cpp
-@@ -2,6 +2,11 @@
+@@ -2,8 +2,14 @@
  // SPDX-License-Identifier: GPL-2.0-or-later
  
  #include "VideoCommon/Present.h"
@@ -2628,8 +2628,26 @@ index 7c62730..51925c7 100644
 +#include "VideoCommon/TurbulenceViewport.h"
  
  #include "Common/ChunkFile.h"
++#include "Core/Config/ConfigManager.h"
  #include "Core/Config/GraphicsSettings.h"
-@@ -738,6 +743,8 @@ void Presenter::UpdateDrawRectangle()
+ #include "Core/Config/MainSettings.h"
+ #include "Core/CoreTiming.h"
+@@ -493,7 +499,13 @@ float Presenter::CalculateDrawAspectRatio(bool allow_stretch) const
+   {
+     // The actual aspect ratio of the XFB texture is irrelevant, the VI one is the one that matters
+     const auto& vi = Core::System::GetInstance().GetVideoInterface();
+-    const float vi_aspect_ratio = vi.GetAspectRatio();
++    float vi_aspect_ratio = vi.GetAspectRatio();
++    // Sonic Riders (GXEE8P) renders internally at 584x480 and relies on the
++    // VI's horizontal scaling to stretch it to the standard 640-wide 4:3
++    // frame. Dolphin's VI model reports the narrow 584-sample active area, so
++    // scale it back up to 640 (80/73) to recover the correct 4:3 aspect.
++    if (SConfig::GetInstance().GetGameID() == "GXEE8P")
++      vi_aspect_ratio *= 640.0f / 584.0f;
+     const float source_aspect_ratio = AdjustAspectRatioForCustomCrop(vi_aspect_ratio);
+ 
+     // This will scale up the source ~4:3 resolution to its equivalent ~16:9 resolution
+@@ -738,6 +750,8 @@ void Presenter::UpdateDrawRectangle()
      g_Config.fAspectRatioHackH = 1;
    }
  
@@ -2638,7 +2656,7 @@ index 7c62730..51925c7 100644
    // The rendering window size
    const float win_width = static_cast<float>(m_backbuffer_width);
    const float win_height = static_cast<float>(m_backbuffer_height);
-@@ -871,6 +878,17 @@ void Presenter::RenderXFBToScreen(const MathUtil::Rectangle<int>& target_rc,
+@@ -871,6 +885,17 @@ void Presenter::RenderXFBToScreen(const MathUtil::Rectangle<int>& target_rc,
                                    const AbstractTexture* source_texture,
                                    const MathUtil::Rectangle<int>& source_rc)
  {
@@ -2656,7 +2674,7 @@ index 7c62730..51925c7 100644
    if (g_ActiveConfig.stereo_mode == StereoMode::QuadBuffer &&
        g_backend_info.bUsesExplictQuadBuffering)
    {
-@@ -901,11 +919,14 @@ void Presenter::RenderXFBToScreen(const MathUtil::Rectangle<int>& target_rc,
+@@ -901,11 +926,14 @@ void Presenter::RenderXFBToScreen(const MathUtil::Rectangle<int>& target_rc,
  
  void Presenter::Present(PresentInfo* present_info)
  {
@@ -2672,7 +2690,7 @@ index 7c62730..51925c7 100644
    if (!g_gfx->SupportsUtilityDrawing())
    {
      // Video Software doesn't support drawing a UI or doing post-processing
-@@ -958,6 +979,14 @@ void Presenter::Present(PresentInfo* present_info)
+@@ -958,6 +986,14 @@ void Presenter::Present(PresentInfo* present_info)
      {
        const auto present_time = GetUpdatedPresentationTime(present_info->intended_present_time);
  
