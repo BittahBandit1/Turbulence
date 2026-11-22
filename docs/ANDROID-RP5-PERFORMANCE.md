@@ -12,8 +12,8 @@ thermal endurance benchmark.
 
 ## Changes
 
-- Restored the current-draw vertex pointer already described in the project's
-  Windows handoff and dolphin.patch. Vulkan's base pointer describes the entire
+- Restored the current-draw vertex pointer already described in dolphin.patch.
+  Vulkan's base pointer describes the entire
   stream buffer, not the pending draw. Measuring the old base repeatedly scanned
   stale vertices in slow mapped GPU memory and misclassified backgrounds.
 - Reject batches other than four-vertex quads before reading vertex positions.
