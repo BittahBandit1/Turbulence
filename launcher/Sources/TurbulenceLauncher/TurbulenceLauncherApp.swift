@@ -2,13 +2,13 @@ import SwiftUI
 
 @main
 struct TurbulenceLauncherApp: App {
-    @StateObject private var model = LauncherModel()
+  @StateObject private var model = LauncherModel()
 
-    var body: some Scene {
-        WindowGroup {
-            ContentView()
-                .environmentObject(model)
-        }
-        .windowResizability(.contentSize)
+  var body: some Scene {
+    WindowGroup("Turbulence") {
+      ContentView().environmentObject(model)
     }
+    .windowResizability(.contentSize)
+    .commands { CommandGroup(replacing: .newItem) {} }
+  }
 }
