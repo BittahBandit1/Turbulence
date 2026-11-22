@@ -92,11 +92,9 @@ freedesktop 25.08 runtime from Flathub), put the extracted game in
 
 ## Verification
 
-Tests: tests/android_import_test.py, tests/ios_import_test.swift,
-tests/mobile_touch_test.swift, and tests/mobile_build_test.py. The importer
-checks run with synthetic images and do not need a game disc. Physical-device
-playback and thermal/frame-pacing behavior must be checked separately from
-successful cross-compilation and package validation.
+The mobile importers are validated with synthetic images and do not need a game
+disc. Physical-device playback and thermal/frame-pacing behavior must be checked
+separately from successful cross-compilation and package validation.
 
 The iOS Metal HUD includes the device's live thermal state, including Nominal
 while cool. Its metric list is configured before the first Metal device is

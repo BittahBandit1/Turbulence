@@ -54,10 +54,9 @@ aliases are covered by full 25px copies. GameCube mode bypasses replacements.
 ## Validation (2026-11-17)
 
 - macOS runtime rebuilt successfully.
-- Address/undefined sanitizer tests: `tests/prompt-artwork.cpp` and
-  `tests/trigger-caption.cpp` pass. These check golden Xbox pixel digests,
-  complete cell coverage, transparent rims, smaller shake cells, unchanged
-  neighbours, original PlayStation L/R lettering and Boost B/Circle routing.
+- Address/undefined sanitizer checks pass: golden Xbox pixel digests, complete
+  cell coverage, transparent rims, smaller shake cells, unchanged neighbours,
+  original PlayStation L/R lettering and Boost B/Circle routing.
 - Extraction from the Xbox XISO reproduces the generated header byte for byte.
 - Live Metal races: Xbox Boost B, PlayStation Boost Circle and the patched shake atlases were captured
   in build/prompt-artwork-test. No GPU or static-code verification errors were
