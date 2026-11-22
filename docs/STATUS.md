@@ -144,7 +144,7 @@ side bars in `build/codex-intro-fixed-auto/intro-fixed.png`.
 
 ## Frame pacing follow-up (2026-11-04)
 
-Working sources recovered from `/Users/piestudios/.gemini/users/user1/Turbulence`
+Working sources recovered from `~/.gemini/users/user1/Turbulence`
 (parent revision `0ecf0d4`), including the existing uncommitted runtime and
 pacing-report changes. The older working copy and play folder were left intact.
 
@@ -357,8 +357,7 @@ so callback scheduling delays cannot introduce artificial interval jitter.
 
 ## RP Nova Android handoff — 2026-11-08
 
-Installed the debug-signed Android APK on Retroid Pocket Nova (ADB serial
-28c0cb0f), Android 13/API 33, QCS8550, landscape 1280x960. The fresh install
+Installed the debug-signed Android APK on a Retroid Pocket Nova, Android 13/API 33, QCS8550, landscape 1280x960. The fresh install
 opened successfully. Reconstructed a private test ISO from the existing
 extracted USA revision 0 assets and exercised the on-device importer: 1669
 files imported and verified. Imported assets remain in the app sandbox.

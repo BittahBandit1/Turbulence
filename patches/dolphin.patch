@@ -2700,10 +2700,10 @@ index 91ba870..3eecaa6 100644
    // Can be used for presentation of ImmediateXFB swaps which don't have timing information.
    u64 m_next_swap_estimated_ticks = 0;
 diff --git a/Source/Core/VideoCommon/TextureCacheBase.cpp b/Source/Core/VideoCommon/TextureCacheBase.cpp
-index c5d6096..14a5bb9 100644
+index c5d6096..49d91c2 100644
 --- a/Source/Core/VideoCommon/TextureCacheBase.cpp
 +++ b/Source/Core/VideoCommon/TextureCacheBase.cpp
-@@ -7,6 +7,7 @@
+@@ -7,12 +7,15 @@
  #include <chrono>
  #include <cmath>
  #include <cstring>
@@ -2711,7 +2711,15 @@ index c5d6096..14a5bb9 100644
  #include <memory>
  #include <string>
  #include <utility>
-@@ -47,6 +48,8 @@
+ #include <vector>
+ #if defined(_M_X86_64)
+ #include <pmmintrin.h>
++#elif defined(__aarch64__)
++#include <arm_neon.h>
+ #endif
+ 
+ #include <fmt/format.h>
+@@ -47,6 +50,8 @@
  #include "VideoCommon/OpcodeDecoding.h"
  #include "VideoCommon/PixelShaderManager.h"
  #include "VideoCommon/Present.h"
@@ -2720,7 +2728,7 @@ index c5d6096..14a5bb9 100644
  #include "VideoCommon/Resources/CustomResourceManager.h"
  #include "VideoCommon/ShaderCache.h"
  #include "VideoCommon/Statistics.h"
-@@ -57,6 +60,7 @@
+@@ -57,6 +62,7 @@
  #include "VideoCommon/VertexManagerBase.h"
  #include "VideoCommon/VideoCommon.h"
  #include "VideoCommon/VideoConfig.h"
@@ -2728,7 +2736,7 @@ index c5d6096..14a5bb9 100644
  
  static const u64 TEXHASH_INVALID = 0;
  // Sonic the Fighters (inside Sonic Gems Collection) loops a 64 frames animation
-@@ -1233,6 +1237,41 @@ private:
+@@ -1233,6 +1239,41 @@ private:
  
  TCacheEntry* TextureCacheBase::Load(u32 stage)
  {
@@ -2770,7 +2778,7 @@ index c5d6096..14a5bb9 100644
    if (auto entry = LoadImpl(stage, false))
    {
      if (!DidLinkedAssetsChange(*entry))
-@@ -1262,14 +1301,15 @@ TCacheEntry* TextureCacheBase::LoadImpl(u32 stage, bool force_reload)
+@@ -1262,14 +1303,15 @@ TCacheEntry* TextureCacheBase::LoadImpl(u32 stage, bool force_reload)
      //
      // Spyro: A Hero's Tail is known for (deliberately?) using such overwritten textures
      // in it's bloom effect, which breaks without giving it the invalidated texture.
@@ -2788,7 +2796,7 @@ index c5d6096..14a5bb9 100644
      {
        return entry;
      }
-@@ -1463,11 +1503,14 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
+@@ -1463,11 +1505,14 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
      else
      {
        // For normal textures, all texture parameters need to match
@@ -2804,7 +2812,7 @@ index c5d6096..14a5bb9 100644
          entry = DoPartialTextureUpdates(iter->second, texture_info.GetTlutAddress(),
                                          texture_info.GetTlutFormat());
          if (entry)
-@@ -1583,6 +1626,19 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
+@@ -1583,6 +1628,19 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
      }
    }
  
@@ -2824,7 +2832,7 @@ index c5d6096..14a5bb9 100644
    std::string texture_name = "";
  
    if (g_ActiveConfig.bGraphicMods)
-@@ -1602,8 +1658,46 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
+@@ -1602,8 +1660,46 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
        CreateTextureEntry(TextureCreationInfo{base_hash, full_hash, bytes_per_block, palette_size},
                           texture_info, textureCacheSafetyColorSampleSize, custom_texture_data.get(),
                           has_arbitrary_mipmaps, skip_texture_dump);
@@ -2871,7 +2879,7 @@ index c5d6096..14a5bb9 100644
    entry->texture_info_name = std::move(texture_name);
    return entry;
  }
-@@ -1759,7 +1853,14 @@ RcTcacheEntry TextureCacheBase::CreateTextureEntry(
+@@ -1759,7 +1855,14 @@ RcTcacheEntry TextureCacheBase::CreateTextureEntry(
  
      entry->has_arbitrary_mips = arbitrary_mip_detector.HasArbitraryMipmaps(dst_buffer);
  
@@ -2887,7 +2895,7 @@ index c5d6096..14a5bb9 100644
      {
        const std::string basename = texture_info.CalculateTextureName().GetFullName();
        if (g_ActiveConfig.bDumpBaseTextures)
-@@ -2209,8 +2310,8 @@ void TextureCacheBase::CopyRenderTargetToTexture(
+@@ -2209,8 +2312,8 @@ void TextureCacheBase::CopyRenderTargetToTexture(
    {
      tex_w /= 2;
      tex_h /= 2;
@@ -2898,6 +2906,21 @@ index c5d6096..14a5bb9 100644
    }
  
    if (!is_xfb_copy && !g_ActiveConfig.bCopyEFBScaled)
+@@ -2642,6 +2745,14 @@ void TextureCacheBase::UninitializeXFBMemory(u8* dst, u32 stride, u32 bytes_per_
+       size -= 16;
+       rowdst += 16;
+     }
++#elif defined(__aarch64__)
++    const uint8x16_t pattern = vreinterpretq_u8_u16(vdupq_n_u16(0xfe01));
++    while (size >= 16)
++    {
++      vst1q_u8(rowdst, pattern);
++      size -= 16;
++      rowdst += 16;
++    }
+ #endif
+     for (u32 offset = 0; offset < size; offset++)
+     {
 diff --git a/Source/Core/VideoCommon/TextureCacheBase.h b/Source/Core/VideoCommon/TextureCacheBase.h
 index d596f84..fc548b3 100644
 --- a/Source/Core/VideoCommon/TextureCacheBase.h

@@ -1,211 +1,173 @@
-# ModernGekko-Template
+# Turbulence — Sonic Riders (GameCube)
 
-A template for building a static-recompilation pipeline for GameCube and Wii games, built on:
+A native static recompilation of **Sonic Riders** (USA, `GXEE8P`) that runs on
+macOS, Windows, Linux, Android, and iOS. Turbulence recompiles the game's
+PowerPC code to native machine code at build time and runs it against a
+Dolphin-derived runtime — full speed, no interpreter, and proper widescreen.
 
-- [DolRecomp](https://github.com/ExpansionPak/DolRecomp) - static recompiler that turns a GameCube/Wii DOL into portable C or optimized native LLVM objects.
-- [ModernGekko](https://github.com/ExpansionPak/ModernGekko) - the runtime the recompiled C links against (built on a Dolphin-derived core for video/audio/HLE).
+It is built on [DolRecomp](https://github.com/ExpansionPak/DolRecomp) (the static
+recompiler) and [ModernGekko](https://github.com/ExpansionPak/ModernGekko) (the
+runtime, built on Dolphin's video/audio/HLE core). Sonic Riders–specific changes
+are kept as patches in `patches/` rather than forks.
 
-Both are pulled in as git submodules under `lib/`. Everything is handled through the top-level `Makefile`. This repo has no game-specific code of its own, so it's a starting point for standing up a recompilation project for any GameCube or Wii title you own.
+> [!IMPORTANT]
+> **No game data is included in or downloaded by this repository.** You must
+> supply your own legally-obtained copy of *Sonic Riders* (USA, revision 0).
+> This project is for preservation and interoperability only and is not
+> affiliated with or endorsed by SEGA.
 
-## Using This Template
+## Features
 
-Click **Use this template** on GitHub (or fork/clone it directly) to create your own project repo. Nothing in the `Makefile` or submodule setup needs to change to point it at a different game, just pass a different `ISO=` the first time you run it. Rename the repo to whatever fits your project.
+- **Full-game static recompilation.** `main.dol` uses DolRecomp's LLVM backend;
+  `_Main.rel` (about two thirds of the game's code) is recompiled and linked at
+  its runtime address. Every chunk is hash-verified against guest RAM before it
+  runs, falling back to the JIT only if a chunk no longer matches.
+- **60 FPS on desktop.** Locked frame pacing, persistent shader caches, and an
+  idle-loop fast path for the SDK cache routines.
+- **Widescreen and ultrawide.** 2D draws are classified and stretched or centered
+  appropriately; 3D uses Hor+/Vert+ projection with correct frustum updates, from
+  4:3 through 32:9 and portrait.
+- **Dynamic controller prompts.** GameCube, Xbox, and PlayStation button artwork
+  follows the connected controller automatically, with a manual override.
+- **In-game options menu** (R1 / Tab): aspect ratio, V-Sync, button-prompt style,
+  FPS counter, and native Recomp Settings, styled to match the game.
+- **Cross-platform.** Desktop (macOS Metal, Windows x64, Linux Flatpak) and mobile
+  (Android, iOS) hosts with touch controls and game-controller support.
 
-## Dependencies
+## Supported platforms
 
-CMake, Ninja, and pkg-config, plus a C11/C++23 toolchain. DolRecomp and ModernGekko both build on macOS, Linux, and Windows; this repo's `Makefile` doesn't do anything platform-specific itself, it just drives the same CMake builds each submodule supports natively. `TOOLCHAIN` (see below) follows the compiler used to build ModernGekko.
+| Platform | Status |
+|---|---|
+| macOS (Apple Silicon, Metal) | Primary target; full speed |
+| Windows x64 | Native build (VS 2022 clang-cl) |
+| Linux (Flatpak) | aarch64 and x86_64 |
+| Android (ARM64) | APK with touch + controller input |
+| iOS (ARM64) | IPA, requires personal signing |
 
-### Linux
+See [`ports/README.md`](ports/README.md) for the mobile, Windows, and Linux
+builds.
 
-Ubuntu/Debian, matching what `lib/ModernGekko/vendor/dolphin`'s own CI installs for its NoGUI build (`.github/workflows/build.yml`):
+## Requirements
 
+A C11/C++23 toolchain, CMake, Ninja, and pkg-config. The default LLVM backend
+also needs LLVM 19 or 20; the portable C backend is always available with
+`BACKEND=c`.
+
+### macOS
+
+```sh
+brew install cmake ninja pkg-config
 ```
+
+Xcode command line tools are also required (AppleClang 14.0.3+).
+
+### Linux (Ubuntu/Debian)
+
+```sh
 sudo apt-get install -y ninja-build build-essential pkg-config cmake \
   libevdev-dev libudev-dev libgtk-3-dev libsystemd-dev \
   libbluetooth-dev libasound2-dev libpulse-dev libgl1-mesa-dev \
   libxrandr-dev libxi-dev
 ```
 
-`build-essential` pulls in GCC, the default toolchain on Linux.
-
-### macOS
-
-Via Homebrew:
-
-```
-brew install cmake ninja pkg-config
-```
-
-Xcode's command line tools are also required (AppleClang 14.0.3+; verified on AppleClang 17).
-
 ### Windows
 
-Visual Studio 2022 (or the standalone Build Tools) with the "Desktop development with C++" workload, for the MSVC toolchain, plus CMake and Ninja on `PATH` (installable via winget/Chocolatey or their own installers). No external package manager is needed beyond that. Dolphin's Windows dependency tree (FFmpeg, SDL, etc.) is vendored as prebuilt binaries/source under `lib/ModernGekko/vendor/dolphin/Externals/`, unlike Linux where system `-dev` packages are expected.
+Visual Studio 2022 with the "Desktop development with C++" workload, plus CMake
+and Ninja on `PATH`. The shipped Windows package is cross-compiled; see
+[`ports/README.md`](ports/README.md).
 
-## Getting the Source
+## Build and run
 
-```
-git clone --recurse-submodules https://github.com/<your-org>/<your-repo>.git
-cd <your-repo>
-```
+Clone with submodules, then build — the Turbulence vendor patches are applied
+automatically the first time you build:
 
-If you already cloned without `--recurse-submodules`, `make` will fetch them for you on first run. To do it manually instead:
-
-```
-git submodule update --init --recursive
-```
-
-Run the build check at any time with:
-
-```
-make check
+```sh
+git clone --recurse-submodules https://github.com/bittahbandit1/Turbulence.git
+cd Turbulence
+make run ISO=/path/to/Sonic\ Riders\ \(USA\).iso
 ```
 
-It verifies CMake, Ninja, Git, Python, working C11/C++23 compilers, and a
-64-bit target with 8-byte pointers. If the source submodules are absent, it
-offers to fetch them. Use `make check FETCH=1` for a non-interactive fetch,
-or `make check BACKEND=llvm` to validate LLVM 19/20 as well.
+`make run` builds DolRecomp and ModernGekko, applies the patches, extracts your
+ISO, recompiles `main.dol` and `_Main.rel`, and launches the game. The ISO is
+only needed the first time; afterwards select the extracted game by slug:
 
-> [!NOTE]
-> `lib/ModernGekko` vendors a large chunk of Dolphin's dependency tree (SDL, fmt, imgui, Vulkan headers, etc.), so the first submodule sync takes a while and pulls a few hundred MB.
-
-## Recompile and Run
-
-Bring your own legally-owned ISO, no game data is included in or downloaded by this repository. Works with any GameCube or Wii disc; there is no default game, so `ISO=` (or an already-extracted `GAME=`) is required. Point `ISO` at a dump and run:
-
-```
-make run ISO=/path/to/Your\ Game.iso
+```sh
+make run GAME=Sonic-Riders-USA-En-Ja-Fr-De-Es-It
 ```
 
-This builds DolRecomp and ModernGekko, extracts the ISO, recompiles `main.dol` to C, compiles the result into a native module, and launches the game in a window.
+If you cloned without `--recurse-submodules`, `make` fetches them on first run.
+To apply the vendor patches manually: `make patches` (or
+`sh scripts/apply-patches.sh`).
 
-For the optimized LLVM backend:
+Useful targets:
 
-```
-make llvm-run ISO=/path/to/Your\ Game.iso
-```
+| Target | Description |
+|---|---|
+| `make check` | Validate the toolchain and architecture |
+| `make tools` | Build DolRecomp and ModernGekko |
+| `make run ISO=…` | Extract, recompile, and launch |
+| `make recompile GAME=… BACKEND=c` | Portable C backend |
+| `make patches` | Apply the Turbulence vendor patches |
+| `make save-patches` | Regenerate `patches/` from edited submodules |
 
-`make llvm` builds the module without launching it. DolRecomp emits native
-objects, and RecompCore's module template discovers the generated object
-manifest and links every object into the game module automatically. LLVM is
-only needed while building; the resulting game module has no LLVM runtime
-dependency.
+### Variables
 
-Each game gets its own directory under `extracted/<slug>/`, where `<slug>` is derived from the ISO's filename, so multiple games coexist without clobbering each other. `ISO` is only needed the first time per game, once extracted, run it again by slug instead:
+| Variable | Default | Description |
+|---|---|---|
+| `ISO` | *(none)* | Path to your ISO (first run only) |
+| `GAME` | *(none)* | Select an already-extracted game by slug |
+| `BACKEND` | `llvm` | Generated-code backend: `llvm` or `c` |
+| `LLVM_DIR` | *(discovered)* | Path to LLVM 19/20's CMake package |
+| `TOOLCHAIN` | `auto` | `auto`, `clang`, `gcc`, or `msvc` for the module |
+| `RUN_ARGS` | *(empty)* | Extra flags forwarded to the runner (`--graphics Vulkan`, `--headless`) |
+| `CMAKE_BUILD_TYPE` | `Release` | Build type for the tools |
 
-```
-make run ISO=iso/Your\ Game.iso        # first time for a new game
-make run GAME=Your-Game-Slug           # afterwards
-```
+### Controller input
 
-Drop ISOs under `iso/` at the repo root (gitignored) for a stable local path.
+GameCube bindings come from `Config/GCPadNew.ini` in ModernGekko's user
+directory (`~/.local/share/moderngekko/Config/` by default). A working example is
+provided in [`config/GCPadNew.ini`](config/GCPadNew.ini) and copied into place by
+[`launch_sonic_riders.sh`](launch_sonic_riders.sh). Dolphin's ini format applies.
 
-To just build the tools without touching a game, or to produce the compiled module without launching it:
+The options menu (R1 / Tab) switches button-prompt artwork between GameCube, Xbox,
+and PlayStation; prompts also follow the last-used controller automatically.
 
-```
-make tools
-make recompile ISO=/path/to/game.iso
-```
-
-`moderngekko-port` caches compiled modules by DOL hash and toolchain identity, so re-running `recompile`/`run` after the first build is cheap, it hits cache instead of recompiling.
-
-> [!NOTE]
-> Wii ISOs need [Wiimms ISO Tools](https://wit.wiimm.de/) (`wit`) for extraction, `make` downloads it automatically into `extern/wit` on first use. GameCube extraction is built into DolRecomp directly and doesn't need this.
-
-## Makefile Targets
-
-Run `make help` (or just `make`, the default target) for this list:
-
-| Target       | Description                                                |
-|--------------|--------------------------------------------------------------|
-| `check`      | Validate build tools, compilers, architecture, and sources  |
-| `tools`      | Build DolRecomp and ModernGekko                             |
-| `extract`    | Extract a GameCube/Wii ISO into `extracted/<slug>/`         |
-| `recompile`  | Recompile + compile a runnable module                       |
-| `run`        | Recompile (if needed) and launch the game                   |
-| `llvm`       | Build an optimized LLVM object module                       |
-| `llvm-run`   | Build an LLVM object module and launch the game             |
-| `clean`      | Remove all build output                                     |
-
-## Variables
-
-| Variable           | Default                                    | Description                                              |
-|--------------------|--------------------------------------------|----------------------------------------------------------|
-| `ISO`              | *(none)*                                   | Path to a game ISO. Required the first time per game, also determines that game's slug. |
-| `GAME`             | *(none)*                                   | Select an already-extracted game by slug instead of `ISO=`. Required if `ISO` isn't given. |
-| `JOBS`             | detected CPU count                         | Parallel build jobs passed to CMake/Ninja.                |
-| `CMAKE_BUILD_TYPE` | `Release`                                  | Passed to both submodule builds.                          |
-| `BUILD_TESTING`    | `OFF`                                      | Build developer test targets alongside production tools. |
-| `BACKEND`          | `c`                                        | Generated-code backend: `c` or `llvm`.                    |
-| `LLVM_DIR`         | *(CMake discovery)*                        | Optional path to LLVM 19/20's CMake package.              |
-| `RUN_ARGS`         | *(empty)*                                  | Extra flags forwarded to `moderngekko-run` via `make run`, e.g. `--headless`, `--graphics Vulkan`. |
-| `TOOLCHAIN`        | `auto`                                      | Compiler for the per-game module: `auto`, `clang`, `gcc`, or `msvc`. See "Toolchain" below. |
-
-For example, to force a debug build with extra runner flags:
+## Project layout
 
 ```
-CMAKE_BUILD_TYPE=Debug make run ISO=/path/to/game.iso RUN_ARGS="--headless"
+Makefile               top-level build driver
+patches/               Turbulence's changes to the upstream submodules
+config/                example controller / graphics configs
+src/                   native runtime sources (options, prompts, pacing)
+ports/                 Android, iOS, Windows, and Linux hosts
+scripts/               build, patch, and validation scripts
+docs/                  status notes and platform handoffs
+lib/DolRecomp          (submodule) static recompiler
+lib/ModernGekko        (submodule) Dolphin-derived runtime
 ```
 
-## LLVM Backend
+## How the patches work
 
-DolRecomp supports LLVM 19 and 20. If it is installed outside CMake's normal
-search path, point the template at its package directory:
-
-```
-make llvm GAME=Your-Game-Slug LLVM_DIR=/usr/lib/llvm-19/lib/cmake/llvm
-make llvm-run GAME=Your-Game-Slug LLVM_DIR=/usr/lib/llvm-19/lib/cmake/llvm
-```
-
-The portable C backend remains the default and is always available:
-
-```
-make recompile GAME=Your-Game-Slug BACKEND=c
-```
-
-## Toolchain
-
-The default `TOOLCHAIN=auto` follows the compiler used to build `moderngekko-port`.
-This keeps an MSVC build on MSVC and an MSYS2/MinGW build on GCC or Clang instead
-of assuming that Visual Studio's `cl` is available.
-
-Override it either way with `TOOLCHAIN=`:
-
-```
-make run ISO=/path/to/game.iso TOOLCHAIN=clang   # try clang on Linux anyway
-make run ISO=/path/to/game.iso TOOLCHAIN=auto    # let moderngekko-port pick
-```
-
-Module builds are cached by DOL hash *and* toolchain identity, so switching `TOOLCHAIN` between runs produces a separate cache entry rather than clobbering a previous build.
-
-## Controller Input
-
-ModernGekko has no in-app controller configuration UI (same as Dolphin's NoGUI frontend it's built on), bindings come from `Config/GCPadNew.ini` / `Config/WiimoteNew.ini` in ModernGekko's user directory (`~/.local/share/moderngekko/Config/` by default), which nothing in this pipeline creates for you. Without one, GameCube pad input silently does nothing. You'll need to hand-author or copy in a working ini, Dolphin's ini format and key names are stable and documented by the project itself.
-
-## Cleaning Up
-
-```
-make clean           # everything below
-make clean-extracted # extracted disc + compiled modules only, keeps built tools
-make clean-tools     # DolRecomp/ModernGekko build trees only
-```
+DolRecomp and ModernGekko are tracked as upstream git submodules, and Turbulence's
+modifications are kept as git patches in `patches/` rather than as forked copies.
+`make` applies them on top of a fresh submodule checkout (idempotently), so the
+submodules themselves never carry uncommitted local changes. After editing a
+submodule, capture the changes with `make save-patches`.
 
 ## License
 
-DolRecomp and ModernGekko are each distributed under their own upstream licenses (see `lib/DolRecomp/LICENSE` and `lib/ModernGekko/LICENSE`, the latter GPL-3.0-or-later due to its Dolphin-derived runtime). No Nintendo disc image, extracted game data, keys, or copyrighted assets are part of this repository, bring your own legally-owned dump.
+Turbulence is distributed under the [GNU GPL v3 (or later)](LICENSE), matching its
+ModernGekko/Dolphin-derived runtime. DolRecomp and ModernGekko carry their own
+upstream licenses (`lib/DolRecomp/LICENSE`, `lib/ModernGekko/LICENSE`). The
+Android and iOS hosts are adapted from the Crazy Taxi ReFare project (GPL-3.0; see
+`ports/COPYING`).
 
-## Android and iOS
+*Sonic Riders* and all related artwork are © SEGA. No disc images, extracted game
+data, or keys are included.
 
-Turbulence now has mobile test hosts adapted from Crazy Taxi ReFare. Both
-statically link personal Sonic Riders USA main.dol and REL output and import
-disc assets on the device. They include touch controls and gamepad support.
+## Acknowledgments
 
-```sh
-python3 scripts/android.py --sdk "$ANDROID_HOME"
-python3 scripts/ios.py gameplay-app --ipa
-```
-
-Generated main/REL sources are found automatically in the local build outputs,
-or can be supplied explicitly. Packages are written to `build/release`.
-The iOS IPA requires personal signing. See [mobile build instructions](ports/README.md)
-for toolchain requirements, supported import formats and validation limits.
+- [DolRecomp](https://github.com/ExpansionPak/DolRecomp) and
+  [ModernGekko](https://github.com/ExpansionPak/ModernGekko) by ExpansionPak
+- [Dolphin](https://dolphin-emu.org/) — the runtime's video/audio/HLE core
+- Crazy Taxi ReFare — source of the mobile hosts

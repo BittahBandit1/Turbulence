@@ -50,11 +50,11 @@ WIT_STAMP := .git/.recomp-wit-stamp
 
 .DEFAULT_GOAL := help
 
-.PHONY: help all check tools dolrecomp moderngekko submodules wit extract recompile run \
+.PHONY: help all check tools dolrecomp moderngekko submodules patches save-patches wit extract recompile run \
         llvm llvm-run clean clean-extracted clean-tools
 
 help:
-	@echo "GCWIIRecomp-template"
+	@echo "Turbulence - Sonic Riders (GameCube)"
 	@echo ""
 	@echo "Works with any GameCube or Wii ISO -- there is no default game."
 	@echo "ISO= or GAME= is required the first time you run a target that"
@@ -106,15 +106,24 @@ submodules:
 		git submodule update --init --recursive; \
 	fi
 
+# Apply Turbulence's vendor patches (patches/*.patch) on top of the upstream
+# submodules. Idempotent: already-applied patches are skipped.
+patches: submodules
+	@sh scripts/apply-patches.sh
+
+# Regenerate patches/*.patch from the current submodule working trees.
+save-patches:
+	@sh scripts/save-patches.sh
+
 # --- tools -------------------------------------------------------------------
 
-dolrecomp: submodules
+dolrecomp: patches
 	cmake -S $(DOLRECOMP_DIR) -B $(DOLRECOMP_BUILD) -G Ninja -DCMAKE_BUILD_TYPE=$(CMAKE_BUILD_TYPE) \
 		-DBUILD_TESTING=$(BUILD_TESTING) \
 		-DDOLRECOMP_ENABLE_LLVM=$(DOLRECOMP_ENABLE_LLVM) $(LLVM_CMAKE_ARG)
 	cmake --build $(DOLRECOMP_BUILD) --target dolrecomp -j$(JOBS)
 
-moderngekko: submodules
+moderngekko: patches
 	cmake -S $(MODERNGEKKO_DIR) -B $(MODERNGEKKO_BUILD) -G Ninja -DCMAKE_BUILD_TYPE=$(CMAKE_BUILD_TYPE) \
 		-DBUILD_TESTING=$(BUILD_TESTING) \
 		-DDOLRECOMP_ENABLE_LLVM=$(DOLRECOMP_ENABLE_LLVM) $(LLVM_CMAKE_ARG) \
