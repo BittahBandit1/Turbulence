@@ -82,7 +82,7 @@ Clone with submodules, then build — the Turbulence vendor patches are applied
 automatically the first time you build:
 
 ```sh
-git clone --recurse-submodules https://github.com/bittahbandit1/Turbulence.git
+git clone --recurse-submodules https://github.com/BittahBandit1/Turbulence.git
 cd Turbulence
 make run ISO=/path/to/Sonic\ Riders\ \(USA\).iso
 ```
