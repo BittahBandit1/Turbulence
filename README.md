@@ -132,10 +132,24 @@ provided in [`config/GCPadNew.ini`](config/GCPadNew.ini) and copied into place b
 The options menu (R1 / Tab) switches button-prompt artwork between GameCube, Xbox,
 and PlayStation; prompts also follow the last-used controller automatically.
 
+### macOS launcher
+
+A native SwiftUI launcher lives in [`launcher/`](launcher). It locates the runtime,
+the compiled game module, and the extracted disc, then launches the game with the
+correct arguments — no shell required. Build it with:
+
+```sh
+make launcher            # -> build/release/Turbulence.app
+```
+
+If the launcher is run outside the source tree, point it at the repo with the
+`TURBULENCE_ROOT` environment variable.
+
 ## Project layout
 
 ```
 Makefile               top-level build driver
+launcher/              Swift macOS launcher app
 patches/               Turbulence's changes to the upstream submodules
 config/                example controller / graphics configs
 src/                   native runtime sources (options, prompts, pacing)

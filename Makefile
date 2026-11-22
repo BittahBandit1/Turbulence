@@ -50,7 +50,7 @@ WIT_STAMP := .git/.recomp-wit-stamp
 
 .DEFAULT_GOAL := help
 
-.PHONY: help all check tools dolrecomp moderngekko submodules patches save-patches wit extract recompile run \
+.PHONY: help all check tools dolrecomp moderngekko submodules patches save-patches launcher wit extract recompile run \
         llvm llvm-run clean clean-extracted clean-tools
 
 help:
@@ -114,6 +114,11 @@ patches: submodules
 # Regenerate patches/*.patch from the current submodule working trees.
 save-patches:
 	@sh scripts/save-patches.sh
+
+# --- launcher ------------------------------------------------------------------
+
+launcher:
+	@sh scripts/build-launcher.sh
 
 # --- tools -------------------------------------------------------------------
 

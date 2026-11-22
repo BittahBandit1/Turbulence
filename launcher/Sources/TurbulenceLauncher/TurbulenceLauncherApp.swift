@@ -1,0 +1,14 @@
+import SwiftUI
+
+@main
+struct TurbulenceLauncherApp: App {
+    @StateObject private var model = LauncherModel()
+
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+                .environmentObject(model)
+        }
+        .windowResizability(.contentSize)
+    }
+}

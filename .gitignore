@@ -5,6 +5,7 @@ build/
 extern/
 database/
 build-*/
+.build/
 cmake-build-*/
 CMakeUserPresets.json
 .cache/
