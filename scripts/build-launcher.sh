@@ -8,15 +8,20 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 CONFIG="${CONFIG:-release}"
-NOLLVM=build/dolrecomp-nollvm/dolrecomp
-PORT=build/codex-runtime/moderngekko-port
-RUNNER=build/codex-runtime/moderngekko-run
-SYS=build/codex-runtime/Sys
+NOLLVM="${TURBULENCE_LAUNCHER_RECOMPILER:-build/dolrecomp-nollvm/dolrecomp}"
+RUNTIME_BUILD="${TURBULENCE_LAUNCHER_RUNTIME_BUILD:-build/codex-runtime}"
+PORT="$RUNTIME_BUILD/moderngekko-port"
+RUNNER="$RUNTIME_BUILD/moderngekko-run"
+SYS="$RUNTIME_BUILD/Sys"
 DOLPHIN=lib/ModernGekko/vendor/dolphin
 
 # A dolrecomp without the LLVM backend avoids a runtime dependency on the
 # player's Homebrew LLVM (whose ABI drifts across versions).
 if [ ! -x "$NOLLVM" ]; then
+  if [ "$NOLLVM" != build/dolrecomp-nollvm/dolrecomp ]; then
+    echo "error: missing launcher recompiler $NOLLVM" >&2
+    exit 1
+  fi
   echo "Building a C-backend-only dolrecomp (no LLVM)..."
   cmake -S lib/DolRecomp -B build/dolrecomp-nollvm -G Ninja \
     -DCMAKE_BUILD_TYPE=Release -DDOLRECOMP_ENABLE_LLVM=OFF >/dev/null
