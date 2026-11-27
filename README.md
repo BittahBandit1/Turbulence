@@ -23,7 +23,7 @@ are kept as patches in `patches/` rather than forks.
   its runtime address. Every chunk is hash-verified against guest RAM before it
   runs, falling back to the JIT only if a chunk no longer matches.
 - **60 FPS on desktop.** Locked frame pacing, persistent shader caches, and an
-  idle-loop fast path for the SDK cache routines.
+  idle-loop fast path for the SDK cache routines. Framerates beyond 60 will be added later.
 - **Widescreen and ultrawide.** 2D draws are classified and stretched or centered
   appropriately; 3D uses Hor+/Vert+ projection with correct frustum updates, from
   4:3 through 32:9 and portrait.
