@@ -103,7 +103,7 @@ constexpr const char* kApiLabels[] = {"Vulkan", "Direct3D 11"};
 // Dolphin post-processing shader shipped in Sys/Shaders/FXAA.glsl.
 constexpr const char* kFXAAShader = "FXAA";
 
-enum class Row { Scale, Aspect, Fullscreen, GraphicsApi, HudLayout, FXAA, VSync, MetalHUD, PerfOverlay, Prompts, MenuButton, Exit };
+enum class Row { Scale, Aspect, Fullscreen, GraphicsApi, HudLayout, FXAA, Fog, VSync, MetalHUD, PerfOverlay, Prompts, MenuButton, Exit };
 const std::vector<Row>& Rows() {
   static const std::vector<Row> rows = {Row::Scale, Row::Aspect,
 #if !defined(TURBULENCE_IOS) && !defined(TURBULENCE_ANDROID)
@@ -112,7 +112,7 @@ const std::vector<Row>& Rows() {
 #if defined(_WIN32)
     Row::GraphicsApi,  // Vulkan or Direct3D 11, applied at the next launch
 #endif
-    Row::HudLayout, Row::FXAA,
+    Row::HudLayout, Row::FXAA, Row::Fog,
     Row::VSync,
 #ifdef __APPLE__
     Row::MetalHUD,
@@ -130,6 +130,7 @@ const char* RowLabel(Row row) {
   case Row::GraphicsApi: return "Graphics API";
   case Row::HudLayout: return "HUD and menus";
   case Row::FXAA: return "FXAA";
+  case Row::Fog: return "Fog effects";
   case Row::VSync: return "V-Sync";
   case Row::MetalHUD: return "Metal HUD";
   case Row::PerfOverlay: return "FPS counter";
@@ -345,6 +346,7 @@ struct OptionsMenu::Impl {
   int aspect_index = 0;
   bool stretch_hud = false;
   bool fxaa = false;
+  bool fog_enabled = true;
   bool vsync = true;
   bool fullscreen = false;
   int api_choice = 0;       // saved for the next launch: 0 Vulkan, 1 Direct3D 11
@@ -390,6 +392,7 @@ struct OptionsMenu::Impl {
   void ReadSettings() {
     stretch_hud = g_turbulence_hud_stretched;
     fxaa = Config::Get(Config::GFX_ENHANCE_POST_SHADER) == kFXAAShader;
+    fog_enabled = !Config::Get(Config::GFX_DISABLE_FOG);
     vsync = Config::Get(Config::GFX_VSYNC);
     // Alt+Enter / Cmd+Return / the window menu can change it too.
     fullscreen = Host_RendererIsFullscreen();
@@ -473,6 +476,12 @@ struct OptionsMenu::Impl {
       ini.GetOrCreateSection("Enhancements")->Set("PostProcessingShader", std::string(fxaa ? kFXAAShader : ""));
     });
   }
+  void ApplyFog() {
+    Config::SetBaseOrCurrent(Config::GFX_DISABLE_FOG, !fog_enabled);
+    SaveGraphics([&](Common::IniFile& ini) {
+      ini.GetOrCreateSection("Settings")->Set("DisableFog", !fog_enabled);
+    });
+  }
   void ApplyVSync() {
     // Off lets presents run unthrottled (tearing possible); applies live.
     Config::SetBaseOrCurrent(Config::GFX_VSYNC, vsync);
@@ -535,6 +544,7 @@ struct OptionsMenu::Impl {
     case Row::GraphicsApi: api_choice = 1 - api_choice; ApplyGraphicsApi(); break;
     case Row::HudLayout: stretch_hud = !stretch_hud; ApplyHudLayout(); break;
     case Row::FXAA: fxaa = !fxaa; ApplyFXAA(); break;
+    case Row::Fog: fog_enabled = !fog_enabled; ApplyFog(); break;
     case Row::VSync: vsync = !vsync; ApplyVSync(); break;
     case Row::MetalHUD: metal_hud = !metal_hud; ApplyMetalHUD(); break;
     case Row::PerfOverlay:
@@ -563,7 +573,7 @@ struct OptionsMenu::Impl {
     switch (CurrentRow()) {
     case Row::Exit: confirm_exit = true; exit_choice = 0; break;
     case Row::MenuButton: StartCapture(); break;
-    case Row::Fullscreen: case Row::GraphicsApi: case Row::HudLayout: case Row::FXAA: case Row::VSync: case Row::MetalHUD: case Row::PerfOverlay: case Row::Prompts: Step(1); break;
+    case Row::Fullscreen: case Row::GraphicsApi: case Row::HudLayout: case Row::FXAA: case Row::Fog: case Row::VSync: case Row::MetalHUD: case Row::PerfOverlay: case Row::Prompts: Step(1); break;
     default: break;
     }
   }
@@ -584,6 +594,7 @@ struct OptionsMenu::Impl {
     case Row::GraphicsApi: return kApiLabels[api_choice];
     case Row::HudLayout: return stretch_hud ? "Stretched" : "Centered (4:3)";
     case Row::FXAA: return fxaa ? "On" : "Off";
+    case Row::Fog: return fog_enabled ? "On" : "Off";
     case Row::VSync: return vsync ? "On" : "Off";
     case Row::MetalHUD: return metal_hud ? "On" : "Off";
     case Row::PerfOverlay: return kPerfLabels[perf_overlay];

@@ -444,6 +444,39 @@ index 9263c79..c5ce63a 100644
    void emitExactPaired(u64 descriptor);
    llvm::Value *emitPSQ(const DolIRInstruction &instruction);
    llvm::Value *emitKnownPSQ(const DolIRInstruction &instruction, u32 type,
+diff --git a/src/backend/llvm/exits.cpp b/src/backend/llvm/exits.cpp
+index 43693e9..99c81cd 100644
+--- a/src/backend/llvm/exits.cpp
++++ b/src/backend/llvm/exits.cpp
+@@ -98,9 +98,16 @@ void FunctionEmitter::emitEntry() {
+   ram_ = loadOffset(pointer, offsetof(CPUState, ram));
+   ram_size_ =
+       loadOffset(Type::getInt32Ty(context_), offsetof(CPUState, ram_size));
+-  mem2_ = loadOffset(pointer, offsetof(CPUState, exram));
+-  mem2_size_ =
+-      loadOffset(Type::getInt32Ty(context_), offsetof(CPUState, exram_size));
++  // The fixed GameCube profile has no second RAM bank. Guest addresses
++  // outside MEM1 still go through the host's external access handlers.
++  if (fixed_memory_layout_ && expected_mem2_size_ == 0) {
++    mem2_ = ConstantPointerNull::get(pointer);
++    mem2_size_ = builder_.getInt32(0);
++  } else {
++    mem2_ = loadOffset(pointer, offsetof(CPUState, exram));
++    mem2_size_ =
++        loadOffset(Type::getInt32Ty(context_), offsetof(CPUState, exram_size));
++  }
+   Function *assume = Intrinsic::getDeclaration(&module_, Intrinsic::assume);
+   Value *ramSizeValid =
+       fixed_memory_layout_
+@@ -112,7 +119,7 @@ void FunctionEmitter::emitEntry() {
+   builder_.CreateCall(
+       assume,
+       {builder_.CreateICmpULE(mem2_size_, builder_.getInt32(WII_MEM2_SIZE))});
+-  if (fixed_memory_layout_ && expected_mem2_size_) {
++  if (fixed_memory_layout_) {
+     Value *mem2SizeValid = builder_.CreateOr(
+         builder_.CreateIsNull(mem2_),
+         builder_.CreateICmpEQ(mem2_size_,
 diff --git a/src/backend/llvm/floating_point.cpp b/src/backend/llvm/floating_point.cpp
 index 5064636..52d03db 100644
 --- a/src/backend/llvm/floating_point.cpp
@@ -481,6 +514,26 @@ index 4376667..b6a90eb 100644
  }
  
  Function *getPairNaNFixup(Module &module, Type *pairType) {
+diff --git a/src/backend/llvm/llvm_backend.cpp b/src/backend/llvm/llvm_backend.cpp
+index a2fca3f..a9cf531 100644
+--- a/src/backend/llvm/llvm_backend.cpp
++++ b/src/backend/llvm/llvm_backend.cpp
+@@ -236,11 +236,12 @@ extern "C" bool dolllvm_codegen_fingerprint(const DolLLVMOptions *options,
+       out, size,
+       "llvm=%s|triple=%s|cpu=%s|features=%s|native-abi=%u|mask-words=%u|"
+       "state-count=%u|calling=fastcc|control=pc32x2|return=i64-lanes|"
+-      "escape=sjlj|memory=proven-mem1-v1|cycles=return-or-chain|"
++      "escape=sjlj|memory=proven-mem1-v2|cycles=return-or-chain|"
+       "x86-return-registers=3|"
+-      "aarch64-return-registers=8|reloc=pic|pipeline=default-per-module",
++      "aarch64-return-registers=8|reloc=pic|pipeline=default-per-module|fast-compile=%s",
+       LLVM_VERSION_STRING, profile.triple.c_str(), profile.cpu.c_str(),
+       profile.features.c_str(), DOLLLVM_NATIVE_ABI_VERSION,
+-      DOLIR_STATE_MASK_WORDS, DOLIR_STATE_COUNT);
++      DOLIR_STATE_MASK_WORDS, DOLIR_STATE_COUNT,
++      std::getenv("DOLRECOMP_LLVM_FAST_COMPILE") ? std::getenv("DOLRECOMP_LLVM_FAST_COMPILE") : "0");
+   return written >= 0 && static_cast<size_t>(written) < size;
+ }
 diff --git a/src/backend/llvm/memory.cpp b/src/backend/llvm/memory.cpp
 index a3b90cf..168f3ef 100644
 --- a/src/backend/llvm/memory.cpp
@@ -756,6 +809,38 @@ index e12bbfc..c1b1c2f 100644
    builder_.CreateBr(good);
    builder_.SetInsertPoint(good);
    PHINode *checked = builder_.CreatePHI(Type::getInt1Ty(context_), 2);
+diff --git a/src/backend/llvm/target.cpp b/src/backend/llvm/target.cpp
+index 2bdaa32..fea7395 100644
+--- a/src/backend/llvm/target.cpp
++++ b/src/backend/llvm/target.cpp
+@@ -2,6 +2,8 @@
+ 
+ #include <array>
+ #include <cstring>
++#include <cstdlib>
++#include <llvm/Support/CommandLine.h>
+ 
+ #include <llvm/MC/TargetRegistry.h>
+ #include <llvm/Support/TargetSelect.h>
+@@ -45,6 +47,18 @@ static const ProfileDefinition *definition(DolLLVMTargetProfile id) {
+ 
+ void initializeTargets() {
+   static const bool once = [] {
++    if (const char* fast = std::getenv("DOLRECOMP_LLVM_FAST_COMPILE"); fast && (std::strcmp(fast, "1") == 0 || std::strcmp(fast, "2") == 0)) {
++      auto& options = llvm::cl::getRegisteredOptions();
++      auto scheduler = options.find("enable-misched");
++      if (scheduler != options.end())
++        scheduler->second->addOccurrence(0, "enable-misched", "false");
++      if (std::strcmp(fast, "2") == 0) {
++        auto allocator = options.find("regalloc");
++        if (allocator != options.end())
++          allocator->second->addOccurrence(0, "regalloc", "basic");
++      }
++    }
++
+     // Only the targets DolRecomp can emit, and only those the host LLVM
+     // actually ships. InitializeAll* expands to every target this LLVM was
+     // configured with, which forces the link to carry backends the emitter
 diff --git a/src/cpu/cpu.c b/src/cpu/cpu.c
 index 27297aa..7f99530 100644
 --- a/src/cpu/cpu.c

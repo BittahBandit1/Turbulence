@@ -100,6 +100,14 @@ extern "C" JNIEXPORT void JNICALL JNI_METHOD(nativeStart)(JNIEnv* env,jclass,job
    if(!std::filesystem::exists(profile/"Config/GFX.ini"))std::filesystem::copy_file(system.parent_path()/"GFX.ini",profile/"Config/GFX.ini");
    moderngekko::RuntimeConfig config;
    config.game_root=root;config.user_directory=profile;
+   if (std::filesystem::exists(profile / "bulk-memory-trial"))
+     setenv("TURBULENCE_BULK_MEMORY_TRIAL", "1", 1);
+   else
+     unsetenv("TURBULENCE_BULK_MEMORY_TRIAL");
+   if (std::filesystem::exists(profile / "parallel-vertex-trial"))
+     setenv("TURBULENCE_PARALLEL_VERTEX", "1", 1);
+   else
+     unsetenv("TURBULENCE_PARALLEL_VERTEX");
    config.module=moderngekko::ModuleSource::AttachedDescriptor(staticrecomp_get_module());
    config.native_window=window;config.native_metal_layer=window;config.native_surface_scale=scale;
    config.graphics.backend="Vulkan";config.audio.backend="AAudio";config.show_fps_in_title=false;
