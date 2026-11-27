@@ -1,8 +1,8 @@
 diff --git a/src/app/main.c b/src/app/main.c
-index e37c893..99cecc1 100644
+index e37c893..14d1cc9 100644
 --- a/src/app/main.c
 +++ b/src/app/main.c
-@@ -196,6 +196,35 @@ int main(int argc, char** argv) {
+@@ -196,6 +196,39 @@ int main(int argc, char** argv) {
              return 1;
          }
  
@@ -10,11 +10,15 @@ index e37c893..99cecc1 100644
 +           image with every in-place section relocated) next to the output, so
 +           the module tables can hash exactly the bytes the runtime verifies. */
 +        {
++            char image_dir[1200];
 +            char image_path[1200];
-+            const char* slash = strrchr(output_path, '/');
-+            int dir_len = slash ? (int)(slash - output_path) : 0;
-+            snprintf(image_path, sizeof(image_path), "%.*s%srel_image.bin", dir_len,
-+                     output_path, dir_len ? "/" : "");
++            if (!path_dirname(output_path, image_dir, sizeof(image_dir)) ||
++                snprintf(image_path, sizeof(image_path), "%s/rel_image.bin", image_dir) >=
++                    (int)sizeof(image_path)) {
++                fprintf(stderr, "error: REL image output path is too long\n");
++                rel_free(&rel);
++                return 1;
++            }
 +            u8* image = (u8*)malloc(rel.file_size);
 +            FILE* f = image ? fopen(image_path, "wb") : NULL;
 +            if (!f) {

@@ -72,9 +72,12 @@ sudo apt-get install -y ninja-build build-essential pkg-config cmake \
 
 ### Windows
 
-Visual Studio 2022 with the "Desktop development with C++" workload, plus CMake
-and Ninja on `PATH`. The shipped Windows package is cross-compiled; see
-[`ports/README.md`](ports/README.md).
+Extract the Windows x64 ZIP and open `Turbulence.exe`. Select a Sonic Riders
+USA revision 0 ISO, GCM, or GameCube CISO. The launcher compiles the game on
+your PC and reuses the build on subsequent launches. First-time setup needs
+Python 3 and Visual Studio Build Tools with Desktop development with C++,
+C++ Clang tools for Windows, C++ CMake tools for Windows, and a Windows SDK.
+See [`ports/README.md`](ports/README.md) to package the launcher.
 
 ## Build and run
 

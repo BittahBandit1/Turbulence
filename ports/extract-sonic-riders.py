@@ -24,6 +24,9 @@ DISC_ID = b"GXEE8P"
 DOL_SHA256 = "8b36ae0c3c86bc249b1bf0b05ea636478589aad25a5632f21877f60c900a94a1"
 REL_SHA256 = "7d850de948d27555c6ad5efb469b2856168fc8ed6806aed1af4bb4ca6a069479"
 GC_MAGIC = 0xC2339F3D
+WINDOWS_DEVICES = {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+WINDOWS_DEVICES.update(f"{device}{digit}" for device in ("COM", "LPT")
+                       for digit in "0123456789¹²³")
 
 
 class PlainDisc:
@@ -47,12 +50,16 @@ class CisoDisc:
     def __init__(self, f):
         self.f = f
         header = f.read(self.HEADER)
+        if len(header) != self.HEADER:
+            raise SystemExit("error: truncated CISO header")
         self.block_size = struct.unpack_from("<I", header, 4)[0]
-        if self.block_size == 0:
+        if not 0x440 <= self.block_size <= 32 * 1024 * 1024:
             raise SystemExit("error: bad CISO header")
         self.index = {}
         stored = 0
         for block, present in enumerate(header[8:]):
+            if present not in (0, 1):
+                raise SystemExit("error: invalid CISO block table")
             if present:
                 self.index[block] = stored
                 stored += 1
@@ -91,6 +98,10 @@ def dol_size(header):
 def safe_name(name):
     if not name or name in (".", "..") or "/" in name or "\\" in name or "\0" in name:
         raise SystemExit(f"error: refusing unsafe file name in the disc: {name!r}")
+    if os.name == "nt" and (name.endswith((".", " ")) or
+                            any(ord(c) < 32 or c in '<>:"|?*' for c in name) or
+                            name.split(".", 1)[0].rstrip().upper() in WINDOWS_DEVICES):
+        raise SystemExit(f"error: refusing unsafe Windows file name: {name!r}")
     return name
 
 
@@ -100,7 +111,7 @@ def write(path, data):
 
 
 def copy_file(disc, offset, size, path):
-    with open(path, "wb") as out:
+    with open(path, "xb") as out:
         while size:
             take = min(size, 8 << 20)
             out.write(disc.read(offset, take))
@@ -135,9 +146,15 @@ def main():
 
         bi2 = disc.read(0x440, 0x2000)
         app_header = disc.read(0x2440, 0x20)
-        apploader = disc.read(0x2440, 0x20 + be32(app_header, 0x14) + be32(app_header, 0x18))
+        app_size = 0x20 + be32(app_header, 0x14) + be32(app_header, 0x18)
+        if app_size > 16 << 20:
+            raise SystemExit("error: invalid apploader size")
+        apploader = disc.read(0x2440, app_size)
         dol_offset, fst_offset, fst_len = be32(boot, 0x420), be32(boot, 0x424), be32(boot, 0x428)
-        dol = disc.read(dol_offset, dol_size(disc.read(dol_offset, 0x100)))
+        main_size = dol_size(disc.read(dol_offset, 0x100))
+        if main_size > 32 << 20 or not 12 <= fst_len <= 16 << 20:
+            raise SystemExit("error: invalid DOL or filesystem size")
+        dol = disc.read(dol_offset, main_size)
         fst = disc.read(fst_offset, fst_len)
 
         dol_hash = hashlib.sha256(dol).hexdigest()
@@ -172,8 +189,11 @@ def main():
             entry = fst[i * 12:i * 12 + 12]
             path = os.path.join(stack[-1][1], safe_name(name_at(i)))
             if entry[0] & 1:  # directory: field 2 is the index after its last child
-                os.makedirs(path, exist_ok=True)
-                stack.append((be32(entry, 8), path))
+                end = be32(entry, 8)
+                if not i < end <= stack[-1][0]:
+                    raise SystemExit("error: corrupt directory range")
+                os.mkdir(path)
+                stack.append((end, path))
             else:
                 size = be32(entry, 8)
                 copy_file(disc, be32(entry, 4), size, path)

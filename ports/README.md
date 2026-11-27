@@ -62,15 +62,33 @@ Turnip): Install GPU driver (.zip) on the home screen takes a standard
 adrenotools package (meta.json plus the driver library). Use system driver
 removes it. The first launch with a new driver compiles shaders for it.
 
-## Windows x64 and Linux Flatpak
+## Windows x64 launcher
 
-These are cross-built from macOS. Both use LLVM main.dol objects
+Extract the release ZIP and open `Turbulence.exe`. Choose or drop a Sonic
+Riders USA revision 0 ISO, GCM, or GameCube CISO. Python 3 and Visual Studio
+Build Tools with Desktop development with C++, C++ Clang tools for Windows,
+C++ CMake tools for Windows, and a Windows SDK are needed for the first build.
+Game data, settings, and the build log live in `%LOCALAPPDATA%\Turbulence`.
+
+Build the release ZIP from macOS with the xwin MSVC CRT and Windows SDK, LLVM
+20, LLD, CMake, Ninja, and MinGW-w64:
+
+```sh
+bash scripts/build-windows-launcher.sh  # build/release/Turbulence-Windows-x64-Preview.zip
+```
+
+The release ZIP includes the runtime, C recompiler and module sources. The
+launcher builds both game modules from the player's disc, locally.
+
+## Windows developer build and Linux Flatpak
+
+These play folders are cross-built from macOS. Both use LLVM main.dol objects
 (x86-64-v2 with a runtime-selected x86-64-v3 copy on x86_64) and the C REL.
 
 ```sh
 # Windows: needs Homebrew llvm@20 + lld and the MSVC CRT/SDK from xwin in ~/.xwin
 #   (xwin --accept-license splat --output ~/.xwin)
-bash scripts/windows.sh          # -> build/release/Turbulence-Windows-x64.zip
+bash scripts/windows.sh          # local Windows test folder with a prebuilt game module
 # Linux: needs Docker (Colima with --vz-rosetta for x86_64 on Apple Silicon)
 bash scripts/flatpak.sh aarch64  # -> build/release/Turbulence-linux-aarch64.flatpak
 bash scripts/flatpak.sh x86_64   # -> build/release/Turbulence-linux-x86_64.flatpak
@@ -82,7 +100,7 @@ with `DOLRECOMP_LLVM_TARGET` set to `x86_64-pc-windows-msvc`,
 `x86_64-unknown-linux-gnu` or `aarch64-unknown-linux-gnu`, written to
 build/llvm-<windows-x86_64|linux-x86_64|linux-aarch64>/dol/generated.
 
-Windows: unzip, put the extracted Sonic Riders USA folder (with sys\main.dol)
+For the Windows developer build, unzip and put the extracted Sonic Riders USA folder (with sys\main.dol)
 in `game` next to Turbulence.bat, and run Turbulence.bat. Settings go in `user`.
 
 Linux: `flatpak install --user Turbulence-linux-<arch>.flatpak` (pulls the
